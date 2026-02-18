@@ -4,6 +4,7 @@ import pickle
 import os
 import cv2
 import sys
+import numpy as np
 sys.path.append('../')
 from utils import get_center_of_bbox, get_bbox_width, get_foot_position
 
@@ -95,33 +96,47 @@ class Tracker:
             lineType=cv2.LINE_4
         )
 
-        rectangle_width = 40
-        rectangle_height=20
-        x1_rect = x_center - rectangle_width//2
-        x2_rect = x_center + rectangle_width//2
-        y1_rect = (y2- rectangle_height//2) +15
-        y2_rect = (y2+ rectangle_height//2) +15
+        # rectangle_width = 40
+        # rectangle_height=20
+        # x1_rect = x_center - rectangle_width//2
+        # x2_rect = x_center + rectangle_width//2
+        # y1_rect = (y2- rectangle_height//2) +15
+        # y2_rect = (y2+ rectangle_height//2) +15
 
-        if track_id is not None:
-            cv2.rectangle(frame,
-                          (int(x1_rect),int(y1_rect) ),
-                          (int(x2_rect),int(y2_rect)),
-                          color,
-                          cv2.FILLED)
+        # if track_id is not None:
+        #     cv2.rectangle(frame,
+        #                   (int(x1_rect),int(y1_rect) ),
+        #                   (int(x2_rect),int(y2_rect)),
+        #                   color,
+        #                   cv2.FILLED)
             
-            x1_text = x1_rect+12
-            if track_id > 99:
-                x1_text -=10
+        #     x1_text = x1_rect+12
+        #     if track_id > 99:
+        #         x1_text -=10
             
-            cv2.putText(
-                frame,
-                f"{track_id}",
-                (int(x1_text),int(y1_rect+15)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (0,0,0),
-                2
-            )
+        #     cv2.putText(
+        #         frame,
+        #         f"{track_id}",
+        #         (int(x1_text),int(y1_rect+15)),
+        #         cv2.FONT_HERSHEY_SIMPLEX,
+        #         0.6,
+        #         (0,0,0),
+        #         2
+        #     )
+
+        return frame
+    
+    def draw_traingle(self,frame,bbox,color):
+        y= int(bbox[1])
+        x,_ = get_center_of_bbox(bbox)
+
+        triangle_points = np.array([
+            [x,y],
+            [x-10,y-20],
+            [x+10,y-20],
+        ])
+        cv2.drawContours(frame, [triangle_points],0,color, cv2.FILLED)
+        cv2.drawContours(frame, [triangle_points],0,(0,0,0), 2)
 
         return frame
 
@@ -136,23 +151,23 @@ class Tracker:
 
             # Draw Players
             for track_id, player in player_dict.items():
-                # color = player.get("team_color",(0,0,255))
+                color = player.get("team_color",(0,0,255))
                 frame = self.draw_ellipse(frame, player["bbox"],(0,0,225),track_id)
 
-            #     if player.get('has_ball',False):
-            #         frame = self.draw_traingle(frame, player["bbox"],(0,0,255))
+                if player.get('has_ball',False):
+                    frame = self.draw_traingle(frame, player["bbox"],(0,0,255))
 
-            # # Draw Referee
-            # for _, referee in referee_dict.items():
-            #     frame = self.draw_ellipse(frame, referee["bbox"],(0,255,255))
+            # Draw Referee
+            for _, referee in referee_dict.items():
+                frame = self.draw_ellipse(frame, referee["bbox"],(0,255,255))
             
-            # # Draw ball 
-            # for track_id, ball in ball_dict.items():
-            #     frame = self.draw_traingle(frame, ball["bbox"],(0,255,0))
+            # Draw ball 
+            for track_id, ball in ball_dict.items():
+                frame = self.draw_traingle(frame, ball["bbox"],(0,255,0))
 
 
             # # Draw Team Ball Control
-            # frame = self.draw_team_ball_control(frame, frame_num, team_ball_control)
+            # frame = self.draw_team_ball_control(frame, frame_num)
 
             output_video_frames.append(frame)
 
