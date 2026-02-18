@@ -12,7 +12,7 @@ def main():
 
 
     #save_video
-    save_video = save_video('output_videos/football_analysis_output')
+    save_video(video_frames, 'output_videos/football_analysis_output')
 
 if __name__ == '__main__':
     main()
