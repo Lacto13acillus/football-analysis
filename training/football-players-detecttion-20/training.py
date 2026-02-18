@@ -1,0 +1,1 @@
+task=detect mode=train model=yolov5l.pt data =(dataset.location)/data.yaml epochs=100 imgsz=640
