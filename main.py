@@ -39,17 +39,18 @@ def main():
             elif track.get('team') == 2:
                 team_2_count += 1
         
+        # Store which team has more players (for ball control visualization)
         if team_1_count > team_2_count:
             team_ball_control.append(1)
         elif team_2_count > team_1_count:
             team_ball_control.append(2)
         else:
+            # If equal, keep previous team or default to 1
             team_ball_control.append(team_ball_control[-1] if team_ball_control else 1)
     
     # Draw output 
     ## Draw object Tracks
-    output_video_frames = tracker.draw_annotations(video_frames, tracks, team_ball_control, 
-                                                   team_assigner.team_colors)
+    output_video_frames = tracker.draw_annotations(video_frames, tracks)
 
     #save_video
     save_video(output_video_frames, 'output_videos/football_analysis_output_color.avi')
