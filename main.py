@@ -26,6 +26,25 @@ def main():
                                                  player_id)
             tracks['players'][frame_num][player_id]['team'] = team 
             tracks['players'][frame_num][player_id]['team_color'] = team_assigner.team_colors[team]
+
+    # Count players per team in each frame
+    team_ball_control = []
+    for frame_num, player_track in enumerate(tracks['players']):
+        team_1_count = 0
+        team_2_count = 0
+        
+        for player_id, track in player_track.items():
+            if track.get('team') == 1:
+                team_1_count += 1
+            elif track.get('team') == 2:
+                team_2_count += 1
+        
+        if team_1_count > team_2_count:
+            team_ball_control.append(1)
+        elif team_2_count > team_1_count:
+            team_ball_control.append(2)
+        else:
+            team_ball_control.append(team_ball_control[-1] if team_ball_control else 1)
     
     # Draw output 
     ## Draw object Tracks
