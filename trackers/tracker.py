@@ -53,7 +53,7 @@ class Tracker:
             detection_with_tracks = self.tracker.update_with_detections(detection_supervision)
 
             tracks["players"].append({})
-            tracks["goalkeepers"].append({})  # ✅ Tambahkan
+            tracks["goalkeepers"].append({})
             tracks["referees"].append({})
             tracks["ball"].append({})
 
@@ -65,7 +65,7 @@ class Tracker:
                 if cls_id == cls_names_inv['player']:
                     tracks["players"][frame_num][track_id] = {"bbox":bbox}
 
-                # ✅ Track goalkeeper secara terpisah
+                # Track goalkeeper secara terpisah
                 if cls_id == cls_names_inv['goalkeeper']:
                     tracks["goalkeepers"][frame_num][track_id] = {"bbox":bbox}
 
