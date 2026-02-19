@@ -40,9 +40,9 @@ def main():
             # Kiper kiri → Team 1 (sama dengan player tim kiri)
             # Kiper kanan → Team 2 (sama dengan player tim kanan)
             if x_center < frame_width / 2:
-                team = 1
-            else:
                 team = 2
+            else:
+                team = 1
             
             tracks['goalkeepers'][frame_num][goalkeeper_id]['team'] = team
             
