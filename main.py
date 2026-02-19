@@ -48,7 +48,8 @@ def main():
     
     # Draw output 
     ## Draw object Tracks
-    output_video_frames = tracker.draw_annotations(video_frames, tracks)
+    output_video_frames = tracker.draw_annotations(video_frames, tracks, team_ball_control, 
+                                                   team_assigner.team_colors)
 
     #save_video
     save_video(output_video_frames, 'output_videos/football_analysis_output_color.avi')
