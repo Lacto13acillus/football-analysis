@@ -13,10 +13,6 @@ def main():
                                        read_from_stub=True,
                                        stub_path='stubs/track_stubs.pkl')
     
-    # Draw output 
-    ## Draw object Tracks
-    output_video_frames = tracker.draw_annotations(video_frames, tracks)
-
     # Assign Player Teams
     team_assigner = TeamAssigner()
     team_assigner.assign_team_color(video_frames[0], 
@@ -29,6 +25,10 @@ def main():
                                                  player_id)
             tracks['players'][frame_num][player_id]['team'] = team 
             tracks['players'][frame_num][player_id]['team_color'] = team_assigner.team_colors[team]
+    
+    # Draw output 
+    ## Draw object Tracks
+    output_video_frames = tracker.draw_annotations(video_frames, tracks)
 
 
     #save_video
