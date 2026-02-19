@@ -1,6 +1,6 @@
 from utils.video_utils import read_video, save_video
 from trackers import Tracker
-from team_assigner.teamAssigner import TeamAssigner
+from team_assigner import TeamAssigner
 
 def main():
     #read_video
