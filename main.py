@@ -28,25 +28,29 @@ def main():
             tracks['players'][frame_num][player_id]['team'] = team 
             tracks['players'][frame_num][player_id]['team_color'] = team_assigner.team_colors[team]
 
-    #Assign goalkeeper ke tim berdasarkan posisi, tapi gunakan warna tim player
+    # Assign goalkeeper ke tim berdasarkan posisi
     frame_width = video_frames[0].shape[1]
+    
+    print(f"Frame width: {frame_width}")
     
     for frame_num, goalkeeper_track in enumerate(tracks['goalkeepers']):
         for goalkeeper_id, track in goalkeeper_track.items():
             bbox = track['bbox']
             x_center = (bbox[0] + bbox[2]) / 2
             
-            # ✅ Tentukan tim berdasarkan posisi
-            # Kiper kiri → Team 1 (sama dengan player tim kiri)
-            # Kiper kanan → Team 2 (sama dengan player tim kanan)
+            # Debug print
+            if frame_num == 0:
+                print(f"GK {goalkeeper_id}: bbox={bbox}, x_center={x_center}, position={'LEFT' if x_center < frame_width/2 else 'RIGHT'}")
+            
+            # Original logic
             if x_center < frame_width / 2:
-                team = 2
+                team = 1  # Kiper kiri
             else:
-                team = 1
+                team = 2  # Kiper kanan
             
             tracks['goalkeepers'][frame_num][goalkeeper_id]['team'] = team
             
-            # ✅ Gunakan warna TIM PLAYER (bukan warna jersey kiper)
+            # Gunakan warna tim player
             team_color = team_assigner.team_colors[team]
             
             # Konversi numpy array ke tuple
@@ -54,6 +58,10 @@ def main():
                 team_color = tuple(int(c) for c in team_color)
             
             tracks['goalkeepers'][frame_num][goalkeeper_id]['team_color'] = team_color
+            
+            # Debug print team assignment
+            if frame_num == 0:
+                print(f"  → Team {team}, Color {team_color}")
     
     # Draw output 
     ## Draw object Tracks
