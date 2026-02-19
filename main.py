@@ -18,6 +18,7 @@ def main():
     team_assigner.assign_team_color(video_frames[0], 
                                     tracks['players'][0])
     
+    # Assign team untuk players
     for frame_num, player_track in enumerate(tracks['players']):
         for player_id, track in player_track.items():
             team = team_assigner.get_player_team(video_frames[frame_num],   
@@ -25,6 +26,21 @@ def main():
                                                  player_id)
             tracks['players'][frame_num][player_id]['team'] = team 
             tracks['players'][frame_num][player_id]['team_color'] = team_assigner.team_colors[team]
+
+    # Assign team untuk goalkeepers berdasarkan posisi X
+    for frame_num, goalkeeper_track in enumerate(tracks['goalkeepers']):
+        for goalkeeper_id, track in goalkeeper_track.items():
+            bbox = track['bbox']
+            x_center = (bbox[0] + bbox[2]) / 2
+            
+            # Goalkeeper di sisi kiri → Team 1, di sisi kanan → Team 2
+            if x_center < video_frames[0].shape[1] / 2:
+                team = 1
+            else:
+                team = 2
+            
+            tracks['goalkeepers'][frame_num][goalkeeper_id]['team'] = team
+            tracks['goalkeepers'][frame_num][goalkeeper_id]['team_color'] = team_assigner.team_colors[team]
     
     # Draw output 
     ## Draw object Tracks
