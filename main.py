@@ -5,7 +5,7 @@ import numpy as np
 
 def main():
     #read_video
-    video_frames = read_video('input_videos/football_analysis.mp4')
+    video_frames = read_video('input_videos/video_ssb.mp4')
 
     # Initialize Tracker
     tracker = Tracker('models/best.pt')
@@ -32,7 +32,7 @@ def main():
     output_video_frames = tracker.draw_annotations(video_frames, tracks)
 
     #save_video
-    save_video(output_video_frames, 'output_videos/football_analysis_output_color.avi')
+    save_video(output_video_frames, 'output_videos/video_ssb_output.avi')
 
 if __name__ == '__main__':
     main()
