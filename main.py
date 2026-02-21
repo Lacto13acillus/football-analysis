@@ -5,7 +5,7 @@ import numpy as np
 
 def main():
     #read_video
-    video_frames = read_video('input_videos/video_ssb.mp4')
+    video_frames = read_video('input_videos/video_ssb_1.mp4')
 
     # Initialize Tracker
     tracker = Tracker('models/best.pt')
