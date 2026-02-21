@@ -6,9 +6,9 @@ import pickle
 import os
 
 def main():
-    video_path = 'input_videos/football_analysis.mp4'
+    video_path = 'input_videos/video_ssb_1.mp4'
     stub_path = 'stubs/track_stubs.pkl'
-    output_path = 'output_videos/football_analysis_output_color.avi'
+    output_path = 'output_videos/video_ssb_1_output.avi'
     
     # Initialize Tracker
     tracker = Tracker('models/best.pt')
