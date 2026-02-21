@@ -47,7 +47,7 @@ def main():
     cap = cv2.VideoCapture(video_path)
     
     for frame_idx, player_track in enumerate(tracks['players']):
-        if len(player_track) > 0:  # Frame has players
+        if len(player_track) >= 2:  # Frame has players
             cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
             ret, frame = cap.read()
             if ret:
