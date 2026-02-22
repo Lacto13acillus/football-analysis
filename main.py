@@ -8,7 +8,7 @@ import os
 def main():
     video_path = 'input_videos/video_ssb_1.mp4'
     stub_path = 'stubs/track_stubs.pkl'
-    output_path = 'output_videos/video_ssb_1_output.avi'
+    output_path = 'output_videos/video_ssb_output.avi'
     
     # Initialize Tracker
     tracker = Tracker('models/best.pt')
@@ -40,44 +40,64 @@ def main():
     # ===== STEP 2: Team Assignment =====
     print("🎨 Assigning team colors...")
     
-    # ✅ Find first frame with players
-    first_frame_with_players = None
-    first_frame_idx = None
+    # ✅ Find best frame: many players, few referees
+    best_frame_idx = None
+    best_frame = None
+    best_score = 0
     
     cap = cv2.VideoCapture(video_path)
     
-    for frame_idx, player_track in enumerate(tracks['players']):
-        if len(player_track) >= 2:  # Frame has players
+    for frame_idx in range(len(tracks['players'])):
+        num_players = len(tracks['players'][frame_idx])
+        num_referees = len(tracks['referees'][frame_idx])
+        
+        # Score: prioritize frames with many players and few referees
+        score = num_players - (num_referees * 3)  # Heavy penalty for referees
+        
+        if num_players >= 4 and score > best_score:  # Minimum 4 players
             cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
             ret, frame = cap.read()
             if ret:
-                first_frame_with_players = frame
-                first_frame_idx = frame_idx
-                print(f"   Found players at frame {frame_idx}")
-                break
+                best_frame = frame
+                best_frame_idx = frame_idx
+                best_score = score
     
-    if first_frame_with_players is None:
-        print("❌ Error: No players found in entire video!")
+    if best_frame is None:
+        print("❌ Error: No suitable frame found!")
         cap.release()
         return
     
+    print(f"   Selected frame {best_frame_idx}: {len(tracks['players'][best_frame_idx])} players, {len(tracks['referees'][best_frame_idx])} referees")
+    
     # Assign team colors
     team_assigner = TeamAssigner()
-    team_assigner.assign_team_color(first_frame_with_players, tracks['players'][first_frame_idx])
+    team_assigner.assign_team_color(best_frame, tracks['players'][best_frame_idx])
     
-    print(f"   Team 1 color: {team_assigner.team_colors[1]}")
-    print(f"   Team 2 color: {team_assigner.team_colors[2]}")
+    print(f"   Team 1 color (BGR): {team_assigner.team_colors[1]}")
+    print(f"   Team 2 color (BGR): {team_assigner.team_colors[2]}")
+    
+    # ✅ Check if any team is yellow-like (referee might be in clustering)
+    def is_yellow_like(color):
+        b, g, r = int(color[0]), int(color[1]), int(color[2])
+        return (g > 180 and r > 180 and b < 150)  # Yellow: high green+red, low blue
+    
+    team_1_is_yellow = is_yellow_like(team_assigner.team_colors[1])
+    team_2_is_yellow = is_yellow_like(team_assigner.team_colors[2])
+    
+    if team_1_is_yellow or team_2_is_yellow:
+        print("   ⚠️  Warning: One team detected as yellow (referee might be in clustering)")
+        print("   💡 Tip: Try using a different frame with more players and fewer referees")
     
     # Assign team to each player in each frame
     for frame_num, player_track in enumerate(tracks['players']):
         for player_id, track in player_track.items():
-            team = team_assigner.get_player_team(first_frame_with_players,
+            team = team_assigner.get_player_team(best_frame,
                                                  track['bbox'],
                                                  player_id)
             tracks['players'][frame_num][player_id]['team'] = team 
             tracks['players'][frame_num][player_id]['team_color'] = team_assigner.team_colors[team]
     
-    del first_frame_with_players  # Free memory
+    del best_frame  # Free memory
     print("✅ Team assignment complete")
 
     # ===== STEP 3: Render Video with Annotations =====
