@@ -10,7 +10,7 @@ from utils.video_utils import read_video, save_video
 def main():
     video_path = 'input_videos/video_ssb_1.mp4'
     stub_path = 'stubs/track_stubs.pkl'
-    output_path = 'output_videos/video_ssb_output_pass.avi'
+    output_path = 'output_videos/video_ssb_output.avi'
     
     # Initialize Tracker
     tracker = Tracker('models/best.pt')
@@ -102,11 +102,19 @@ def main():
     
     frame_num = 0
 
-    # INISIALISASI VARIABEL PASSING
+    # --- INISIALISASI VARIABEL PASSING (DIPERBARUI) ---
     player_assigner = PlayerBallAssigner()
     team_passes = {1: 0, 2: 0}
-    last_player_with_ball = None
+    
+    confirmed_player_with_ball = None 
     current_team_in_possession = None
+    
+    candidate_player = None
+    consecutive_frames_with_ball = 0
+    
+    # Syarat: Pemain harus memegang bola minimal 7 frame berturut-turut agar dianggap SAH
+    FRAMES_REQUIRED_FOR_POSSESSION = 7 
+    # --------------------------------------------------
     
     while True:
         ret, frame = cap.read()
@@ -117,34 +125,46 @@ def main():
         ball_dict = tracks["ball"][frame_num]
         referee_dict = tracks["referees"][frame_num]
 
-        # ---------------- PASS DETECTION LOGIC ---------------- #
+        # ---------------- PASS DETECTION LOGIC (DIPERBARUI) ---------------- #
         assigned_player = -1
-        if 1 in ball_dict: # Pastikan ada bola yang terdeteksi di frame ini
+        if 1 in ball_dict: 
             ball_bbox = ball_dict[1]['bbox']
             assigned_player = player_assigner.assign_ball_to_player(player_dict, ball_bbox)
 
         if assigned_player != -1 and assigned_player is not None:
-            # Beri flag ke pemain yang memegang bola
-            player_dict[assigned_player]['has_ball'] = True
-            team = player_dict[assigned_player]['team']
+            # Cek apakah pemain yang dekat bola SAMA dengan frame sebelumnya
+            if assigned_player == candidate_player:
+                consecutive_frames_with_ball += 1
+            else:
+                candidate_player = assigned_player
+                consecutive_frames_with_ball = 1
 
-            # Jika bola berpindah dari satu pemain ke pemain lain
-            if last_player_with_ball is not None and last_player_with_ball != assigned_player:
-                # Dan jika tim pemegang bola masih sama = SUCCESS PASS
-                if current_team_in_possession == team:
-                    team_passes[team] += 1
-            
-            # Update status penguasaan bola terbaru
-            last_player_with_ball = assigned_player
-            current_team_in_possession = team
-        # ------------------------------------------------------ #
+            # Jika sudah memenuhi batas frame (bola benar-benar dikuasai)
+            if consecutive_frames_with_ball >= FRAMES_REQUIRED_FOR_POSSESSION:
+                player_dict[assigned_player]['has_ball'] = True
+                team = player_dict[assigned_player]['team']
+
+                # Cek apakah bola berpindah penguasaan dari pemain sebelumnya
+                if confirmed_player_with_ball is not None and confirmed_player_with_ball != assigned_player:
+                    # Jika timnya sama, berarti PASS SUKSES!
+                    if current_team_in_possession == team:
+                        team_passes[team] += 1
+                
+                # Update status penguasaan bola yang sah
+                confirmed_player_with_ball = assigned_player
+                current_team_in_possession = team
+        else:
+            # Bola tidak dekat siapa-siapa (bola liar), reset perhitungan sementara
+            candidate_player = None
+            consecutive_frames_with_ball = 0
+        # ------------------------------------------------------------------- #
 
         # Draw Players
         for track_id, player in player_dict.items():
             color = player.get("team_color", (0, 0, 255))
             frame = tracker.draw_ellipse(frame, player["bbox"], color, track_id)
             
-            # Jika player bawa bola, gambar segitiga merah di atasnya
+            # Jika player bawa bola (sudah lolos filter frame), gambar segitiga merah
             if player.get('has_ball', False):
                  frame = tracker.draw_traingle(frame, player["bbox"], (0,0,255))
 
@@ -157,14 +177,9 @@ def main():
             frame = tracker.draw_traingle(frame, ball["bbox"], (0, 255, 0))
 
         # ---------------- STATISTIK PASSING ---------------- #
-        # Background box transparan/solid
         cv2.rectangle(frame, (10, 10), (320, 100), (255, 255, 255), -1)
-        # Text Team 1
-        color_1 = team_assigner.team_colors[1]
         cv2.putText(frame, f"Team 1 Passes: {team_passes[1]}", (20, 45), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,0), 2)
-        # Text Team 2
-        color_2 = team_assigner.team_colors[2]
         cv2.putText(frame, f"Team 2 Passes: {team_passes[2]}", (20, 85), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,0), 2)
         # --------------------------------------------------- #
