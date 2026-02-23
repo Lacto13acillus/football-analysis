@@ -10,7 +10,7 @@ import os
 def main():
     video_path = 'input_videos/video_ssb_1.mp4'
     stub_path = 'stubs/track_stubs.pkl'
-    output_path = 'output_videos/video_ssb_output_pass'
+    output_path = 'output_videos/video_ssb_output_pass.avi'
     
     # Initialize
     tracker = Tracker('models/best.pt')
