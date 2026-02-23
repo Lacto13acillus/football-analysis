@@ -6,7 +6,7 @@ import numpy as np
 import cv2
 import pickle
 import os
-from utils.video_utils import read_video, save_video
+from utils.video_utils import read_video
 
 def main():
     video_path = 'input_videos/video_ssb_1.mp4'
@@ -16,7 +16,6 @@ def main():
     tracker = Tracker('models/best.pt')
 
     # ===== STEP 1 & 2: Get Tracks & Team Assignment =====
-    # (Sama seperti sebelumnya)
     if os.path.exists(stub_path):
         print("✅ Loading tracks from stub...")
         with open(stub_path, 'rb') as f:
@@ -43,8 +42,7 @@ def main():
                 best_frame_idx = frame_idx
                 best_score = score
     
-    if best_frame is None:
-        return
+    if best_frame is None: return
     
     team_assigner = TeamAssigner()
     team_assigner.assign_team_color(best_frame, tracks['players'][best_frame_idx])
@@ -54,10 +52,9 @@ def main():
             team = team_assigner.get_player_team(best_frame, track['bbox'], player_id)
             tracks['players'][frame_num][player_id]['team'] = team 
             tracks['players'][frame_num][player_id]['team_color'] = team_assigner.team_colors[team]
-    
     del best_frame 
 
-    # ===== STEP 3: ADVANCED PASS DETECTION LOGIC =====
+    # ===== STEP 3: AREA-BASED PASS DETECTION =====
     print("🎬 Rendering annotated video...")
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
     
@@ -69,30 +66,21 @@ def main():
     
     frame_num = 0
 
-    # --- ADVANCED TRACKING VARIABLES ---
     player_assigner = PlayerBallAssigner()
     team_passes = {1: 0, 2: 0}
     
-    ball_state = 'FREE' 
     last_possessor = None
     last_possessor_team = None
-    
-    # Kunci algoritma baru: Melacak dimana bola dilepas & terakhir terlihat
-    possession_lost_pos = None 
-    last_valid_ball_pos = None 
+    last_possessor_pos = None
     
     candidate_player = None
     consecutive_frames_with_ball = 0
-    frames_without_ball = 0
     
-    # PARAMETER FISIKA BOLA (Lebih responsif!)
-    FRAMES_REQUIRED_FOR_POSSESSION = 2 # Cukup 2 frame untuk menangkap Quick Pass (Detik 18-27)
-    FRAMES_FOR_TRANSIT = 2            # Bola bebas 3 frame dianggap lepas
-    MIN_TRANSIT_DISTANCE = 30          # Bola HARUS MELUNCUR min 50 piksel SAAT BEBAS agar sah jadi umpan
-    PASS_LINE_DURATION = 25
+    # PARAMETER ROBUST BARU
+    MIN_PASS_DISTANCE = 80  # Jarak antar pemain (mencegah ID switch saat dribbling & kemelut)
+    PASS_LINE_DURATION = 30 
     
     active_pass_lines = []
-    # -----------------------------------
     
     while True:
         ret, frame = cap.read()
@@ -103,65 +91,49 @@ def main():
         ball_dict = tracks["ball"][frame_num]
         referee_dict = tracks["referees"][frame_num]
 
-        curr_ball_pos = get_center_of_bbox(ball_dict[1]['bbox']) if 1 in ball_dict else None
-        if curr_ball_pos is not None:
-            last_valid_ball_pos = curr_ball_pos
-
         assigned_player = -1
-        if curr_ball_pos is not None:
+        if 1 in ball_dict:
             assigned_player = player_assigner.assign_ball_to_player(player_dict, ball_dict[1]['bbox'])
 
-        # ---------------- LOGIKA INTI ---------------- #
+        # ---------------- LOGIKA INTERSECTION AREA ---------------- #
         if assigned_player != -1 and assigned_player is not None:
-            frames_without_ball = 0
-            
             if assigned_player == candidate_player:
                 consecutive_frames_with_ball += 1
             else:
                 candidate_player = assigned_player
                 consecutive_frames_with_ball = 1
 
-            if consecutive_frames_with_ball >= FRAMES_REQUIRED_FOR_POSSESSION:
+            # Cukup 2 frame bola berada di dalam kotak kaki, sah dikuasai (cocok untuk umpan cepat)
+            if consecutive_frames_with_ball >= 2:
                 player_dict[assigned_player]['has_ball'] = True
                 team = player_dict[assigned_player]['team']
+                curr_pos = get_center_of_bbox(player_dict[assigned_player]['bbox'])
 
-                # Apakah pemain baru saja menerima bola dari status meluncur/lepas?
-                if ball_state == 'FREE' and last_possessor is not None and possession_lost_pos is not None:
-                    if curr_ball_pos is not None:
-                        # UKUR SEBERAPA JAUH BOLA MELUNCUR SENDIRIAN
-                        transit_distance = measure_distance(possession_lost_pos, curr_ball_pos)
-                        
-                        # Jika timnya sama, beda orang, dan jarak luncurannya cukup jauh
-                        if team == last_possessor_team and assigned_player != last_possessor:
-                            if transit_distance > MIN_TRANSIT_DISTANCE:
-                                team_passes[team] += 1
-                                active_pass_lines.append({
-                                    'p1': possession_lost_pos,
-                                    'p2': curr_ball_pos,
-                                    'color': team_assigner.team_colors[team],
-                                    'frames_left': PASS_LINE_DURATION
-                                })
+                # Jika penguasa bola berubah
+                if last_possessor is not None and last_possessor != assigned_player:
+                    
+                    # Cek jarak spasial antara posisi pemain lama dan pemain baru
+                    spatial_distance = measure_distance(last_possessor_pos, curr_pos)
+                    
+                    # Jika tim sama, DAN jarak antar pemain jauh (bukan kemelut/ID Switch) -> VALID PASS
+                    if team == last_possessor_team and spatial_distance > MIN_PASS_DISTANCE:
+                        team_passes[team] += 1
+                        active_pass_lines.append({
+                            'p1': last_possessor_pos,
+                            'p2': curr_pos,
+                            'color': team_assigner.team_colors[team],
+                            'frames_left': PASS_LINE_DURATION
+                        })
                 
-                # Update status (Bola sedang dikuasai)
-                ball_state = 'POSSESSED'
                 last_possessor = assigned_player
                 last_possessor_team = team
-
+                last_possessor_pos = curr_pos
         else:
             candidate_player = None
             consecutive_frames_with_ball = 0
-            frames_without_ball += 1
-            
-            # Jika bola tidak dikuasai selama 3 frame
-            if frames_without_ball >= FRAMES_FOR_TRANSIT:
-                if ball_state == 'POSSESSED':
-                    # CATAT TITIK DIMANA BOLA DILEPAS (Kunci untuk membedakan dribble vs pass)
-                    possession_lost_pos = last_valid_ball_pos
-                
-                ball_state = 'FREE'
-        # --------------------------------------------- #
+        # ---------------------------------------------------------- #
 
-        # Gambar UI dan Visual
+        # --- DRAWING VISUALS ---
         for track_id, player in player_dict.items():
             color = player.get("team_color", (0, 0, 255))
             frame = tracker.draw_ellipse(frame, player["bbox"], color, track_id)
@@ -184,17 +156,14 @@ def main():
             line_info['frames_left'] -= 1
 
         cv2.rectangle(frame, (10, 10), (320, 100), (255, 255, 255), -1)
-        cv2.putText(frame, f"Team 1 Passes: {team_passes[1]}", (20, 45), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,0), 2)
-        cv2.putText(frame, f"Team 2 Passes: {team_passes[2]}", (20, 85), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,0), 2)
+        cv2.putText(frame, f"Team 1 Passes: {team_passes[1]}", (20, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,0), 2)
+        cv2.putText(frame, f"Team 2 Passes: {team_passes[2]}", (20, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,0), 2)
 
         out.write(frame)
         frame_num += 1
         
         if frame_num % 50 == 0:
-            progress = (frame_num / total_frames) * 100
-            print(f"   Progress: {frame_num}/{total_frames} frames ({progress:.1f}%)")
+            print(f"   Progress: {frame_num}/{total_frames} frames ({(frame_num / total_frames) * 100:.1f}%)")
     
     cap.release()
     out.release()
