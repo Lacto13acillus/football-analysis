@@ -3,7 +3,7 @@ from utils.bbox_utils import get_center_of_bbox, measure_distance
 class PlayerBallAssigner():
     def __init__(self):
         # Toleransi dinaikkan drastis, tapi kita menggunakan logika "Pemain Terdekat" (Nearest Neighbor)
-        self.max_player_ball_distance = 150
+        self.max_player_ball_distance = 45
 
     def assign_ball_to_player(self, players, ball_bbox):
         ball_position = get_center_of_bbox(ball_bbox)

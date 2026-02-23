@@ -87,9 +87,9 @@ def main():
     
     # PARAMETER FISIKA BOLA (Lebih responsif!)
     FRAMES_REQUIRED_FOR_POSSESSION = 2 # Cukup 2 frame untuk menangkap Quick Pass (Detik 18-27)
-    FRAMES_FOR_TRANSIT = 3             # Bola bebas 3 frame dianggap lepas
-    MIN_TRANSIT_DISTANCE = 50          # Bola HARUS MELUNCUR min 50 piksel SAAT BEBAS agar sah jadi umpan
-    PASS_LINE_DURATION = 30 
+    FRAMES_FOR_TRANSIT = 2            # Bola bebas 3 frame dianggap lepas
+    MIN_TRANSIT_DISTANCE = 30          # Bola HARUS MELUNCUR min 50 piksel SAAT BEBAS agar sah jadi umpan
+    PASS_LINE_DURATION = 25
     
     active_pass_lines = []
     # -----------------------------------
