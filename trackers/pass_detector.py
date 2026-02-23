@@ -179,18 +179,22 @@ class PassDetector:
                 'player_passes': {},
                 'average_pass_distance': 0,
                 'longest_pass': None,
-                'shortest_pass': None
+                'shortest_pass': None,
+                'top_passers': []
             }
         
-        # Initialize statistics
+        # Initialize statistics - tanpa lambda
         stats = {
             'total_passes': len(self.passes),
             'passes_by_team': {1: 0, 2: 0},
-            'player_passes': defaultdict(lambda: {'completed': 0, 'received': 0, 'to': defaultdict(int)}),
+            'player_passes': {},  # Akan diisi manual
             'pass_distances': [],
             'longest_pass': max(self.passes, key=lambda x: x['distance']),
             'shortest_pass': min(self.passes, key=lambda x: x['distance'])
         }
+        
+        # Inisialisasi player_passes sebagai dictionary biasa
+        player_passes = {}
         
         # Calculate statistics
         total_distance = 0
@@ -202,24 +206,44 @@ class PassDetector:
             # Team passes
             stats['passes_by_team'][team] += 1
             
-            # Player statistics
-            stats['player_passes'][from_p]['completed'] += 1
-            stats['player_passes'][from_p]['to'][to_p] += 1
-            stats['player_passes'][to_p]['received'] += 1
+            # Player statistics - inisialisasi jika belum ada
+            if from_p not in player_passes:
+                player_passes[from_p] = {
+                    'completed': 0, 
+                    'received': 0, 
+                    'to': {}
+                }
+            if to_p not in player_passes:
+                player_passes[to_p] = {
+                    'completed': 0, 
+                    'received': 0, 
+                    'to': {}
+                }
+            
+            # Update stats
+            player_passes[from_p]['completed'] += 1
+            if to_p not in player_passes[from_p]['to']:
+                player_passes[from_p]['to'][to_p] = 0
+            player_passes[from_p]['to'][to_p] += 1
+            
+            player_passes[to_p]['received'] += 1
             
             # Distances
             stats['pass_distances'].append(pass_event['distance'])
             total_distance += pass_event['distance']
         
         # Average pass distance
-        stats['average_pass_distance'] = total_distance / len(self.passes)
+        stats['average_pass_distance'] = total_distance / len(self.passes) if self.passes else 0
+        stats['player_passes'] = player_passes
         
-        # Find top passers
-        stats['top_passers'] = sorted(
-            [(pid, data['completed']) for pid, data in stats['player_passes'].items()],
-            key=lambda x: x[1],
-            reverse=True
-        )[:5]
+        # Find top passers - manual sorting tanpa lambda di pickle
+        top_passers_list = []
+        for player_id, data in player_passes.items():
+            top_passers_list.append((player_id, data['completed']))
+        
+        # Sort manual
+        top_passers_list.sort(key=lambda x: x[1], reverse=True)
+        stats['top_passers'] = top_passers_list[:5]
         
         return stats
     
@@ -234,12 +258,18 @@ class PassDetector:
         # Get all passes up to current frame
         relevant_passes = [p for p in self.passes if p['frame'] <= frame_num]
         
-        # Create pass network
-        network = defaultdict(lambda: defaultdict(int))
+        # Create pass network - manual tanpa defaultdict
+        network = {}
         
         for pass_event in relevant_passes:
             from_p = pass_event['from_player']
             to_p = pass_event['to_player']
+            
+            if from_p not in network:
+                network[from_p] = {}
+            if to_p not in network[from_p]:
+                network[from_p][to_p] = 0
+                
             network[from_p][to_p] += 1
         
         return network
