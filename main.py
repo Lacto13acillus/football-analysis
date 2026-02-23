@@ -91,9 +91,9 @@ def main():
     ball_state = 'FREE' 
     
     # PARAMETER KETAT (AKURASI TINGGI)
-    FRAMES_REQUIRED_FOR_POSSESSION = 5 # Butuh 5 frame konstan untuk kuasai bola
-    FRAMES_FOR_TRANSIT = 5             # Bola harus lepas >5 frame agar sah disebut sedang dioper
-    MIN_PASS_DISTANCE = 90             # Jarak minimal operan (mencegah ID Switch saat dribble)
+    FRAMES_REQUIRED_FOR_POSSESSION = 2 # Butuh 5 frame konstan untuk kuasai bola
+    FRAMES_FOR_TRANSIT = 2             # Bola harus lepas >5 frame agar sah disebut sedang dioper
+    MIN_PASS_DISTANCE = 65             # Jarak minimal operan (mencegah ID Switch saat dribble)
     PASS_LINE_DURATION = 25 
     
     active_pass_lines = []
