@@ -113,7 +113,7 @@ def main():
     consecutive_frames_with_ball = 0
     
     # Syarat: Pemain harus memegang bola minimal 7 frame berturut-turut agar dianggap SAH
-    FRAMES_REQUIRED_FOR_POSSESSION = 7 
+    FRAMES_REQUIRED_FOR_POSSESSION = 3
     # --------------------------------------------------
     
     while True:
