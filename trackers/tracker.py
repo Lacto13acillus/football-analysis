@@ -139,6 +139,93 @@ class Tracker:
         cv2.drawContours(frame, [triangle_points],0,(0,0,0), 2)
 
         return frame
+    
+    def draw_pass_statistics(self, frame, pass_stats, possession_stats):
+        """
+        Draw pass statistics on the frame
+        """
+        # Create semi-transparent overlay
+        overlay = frame.copy()
+        height, width = frame.shape[:2]
+
+        # Draw statistics panel in top-left corner
+        panel_x, panel_y = 20, 20
+        panel_width, panel_height = 300, 200
+
+        # Draw background
+        cv2.rectangle(overlay, (panel_x, panel_y), 
+                      (panel_x + panel_width, panel_y + panel_height), 
+                      (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
+
+        # Draw border
+        cv2.rectangle(frame, (panel_x, panel_y), 
+                      (panel_x + panel_width, panel_y + panel_height), 
+                      (255, 255, 255), 2)
+
+        # Title
+        cv2.putText(frame, "PASS STATISTICS", 
+                    (panel_x + 10, panel_y + 25), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+        # Total passes
+        cv2.putText(frame, f"Total Passes: {pass_stats.get('total_passes', 0)}", 
+                    (panel_x + 10, panel_y + 50), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+
+        # Team passes
+        y_offset = 75
+        for team in [1, 2]:
+            color = (0, 0, 255) if team == 1 else (255, 0, 0)
+            passes = pass_stats.get('passes_by_team', {}).get(team, 0)
+            cv2.putText(frame, f"Team {team} Passes: {passes}", 
+                        (panel_x + 10, panel_y + y_offset), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+            y_offset += 20
+
+        # Possession
+        if possession_stats:
+            cv2.putText(frame, "Possession:", 
+                        (panel_x + 10, panel_y + 115), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+            for team in [1, 2]:
+                color = (0, 0, 255) if team == 1 else (255, 0, 0)
+                percentage = possession_stats.get(team, {}).get('percentage', 0)
+                cv2.putText(frame, f"Team {team}: {percentage:.1f}%", 
+                            (panel_x + 20, panel_y + 135 + (team-1)*20), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+        # Average pass distance
+        avg_distance = pass_stats.get('average_pass_distance', 0)
+        cv2.putText(frame, f"Avg Pass Distance: {avg_distance:.1f}px", 
+                    (panel_x + 10, panel_y + 180), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+
+        return frame
+
+    def draw_pass_connection(self, frame, from_pos, to_pos, team):
+        """
+        Draw a line showing a pass connection
+        """
+        color = (0, 0, 255) if team == 1 else (255, 0, 0)
+        
+        # Draw line with arrow effect
+        cv2.line(frame, from_pos, to_pos, color, 2, cv2.LINE_AA)
+        
+        # Draw circles at endpoints
+        cv2.circle(frame, from_pos, 5, color, -1)
+        cv2.circle(frame, to_pos, 5, color, -1)
+        
+        # Draw small arrow
+        direction = (to_pos[0] - from_pos[0], to_pos[1] - from_pos[1])
+        length = np.sqrt(direction[0]**2 + direction[1]**2)
+        if length > 0:
+            direction = (direction[0]/length, direction[1]/length)
+            arrow_pos = (int(to_pos[0] - direction[0]*15), int(to_pos[1] - direction[1]*15))
+            cv2.arrowedLine(frame, arrow_pos, to_pos, color, 2, tipLength=0.3)
+        
+        return frame
 
     def draw_annotations(self,video_frames, tracks):
         output_video_frames= []
@@ -172,3 +259,5 @@ class Tracker:
             output_video_frames.append(frame)
 
         return output_video_frames
+    
+    
