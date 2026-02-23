@@ -1,6 +1,7 @@
 from trackers import Tracker
 from team_assigner import TeamAssigner
 from trackers.player_ball_assigner import PlayerBallAssigner
+from utils.bbox_utils import get_center_of_bbox, measure_distance 
 import numpy as np
 import cv2
 import pickle
@@ -68,16 +69,6 @@ def main():
     team_assigner = TeamAssigner()
     team_assigner.assign_team_color(best_frame, tracks['players'][best_frame_idx])
     
-    def is_yellow_like(color):
-        b, g, r = int(color[0]), int(color[1]), int(color[2])
-        return (g > 180 and r > 180 and b < 150)  
-    
-    team_1_is_yellow = is_yellow_like(team_assigner.team_colors[1])
-    team_2_is_yellow = is_yellow_like(team_assigner.team_colors[2])
-    
-    if team_1_is_yellow or team_2_is_yellow:
-        print("   ⚠️  Warning: One team detected as yellow (referee might be in clustering)")
-    
     for frame_num, player_track in enumerate(tracks['players']):
         for player_id, track in player_track.items():
             team = team_assigner.get_player_team(best_frame, track['bbox'], player_id)
@@ -102,19 +93,24 @@ def main():
     
     frame_num = 0
 
-    # --- INISIALISASI VARIABEL PASSING (DIPERBARUI) ---
+    # --- INISIALISASI VARIABEL PASSING ---
     player_assigner = PlayerBallAssigner()
     team_passes = {1: 0, 2: 0}
     
     confirmed_player_with_ball = None 
     current_team_in_possession = None
+    last_confirmed_pos = None # Menyimpan koordinat pemain terakhir yg pegang bola
     
     candidate_player = None
     consecutive_frames_with_ball = 0
     
-    # Syarat: Pemain harus memegang bola minimal 7 frame berturut-turut agar dianggap SAH
-    FRAMES_REQUIRED_FOR_POSSESSION = 3
-    # --------------------------------------------------
+    # PARAMETER LOGIKA SEPAK BOLA
+    FRAMES_REQUIRED_FOR_POSSESSION = 3 # Toleransi sentuhan ringan
+    MIN_PASS_DISTANCE = 50 # Jarak piksel minimal untuk dianggap umpan valid (mencegah ID Switch & kemelut)
+    PASS_LINE_DURATION = 25 # Berapa frame garis umpan akan muncul di layar (25 frame ~ 1 detik)
+    
+    active_pass_lines = [] # Menyimpan data garis yang sedang dirender
+    # -------------------------------------
     
     while True:
         ret, frame = cap.read()
@@ -125,46 +121,57 @@ def main():
         ball_dict = tracks["ball"][frame_num]
         referee_dict = tracks["referees"][frame_num]
 
-        # ---------------- PASS DETECTION LOGIC (DIPERBARUI) ---------------- #
+        # ---------------- PASS DETECTION LOGIC ---------------- #
         assigned_player = -1
         if 1 in ball_dict: 
             ball_bbox = ball_dict[1]['bbox']
             assigned_player = player_assigner.assign_ball_to_player(player_dict, ball_bbox)
 
         if assigned_player != -1 and assigned_player is not None:
-            # Cek apakah pemain yang dekat bola SAMA dengan frame sebelumnya
             if assigned_player == candidate_player:
                 consecutive_frames_with_ball += 1
             else:
                 candidate_player = assigned_player
                 consecutive_frames_with_ball = 1
 
-            # Jika sudah memenuhi batas frame (bola benar-benar dikuasai)
+            # Jika pemain sudah sah menguasai bola
             if consecutive_frames_with_ball >= FRAMES_REQUIRED_FOR_POSSESSION:
                 player_dict[assigned_player]['has_ball'] = True
                 team = player_dict[assigned_player]['team']
+                curr_pos = get_center_of_bbox(player_dict[assigned_player]['bbox'])
 
-                # Cek apakah bola berpindah penguasaan dari pemain sebelumnya
+                # Jika penguasa bola berbeda dengan sebelumnya
                 if confirmed_player_with_ball is not None and confirmed_player_with_ball != assigned_player:
-                    # Jika timnya sama, berarti PASS SUKSES!
-                    if current_team_in_possession == team:
-                        team_passes[team] += 1
+                    # Cek apakah timnya sama (berarti operan)
+                    if current_team_in_possession == team and last_confirmed_pos is not None:
+                        # FILTER JARAK: Ukur jarak operan
+                        pass_distance = measure_distance(last_confirmed_pos, curr_pos)
+                        
+                        # Jika jaraknya cukup jauh (bukan ID switch / bukan kemelut berdekatan)
+                        if pass_distance > MIN_PASS_DISTANCE:
+                            team_passes[team] += 1
+                            
+                            # Simpan data garis visual untuk dirender
+                            active_pass_lines.append({
+                                'p1': last_confirmed_pos,
+                                'p2': curr_pos,
+                                'color': team_assigner.team_colors[team],
+                                'frames_left': PASS_LINE_DURATION
+                            })
                 
-                # Update status penguasaan bola yang sah
+                # Update status bola terakhir
                 confirmed_player_with_ball = assigned_player
                 current_team_in_possession = team
+                last_confirmed_pos = curr_pos
         else:
-            # Bola tidak dekat siapa-siapa (bola liar), reset perhitungan sementara
             candidate_player = None
             consecutive_frames_with_ball = 0
-        # ------------------------------------------------------------------- #
+        # ------------------------------------------------------ #
 
         # Draw Players
         for track_id, player in player_dict.items():
             color = player.get("team_color", (0, 0, 255))
             frame = tracker.draw_ellipse(frame, player["bbox"], color, track_id)
-            
-            # Jika player bawa bola (sudah lolos filter frame), gambar segitiga merah
             if player.get('has_ball', False):
                  frame = tracker.draw_traingle(frame, player["bbox"], (0,0,255))
 
@@ -175,6 +182,26 @@ def main():
         # Draw ball 
         for track_id, ball in ball_dict.items():
             frame = tracker.draw_traingle(frame, ball["bbox"], (0, 255, 0))
+
+        # ---------------- DRAW VISUAL PASS LINES ---------------- #
+        # Membersihkan garis yang sudah habis masa tampilnya (frames_left <= 0)
+        active_pass_lines = [line for line in active_pass_lines if line['frames_left'] > 0]
+        
+        for line_info in active_pass_lines:
+            p1 = line_info['p1']
+            p2 = line_info['p2']
+            color = (int(line_info['color'][0]), int(line_info['color'][1]), int(line_info['color'][2]))
+            
+            # Gambar garis dari pelempar ke penerima
+            cv2.line(frame, p1, p2, color, thickness=3, lineType=cv2.LINE_AA)
+            # Gambar titik kecil di posisi pelempar
+            cv2.circle(frame, p1, radius=6, color=color, thickness=-1)
+            # Gambar titik putih di posisi penerima (target)
+            cv2.circle(frame, p2, radius=8, color=(255, 255, 255), thickness=-1)
+            cv2.circle(frame, p2, radius=8, color=color, thickness=2)
+            
+            line_info['frames_left'] -= 1
+        # -------------------------------------------------------- #
 
         # ---------------- STATISTIK PASSING ---------------- #
         cv2.rectangle(frame, (10, 10), (320, 100), (255, 255, 255), -1)
