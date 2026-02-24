@@ -85,6 +85,9 @@ def main():
     
     active_passes = []
     
+    # INISIALISASI COUNTER REAL-TIME DI SINI
+    current_pass_count = 0 
+    
     frame_num = 0
     while True:
         ret, frame = cap.read()
@@ -93,9 +96,6 @@ def main():
         
         player_dict = tracks["players"][frame_num]
         ball_dict = tracks["ball"][frame_num]
-        
-        # DIBLOKIR: Data wasit tidak lagi diperlukan
-        # referee_dict = tracks["referees"][frame_num] 
 
         # Draw Players
         for track_id, player in player_dict.items():
@@ -103,18 +103,17 @@ def main():
             frame = tracker.draw_ellipse(frame, player["bbox"], color, track_id)
             
             if ball_possessions[frame_num] == track_id:
-                frame = tracker.draw_traingle(frame, player["bbox"], (0, 0, 255)) # Segitiga merah untuk yang pegang bola
+                frame = tracker.draw_traingle(frame, player["bbox"], (0, 0, 255)) 
 
-        # DIBLOKIR: Draw Referee
-        # for _, referee in referee_dict.items():
-        #     frame = tracker.draw_ellipse(frame, referee["bbox"], (0, 255, 255))
-        
         # Draw ball 
         for track_id, ball in ball_dict.items():
             frame = tracker.draw_traingle(frame, ball["bbox"], (0, 255, 0))
         
+        # CEK UMPAN YANG SELESAI DI FRAME INI
         for pass_event in passes:
+            # Jika frame saat ini adalah frame di mana bola diterima pemain lain
             if pass_event['frame_end'] == frame_num:
+                current_pass_count += 1 # TAMBAHKAN COUNTER +1
                 active_passes.append({
                     'pass': pass_event,
                     'frames_remaining': 30  
@@ -131,8 +130,8 @@ def main():
         for i in reversed(passes_to_remove):
             active_passes.pop(i)
         
-        # Draw pass statistics
-        frame = tracker.draw_pass_statistics(frame, pass_stats)
+        # MENGGAMBAR STATISTIK DENGAN ANGKA YANG REAL-TIME
+        frame = tracker.draw_pass_statistics(frame, current_pass_count)
 
         out.write(frame)
         frame_num += 1

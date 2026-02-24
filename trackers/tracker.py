@@ -89,14 +89,15 @@ class Tracker:
 
         return frame
 
-    def draw_pass_statistics(self, frame, pass_stats):
-        """ Draw total pass statistics on frame """
+    def draw_pass_statistics(self, frame, current_pass_count):
+        """ Draw real-time pass statistics on frame """
         overlay = frame.copy()
+        # Mengubah ukuran kotak hitam agar lebih pas
         cv2.rectangle(overlay, (20, 20), (280, 80), (0, 0, 0), -1)
         frame = cv2.addWeighted(overlay, 0.6, frame, 0.4, 0)
         
-        # Cukup tampilkan total umpan
-        text = f"Total Passes: {pass_stats['total_passes']}"
+        # Menampilkan angka yang dimasukkan dari loop utama
+        text = f"Total Passes: {current_pass_count}"
         cv2.putText(frame, text, (40, 60), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
         
