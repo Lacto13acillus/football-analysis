@@ -9,23 +9,23 @@ class PassDetector:
         self.fps = fps
         
         # === POSSESSION SMOOTHING ===
-        self.smoothing_window = 5          # Dikurangi dari 7
-        self.min_stable_frames = 3         # Dikurangi DRASTIS dari 8 -> 3
+        self.smoothing_window = 5
+        self.min_stable_frames = 3
         
         # === PASS VALIDATION ===
-        self.min_pass_distance = 50        # Dikurangi dari 80 -> 50
-        self.max_pass_distance = 700       # Diperbesar
-        self.cooldown_frames = 10          # Dikurangi dari 20 -> 10
-        self.min_possession_duration = 3   # Dikurangi dari 5 -> 3
+        self.min_pass_distance = 50
+        self.max_pass_distance = 700
+        self.cooldown_frames = 10
+        self.min_possession_duration = 3
         
-        # === BALL MOVEMENT (lebih longgar) ===
-        self.ball_movement_check_radius = 15  # Cek bola di radius frame lebih lebar
-        self.ball_movement_threshold = 15     # Dikurangi dari 30 -> 15
+        # === BALL MOVEMENT ===
+        self.ball_movement_check_radius = 15
+        self.ball_movement_threshold = 15
+        
+        # === BARU: Toleransi pencarian player ===
+        self.player_search_radius = 10  # Cari di ±10 frame jika player hilang
 
     def smooth_possessions(self, raw_possessions):
-        """
-        Majority Vote sliding window untuk hilangkan flickering.
-        """
         smoothed = list(raw_possessions)
         half_window = self.smoothing_window // 2
         
@@ -40,17 +40,12 @@ class PassDetector:
         return smoothed
 
     def fill_short_gaps(self, possessions, max_gap=5):
-        """
-        BARU: Isi gap pendek (-1) dengan possession terakhir yang valid.
-        Mengatasi bola yang hilang sebentar lalu kembali ke pemain yang sama.
-        """
         filled = list(possessions)
         last_valid = -1
         gap_start = -1
         
         for i in range(len(filled)):
             if filled[i] != -1:
-                # Jika sebelumnya ada gap pendek, isi dengan last_valid
                 if last_valid != -1 and gap_start != -1:
                     gap_length = i - gap_start
                     if gap_length <= max_gap:
@@ -65,9 +60,6 @@ class PassDetector:
         return filled
 
     def get_stable_segments(self, smoothed_possessions):
-        """
-        Identifikasi segmen possession yang stabil.
-        """
         segments = []
         current_player = -1
         segment_start = 0
@@ -85,7 +77,6 @@ class PassDetector:
                 current_player = player_id
                 segment_start = frame_num
         
-        # Segment terakhir
         if current_player != -1:
             duration = len(smoothed_possessions) - segment_start
             if duration >= self.min_stable_frames:
@@ -98,10 +89,6 @@ class PassDetector:
         return segments
 
     def validate_ball_movement(self, tracks, frame_start, frame_end):
-        """
-        Validasi bola bergerak — cek di radius yang lebih lebar 
-        (sebelum dan sesudah transisi)
-        """
         check_start = max(0, frame_start - self.ball_movement_check_radius)
         check_end = min(len(tracks['ball']), frame_end + self.ball_movement_check_radius)
         
@@ -115,19 +102,43 @@ class PassDetector:
         if len(ball_positions) < 2:
             return 0
         
-        # Jarak antara posisi pertama dan terakhir bola (bukan total path)
         direct_distance = measure_distance(ball_positions[0], ball_positions[-1])
         return direct_distance
 
-    def detect_passes(self, tracks, ball_possessions, debug=True):
+    def find_player_nearby(self, tracks, player_id, target_frame, search_radius=None):
         """
-        Pipeline:
-        1. Fill short gaps
-        2. Smooth possessions
-        3. Get stable segments
-        4. Validate transitions as passes
+        BARU: Cari data pemain di frame terdekat jika tidak ada di frame target.
+        Mengembalikan (player_data, actual_frame) atau (None, -1).
         """
+        if search_radius is None:
+            search_radius = self.player_search_radius
         
+        total_frames = len(tracks['players'])
+        
+        # Cek frame target dulu
+        player_data = tracks['players'][target_frame].get(player_id)
+        if player_data:
+            return player_data, target_frame
+        
+        # Cari di frame terdekat (expanding outward: ±1, ±2, ±3, ...)
+        for offset in range(1, search_radius + 1):
+            # Cek frame sebelumnya
+            check_frame = target_frame - offset
+            if 0 <= check_frame < total_frames:
+                player_data = tracks['players'][check_frame].get(player_id)
+                if player_data:
+                    return player_data, check_frame
+            
+            # Cek frame sesudahnya
+            check_frame = target_frame + offset
+            if 0 <= check_frame < total_frames:
+                player_data = tracks['players'][check_frame].get(player_id)
+                if player_data:
+                    return player_data, check_frame
+        
+        return None, -1
+
+    def detect_passes(self, tracks, ball_possessions, debug=True):
         # === DEBUG: Cek raw data ===
         if debug:
             valid_count = sum(1 for p in ball_possessions if p != -1)
@@ -139,96 +150,97 @@ class PassDetector:
             
             if valid_count == 0:
                 print(f"[DEBUG] *** PROBLEM: No ball possession detected at all! ***")
-                print(f"[DEBUG] *** Check PlayerBallAssigner and ball detection ***")
                 return []
-            
             if len(unique_players) < 2:
                 print(f"[DEBUG] *** PROBLEM: Only {len(unique_players)} player(s) ever had the ball! ***")
-                print(f"[DEBUG] *** Need at least 2 different players for a pass ***")
                 return []
 
         # === TAHAP 1: Fill short gaps ===
         filled = self.fill_short_gaps(ball_possessions, max_gap=5)
-        
         if debug:
-            filled_valid = sum(1 for p in filled if p != -1)
-            print(f"[DEBUG] After gap-fill: {filled_valid} frames with possession")
-        
+            print(f"[DEBUG] After gap-fill: {sum(1 for p in filled if p != -1)} frames with possession")
+
         # === TAHAP 2: Smoothing ===
         smoothed = self.smooth_possessions(filled)
-        
         if debug:
-            smoothed_valid = sum(1 for p in smoothed if p != -1)
-            smoothed_players = set(p for p in smoothed if p != -1)
-            print(f"[DEBUG] After smoothing: {smoothed_valid} frames, players: {smoothed_players}")
-        
+            print(f"[DEBUG] After smoothing: {sum(1 for p in smoothed if p != -1)} frames")
+
         # === TAHAP 3: Stable segments ===
         segments = self.get_stable_segments(smoothed)
-        
         if debug:
             print(f"[DEBUG] Stable segments found: {len(segments)}")
             for i, seg in enumerate(segments):
                 dur = seg['frame_end'] - seg['frame_start']
                 print(f"[DEBUG]   Seg #{i}: Player {seg['player_id']}, "
                       f"frames {seg['frame_start']}-{seg['frame_end']} (duration={dur})")
-            
             if len(segments) < 2:
                 print(f"[DEBUG] *** PROBLEM: Less than 2 stable segments! ***")
-                print(f"[DEBUG] *** Try lowering min_stable_frames (currently {self.min_stable_frames}) ***")
                 return []
-        
-        # === TAHAP 4: Detect passes from transitions ===
+
+        # === TAHAP 4: Detect passes ===
         passes = []
         last_pass_frame = -999
-        
+
         if debug:
             print(f"\n[DEBUG] === EVALUATING TRANSITIONS ===")
-        
+
         for i in range(len(segments) - 1):
             seg_from = segments[i]
             seg_to = segments[i + 1]
-            
+
             from_player = seg_from['player_id']
             to_player = seg_to['player_id']
-            
+
             transition_frame_start = seg_from['frame_end']
             transition_frame_end = seg_to['frame_start']
-            
+
             if debug:
                 print(f"\n[DEBUG] Transition #{i}: Player {from_player} -> Player {to_player}")
-            
-            # Skip jika pemain sama
+
+            # Skip pemain sama
             if from_player == to_player:
                 if debug:
                     print(f"[DEBUG]   SKIP: Same player")
                 continue
-            
-            # Cooldown check
+
+            # Cooldown
             if (transition_frame_end - last_pass_frame) < self.cooldown_frames:
                 if debug:
                     print(f"[DEBUG]   SKIP: Cooldown ({transition_frame_end - last_pass_frame} < {self.cooldown_frames})")
                 continue
-            
-            # Possession duration check
+
+            # Possession duration
             from_duration = seg_from['frame_end'] - seg_from['frame_start']
             if from_duration < self.min_possession_duration:
                 if debug:
                     print(f"[DEBUG]   SKIP: From-segment too short ({from_duration} < {self.min_possession_duration})")
                 continue
-            
-            # Posisi pemain
-            from_player_data = tracks['players'][transition_frame_start].get(from_player)
-            to_player_data = tracks['players'][transition_frame_end].get(to_player)
-            
+
+            # ====== PERBAIKAN UTAMA: Cari player di frame terdekat ======
+            from_player_data, from_actual_frame = self.find_player_nearby(
+                tracks, from_player, transition_frame_start
+            )
+            to_player_data, to_actual_frame = self.find_player_nearby(
+                tracks, to_player, transition_frame_end
+            )
+
             if not from_player_data or not to_player_data:
                 if debug:
-                    print(f"[DEBUG]   SKIP: Player data missing at transition frames")
+                    msg = ""
+                    if not from_player_data:
+                        msg += f"Player {from_player} not found near frame {transition_frame_start}. "
+                    if not to_player_data:
+                        msg += f"Player {to_player} not found near frame {transition_frame_end}."
+                    print(f"[DEBUG]   SKIP: Player data missing even with ±{self.player_search_radius} search. {msg}")
                 continue
-            
+
+            if debug and (from_actual_frame != transition_frame_start or to_actual_frame != transition_frame_end):
+                print(f"[DEBUG]   (Used nearby frames: from=f{from_actual_frame}, to=f{to_actual_frame})")
+
             from_pos = get_center_of_bbox_bottom(from_player_data['bbox'])
             to_pos = get_center_of_bbox_bottom(to_player_data['bbox'])
             distance = measure_distance(from_pos, to_pos)
-            
+
             # Validasi jarak
             if distance < self.min_pass_distance:
                 if debug:
@@ -238,21 +250,20 @@ class PassDetector:
                 if debug:
                     print(f"[DEBUG]   SKIP: Distance too far ({distance:.0f} > {self.max_pass_distance})")
                 continue
-            
+
             # Validasi ball movement
             ball_movement = self.validate_ball_movement(
                 tracks, transition_frame_start, transition_frame_end
             )
-            
             if ball_movement < self.ball_movement_threshold:
                 if debug:
                     print(f"[DEBUG]   SKIP: Ball didn't move enough ({ball_movement:.0f} < {self.ball_movement_threshold})")
                 continue
-            
+
             # === PASS VALID! ===
             if debug:
                 print(f"[DEBUG]   *** PASS DETECTED! dist={distance:.0f}px, ball_move={ball_movement:.0f}px ***")
-            
+
             pass_event = {
                 'frame_start': transition_frame_start,
                 'frame_end': transition_frame_end,
@@ -266,10 +277,10 @@ class PassDetector:
             }
             passes.append(pass_event)
             last_pass_frame = transition_frame_end
-        
+
         if debug:
             print(f"\n[DEBUG] === RESULT: {len(passes)} passes detected ===\n")
-        
+
         return passes
 
     def get_pass_statistics(self, passes):
