@@ -7,10 +7,6 @@ class PlayerBallAssigner():
         self.max_player_ball_distance = 70
     
     def assign_ball_to_player(self, players, ball_bbox):
-        """
-        Return (player_id, distance) — menambahkan distance agar bisa
-        digunakan untuk confidence scoring di smoothing.
-        """
         ball_position = get_center_of_bbox(ball_bbox)
         
         minimum_distance = 99999
@@ -18,8 +14,6 @@ class PlayerBallAssigner():
         
         for player_id, player in players.items():
             player_bbox = player['bbox']
-            
-            # Cek jarak dari kaki kiri dan kanan pemain ke bola
             distance_left = measure_distance((player_bbox[0], player_bbox[-1]), ball_position)
             distance_right = measure_distance((player_bbox[2], player_bbox[-1]), ball_position)
             distance = min(distance_left, distance_right)
@@ -29,4 +23,4 @@ class PlayerBallAssigner():
                     minimum_distance = distance
                     assigned_player = player_id
         
-        return assigned_player, minimum_distance
+        return assigned_player, minimum_distance  # <-- HARUS TUPLE!
