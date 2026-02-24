@@ -82,7 +82,6 @@ def main():
         print("   *** FATAL: No player ever possesses the ball! ***")
         print("   *** Try increasing max_player_ball_distance (currently 70) ***")
         
-        # Debug: cek jarak terdekat bola-pemain di beberapa frame
         print("\n   Checking closest player-ball distances in sample frames:")
         sample_frames = list(range(0, len(raw_ball_possessions), max(1, len(raw_ball_possessions) // 10)))
         for sf in sample_frames[:10]:
@@ -122,7 +121,6 @@ def main():
     fourcc = cv2.VideoWriter_fourcc(*'XVID')
     out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
 
-    active_passes = []
     current_pass_count = 0
     frame_num = 0
 
@@ -147,25 +145,12 @@ def main():
         for track_id, ball in ball_dict.items():
             frame = tracker.draw_traingle(frame, ball["bbox"], (0, 255, 0))
 
-        # Pass events
+        # Pass counter — increment saat frame_display tercapai (bola sudah di penerima)
         for pass_event in passes:
-            if pass_event['frame_end'] == frame_num:
+            if pass_event['frame_display'] == frame_num:
                 current_pass_count += 1
-                active_passes.append({
-                    'pass': pass_event,
-                    'frames_remaining': int(fps * 1.2)
-                })
 
-        # Draw arrows
-        new_active = []
-        for ap in active_passes:
-            if ap['frames_remaining'] > 0:
-                frame = tracker.draw_pass_arrow(frame, ap['pass'])
-                ap['frames_remaining'] -= 1
-                new_active.append(ap)
-        active_passes = new_active
-
-        # Draw stats
+        # Draw stats (tanpa panah)
         frame = tracker.draw_pass_statistics(frame, current_pass_count)
 
         out.write(frame)
