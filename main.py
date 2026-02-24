@@ -1,7 +1,7 @@
 from trackers import Tracker
-from team_assigner import TeamAssigner
 from trackers.player_ball_assigner import PlayerBallAssigner
 from trackers.pass_detector import PassDetector
+# from team_assigner import TeamAssigner # DIBLOKIR: Tidak perlu team assigner
 import numpy as np
 import cv2
 import pickle
@@ -12,9 +12,8 @@ def main():
     stub_path = 'stubs/track_stubs.pkl'
     output_path = 'output_videos/passing.avi'
     
-    # Initialize
     tracker = Tracker('models/best.pt')
-    team_assigner = TeamAssigner()
+    # team_assigner = TeamAssigner() # DIBLOKIR
     player_ball_assigner = PlayerBallAssigner()
     pass_detector = PassDetector()
 
@@ -37,49 +36,14 @@ def main():
         del video_frames
         print("Tracks saved to stub")
 
-    # ===== STEP 2: Team Assignment =====
-    print("Assigning team colors...")
-    
-    best_frame_idx = None
-    best_frame = None
-    best_score = 0
-    
-    cap = cv2.VideoCapture(video_path)
-    
-    for frame_idx in range(len(tracks['players'])):
-        num_players = len(tracks['players'][frame_idx])
-        num_referees = len(tracks['referees'][frame_idx])
-        score = num_players - (num_referees * 3)
-        
-        if num_players >= 4 and score > best_score:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-            ret, frame = cap.read()
-            if ret:
-                best_frame = frame
-                best_frame_idx = frame_idx
-                best_score = score
-    
-    if best_frame is None:
-        print(" Error: No suitable frame found!")
-        cap.release()
-        return
-    
-    print(f"   Selected frame {best_frame_idx}: {len(tracks['players'][best_frame_idx])} players, {len(tracks['referees'][best_frame_idx])} referees")
-    
-    team_assigner.assign_team_color(best_frame, tracks['players'][best_frame_idx])
-    
-    print(f"   Team 1 color (BGR): {team_assigner.team_colors[1]}")
-    print(f"   Team 2 color (BGR): {team_assigner.team_colors[2]}")
+    # ===== STEP 2: Team Assignment (DIMODIFIKASI UNTUK 1 TIM) =====
+    print("Assigning all players to Training Group...")
     
     for frame_num, player_track in enumerate(tracks['players']):
         for player_id, track in player_track.items():
-            team = team_assigner.get_player_team(best_frame,
-                                                 track['bbox'],
-                                                 player_id)
-            tracks['players'][frame_num][player_id]['team'] = team 
-            tracks['players'][frame_num][player_id]['team_color'] = team_assigner.team_colors[team]
+            tracks['players'][frame_num][player_id]['team'] = 1 
+            tracks['players'][frame_num][player_id]['team_color'] = (255, 255, 255) # Warna putih untuk semua pemain
     
-    del best_frame
     print("Team assignment complete")
 
     # ===== STEP 3: Ball Possession =====
@@ -103,13 +67,12 @@ def main():
     passes = pass_detector.detect_passes(tracks, ball_possessions)
     pass_stats = pass_detector.get_pass_statistics(passes)
     
-    print(f"   Detected {len(passes)} passes")
-    print(f"   Team 1: {pass_stats[1]['successful']}/{pass_stats[1]['total']} ({pass_stats[1]['success_rate']:.1f}%)")
-    print(f"   Team 2: {pass_stats[2]['successful']}/{pass_stats[2]['total']} ({pass_stats[2]['success_rate']:.1f}%)")
+    print(f"   Detected {pass_stats['total_passes']} total passes")
 
     # ===== STEP 5: Render Video =====
     print("🎬 Rendering video with pass annotations...")
     
+    cap = cv2.VideoCapture(video_path)
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
     
     fps = int(cap.get(cv2.CAP_PROP_FPS))
@@ -117,12 +80,9 @@ def main():
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     
-    print(f"   Video: {width}x{height} @ {fps} FPS, {total_frames} frames")
-    
     fourcc = cv2.VideoWriter_fourcc(*'XVID')
     out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
     
-    # Create pass display windows (show arrow for 30 frames after pass)
     active_passes = []
     
     frame_num = 0
@@ -131,37 +91,35 @@ def main():
         if not ret or frame_num >= len(tracks['players']):
             break
         
-        # Get detections for this frame
         player_dict = tracks["players"][frame_num]
         ball_dict = tracks["ball"][frame_num]
-        referee_dict = tracks["referees"][frame_num]
+        
+        # DIBLOKIR: Data wasit tidak lagi diperlukan
+        # referee_dict = tracks["referees"][frame_num] 
 
         # Draw Players
         for track_id, player in player_dict.items():
-            color = player.get("team_color", (0, 0, 255))
+            color = player.get("team_color", (255, 255, 255))
             frame = tracker.draw_ellipse(frame, player["bbox"], color, track_id)
             
-            # Draw triangle if player has ball
             if ball_possessions[frame_num] == track_id:
-                frame = tracker.draw_traingle(frame, player["bbox"], (0, 0, 255))
+                frame = tracker.draw_traingle(frame, player["bbox"], (0, 0, 255)) # Segitiga merah untuk yang pegang bola
 
-        # Draw Referee
-        for _, referee in referee_dict.items():
-            frame = tracker.draw_ellipse(frame, referee["bbox"], (0, 255, 255))
+        # DIBLOKIR: Draw Referee
+        # for _, referee in referee_dict.items():
+        #     frame = tracker.draw_ellipse(frame, referee["bbox"], (0, 255, 255))
         
         # Draw ball 
         for track_id, ball in ball_dict.items():
             frame = tracker.draw_traingle(frame, ball["bbox"], (0, 255, 0))
         
-        # Check for new passes at this frame
         for pass_event in passes:
             if pass_event['frame_end'] == frame_num:
                 active_passes.append({
                     'pass': pass_event,
-                    'frames_remaining': 30  # Show for 30 frames (1 second)
+                    'frames_remaining': 30  
                 })
         
-        # Draw active passes
         passes_to_remove = []
         for i, active_pass in enumerate(active_passes):
             if active_pass['frames_remaining'] > 0:
@@ -170,7 +128,6 @@ def main():
             else:
                 passes_to_remove.append(i)
         
-        # Remove expired passes
         for i in reversed(passes_to_remove):
             active_passes.pop(i)
         
@@ -188,7 +145,6 @@ def main():
     out.release()
     
     print(f"Video saved to {output_path}")
-    print(f"   Total frames processed: {frame_num}")
 
 if __name__ == '__main__':
     main()

@@ -30,7 +30,7 @@ class Tracker:
 
         tracks={
             "players":[],
-            "referees":[],
+            # "referees":[], # DIBLOKIR: Tidak ada wasit
             "ball":[]
         }
 
@@ -38,19 +38,17 @@ class Tracker:
             cls_names = detection.names
             cls_names_inv = {v:k for k,v in cls_names.items()}
 
-            # Covert to supervision Detection format
             detection_supervision = sv.Detections.from_ultralytics(detection)
 
-            # Convert GoalKeeper to player object
-            for object_ind , class_id in enumerate(detection_supervision.class_id):
-                if cls_names[class_id] == "goalkeeper":
-                    detection_supervision.class_id[object_ind] = cls_names_inv["player"]
+            # DIBLOKIR: Konversi Goalkeeper ke player ditiadakan karena tidak ada kiper
+            # for object_ind , class_id in enumerate(detection_supervision.class_id):
+            #     if cls_names[class_id] == "goalkeeper":
+            #         detection_supervision.class_id[object_ind] = cls_names_inv["player"]
 
-             # Track Objects
             detection_with_tracks = self.tracker.update_with_detections(detection_supervision)
 
             tracks["players"].append({})
-            tracks["referees"].append({})
+            # tracks["referees"].append({}) # DIBLOKIR
             tracks["ball"].append({})
 
             for frame_detection in detection_with_tracks:
@@ -61,8 +59,9 @@ class Tracker:
                 if cls_id == cls_names_inv['player']:
                     tracks["players"][frame_num][track_id] = {"bbox":bbox}
                 
-                if cls_id == cls_names_inv['referee']:
-                    tracks["referees"][frame_num][track_id] = {"bbox":bbox}
+                # DIBLOKIR: Tracker untuk wasit
+                # if cls_id == cls_names_inv['referee']:
+                #     tracks["referees"][frame_num][track_id] = {"bbox":bbox}
 
             for frame_detection in detection_supervision:
                 bbox = frame_detection[0].tolist()
@@ -78,55 +77,32 @@ class Tracker:
         return tracks
     
     def draw_pass_arrow(self, frame, pass_event, show_for_frames=30):
-        """
-        Draw arrow for pass visualization
-
-        Args:
-            frame: Video frame
-            pass_event: Pass event dictionary
-            show_for_frames: How many frames to show the arrow
-        """
         from_pos = pass_event['from_pos']
         to_pos = pass_event['to_pos']
-        success = pass_event['success']
+        
+        # Selalu hijau karena ini latihan passing (semua umpan dianggap sukses ke kawan)
+        color = (0, 255, 0) 
 
-        # Color: Green for successful pass, Red for failed
-        color = (0, 255, 0) if success else (0, 0, 255)
-
-        # Draw arrow
         cv2.arrowedLine(frame, from_pos, to_pos, color, 3, tipLength=0.2)
-
-        # Draw circles at start and end
         cv2.circle(frame, from_pos, 8, color, -1)
         cv2.circle(frame, to_pos, 8, color, -1)
 
         return frame
 
     def draw_pass_statistics(self, frame, pass_stats):
-        """
-        Draw pass statistics on frame
-        """
-        # Background rectangle
+        """ Draw total pass statistics on frame """
         overlay = frame.copy()
-        cv2.rectangle(overlay, (20, 20), (350, 180), (0, 0, 0), -1)
+        cv2.rectangle(overlay, (20, 20), (280, 80), (0, 0, 0), -1)
         frame = cv2.addWeighted(overlay, 0.6, frame, 0.4, 0)
         
-        # Title
-        cv2.putText(frame, "Pass Statistics", (30, 50), 
+        # Cukup tampilkan total umpan
+        text = f"Total Passes: {pass_stats['total_passes']}"
+        cv2.putText(frame, text, (40, 60), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-        
-        # Team 1 stats
-        team1_text = f"Team 1: {pass_stats[1]['successful']} / {pass_stats[1]['total']} ({pass_stats[1]['success_rate']:.1f}%)"
-        cv2.putText(frame, team1_text, (30, 90), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 100, 255), 2)
-        
-        # Team 2 stats
-        team2_text = f"Team 2: {pass_stats[2]['successful']} / {pass_stats[2]['total']} ({pass_stats[2]['success_rate']:.1f}%)"
-        cv2.putText(frame, team2_text, (30, 130), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 100, 100), 2)
         
         return frame
     
+    # ... (Fungsi draw_ellipse dan draw_triangle tetap sama seperti aslinya) ...
     def draw_ellipse(self,frame,bbox,color,track_id=None):
         y2 = int(bbox[3])
         x_center, _ = get_center_of_bbox(bbox)
