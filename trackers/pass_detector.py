@@ -14,8 +14,8 @@ class PassDetector:
 
         # === PASS VALIDATION ===
         self.min_pass_distance = 50
-        self.max_pass_distance = 700
-        self.cooldown_frames = 8      # DIUBAH: dari 10 -> 8 (allow faster sequences)
+        self.max_pass_distance = 1500
+        self.cooldown_frames = 3      # DIUBAH: dari 10 -> 8 (allow faster sequences)
         self.min_possession_duration = 1  # DIUBAH: dari 3 -> 1 (one-touch pass)
 
         # === BALL MOVEMENT ===
