@@ -1,148 +1,112 @@
 from trackers import Tracker
 from trackers.player_ball_assigner import PlayerBallAssigner
 from trackers.pass_detector import PassDetector
+from team_assigner.player_identifier import PlayerIdentifier
 from utils.bbox_utils import interpolate_ball_positions
-import numpy as np
+from utils.video_utils import read_video
 import cv2
 import pickle
 import os
 
 def main():
-    video_path = 'input_videos/passing_new.mp4'
+    video_path = 'input_videos/passing_ssb.mp4'
     stub_path = 'stubs/track_stubs.pkl'
-    output_path = 'output_videos/passing_new.avi'
+    output_path = 'output_videos/passing_ssb.avi'
 
     tracker = Tracker('models/best.pt')
     player_ball_assigner = PlayerBallAssigner()
+    player_identifier = PlayerIdentifier()
+    
+    # Statistik passing target
+    stats_per_jersey = {"9": 0, "15": 0, "30": 0, "Other": 0}
 
-    # ===== STEP 1: Get Tracks =====
+    # === STEP 1: Get Tracks ===
+    video_frames = read_video(video_path)
     if os.path.exists(stub_path):
-        print("[STEP 1] Loading tracks from stub...")
         with open(stub_path, 'rb') as f:
             tracks = pickle.load(f)
-        print(f"   Loaded {len(tracks['players'])} frames")
     else:
-        print("[STEP 1] Running detection (no stub found)...")
-        from utils.video_utils import read_video
-        video_frames = read_video(video_path)
-        print(f"   {len(video_frames)} frames loaded")
-        tracks = tracker.get_object_track(video_frames,
-                                           read_from_stub=False,
-                                           stub_path=stub_path)
-        del video_frames
+        tracks = tracker.get_object_track(video_frames, read_from_stub=False, stub_path=stub_path)
 
-    # ===== STEP 1.5: Interpolasi Bola =====
-    print("\n[STEP 1.5] Interpolating ball...")
-    original_ball_count = sum(1 for b in tracks['ball'] if 1 in b)
+    # === STEP 1.5: Interpolasi & Identifikasi ===
     tracks['ball'] = interpolate_ball_positions(tracks['ball'])
-    new_ball_count = sum(1 for b in tracks['ball'] if 1 in b)
-    print(f"   Ball: {original_ball_count} -> {new_ball_count} frames (+{new_ball_count - original_ball_count} interpolated)")
 
-    if new_ball_count == 0:
-        print("   *** FATAL: Ball NEVER detected! Check your YOLO model. ***")
-        return
-
-    # ===== STEP 2: Skip Team Assignment (latihan = 1 tim) =====
-    print("\n[STEP 2] Assigning team (all = team 1)...")
-    for frame_num, player_track in enumerate(tracks['players']):
-        for player_id, track in player_track.items():
-            tracks['players'][frame_num][player_id]['team'] = 1
-            tracks['players'][frame_num][player_id]['team_color'] = (255, 255, 255)
-
-    # ===== STEP 3: Ball Possession =====
-    print("\n[STEP 3] Detecting ball possession...")
-
-    cap_temp = cv2.VideoCapture(video_path)
-    fps = int(cap_temp.get(cv2.CAP_PROP_FPS))
-    if fps == 0:
-        fps = 24
-    cap_temp.release()
-    print(f"   FPS: {fps}")
-
+    # === STEP 2: Possession & OCR Mapping ===
+    print("Processing identities and possession...")
     raw_ball_possessions = []
-
-    for frame_num, player_track in enumerate(tracks['players']):
+    
+    for frame_num, frame_img in enumerate(video_frames):
+        player_track = tracks['players'][frame_num]
         ball_bbox = tracks['ball'][frame_num].get(1, {}).get('bbox', [])
+
+        # Sambil jalan, identifikasi nomor punggung pemain di tiap frame
+        player_identifier.update_identities(frame_img, player_track)
 
         if len(ball_bbox) == 0:
             raw_ball_possessions.append(-1)
         else:
-            assigned_player, distance = player_ball_assigner.assign_ball_to_player(
-                player_track, ball_bbox
-            )
+            assigned_player, _ = player_ball_assigner.assign_ball_to_player(player_track, ball_bbox)
             raw_ball_possessions.append(assigned_player)
 
-    valid_count = sum(1 for p in raw_ball_possessions if p != -1)
-    unique_players = set(p for p in raw_ball_possessions if p != -1)
-    print(f"   Possession valid: {valid_count}/{len(raw_ball_possessions)} frames")
-    print(f"   Unique players with ball: {unique_players}")
-
-    if valid_count == 0:
-        print("   *** FATAL: No player ever possesses the ball! ***")
-        return
-
-    # ===== STEP 4: Pass Detection =====
-    print("\n[STEP 4] Detecting passes...")
+    # === STEP 3: Pass Detection ===
+    cap_temp = cv2.VideoCapture(video_path)
+    fps = int(cap_temp.get(cv2.CAP_PROP_FPS)) or 24
+    cap_temp.release()
 
     pass_detector = PassDetector(fps=fps)
-    passes = pass_detector.detect_passes(tracks, raw_ball_possessions, debug=True)
-    pass_stats = pass_detector.get_pass_statistics(passes)
+    detected_passes = pass_detector.detect_passes(tracks, raw_ball_possessions)
 
-    print(f"\n   TOTAL PASSES: {pass_stats['total_passes']}")
+    # === STEP 4: Render & Real-time Counter ===
+    print("Rendering final video...")
+    height, width, _ = video_frames[0].shape
+    out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'XVID'), fps, (width, height))
 
-    # ===== STEP 5: Render =====
-    print("\n[STEP 5] Rendering video...")
-
-    cap = cv2.VideoCapture(video_path)
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-    fourcc = cv2.VideoWriter_fourcc(*'XVID')
-    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-
-    current_pass_count = 0
-    frame_num = 0
-
-    while True:
-        ret, frame = cap.read()
-        if not ret or frame_num >= len(tracks['players']):
-            break
-
+    for frame_num, frame in enumerate(video_frames):
         player_dict = tracks["players"][frame_num]
-        ball_dict = tracks["ball"][frame_num]
+        
+        # Logika Penambahan Score Berdasarkan Nomor Punggung
+        for pass_event in detected_passes:
+            if pass_event['frame_display'] == frame_num:
+                sender_id = pass_event['from_player']
+                jersey_no = player_identifier.player_numbers_map.get(sender_id, "Unknown")
+                
+                if jersey_no in stats_per_jersey:
+                    stats_per_jersey[jersey_no] += 1
+                else:
+                    stats_per_jersey["Other"] += 1
 
-        # Draw Players
+        # Gambar UI Dashboard
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (20, 20), (350, 180), (0, 0, 0), -1)
+        frame = cv2.addWeighted(overlay, 0.6, frame, 0.4, 0)
+        
+        cv2.putText(frame, "LIVE PASS COUNT", (40, 50), cv2.FONT_HERSHEY_DUPLEX, 0.8, (0, 255, 255), 2)
+        cv2.putText(frame, f"Player #9  : {stats_per_jersey['9']}", (40, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(frame, f"Player #15 : {stats_per_jersey['15']}", (40, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(frame, f"Player #30 : {stats_per_jersey['30']}", (40, 145), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+        # Gambar Trackers (Ellipse & ID)
         for track_id, player in player_dict.items():
-            color = player.get("team_color", (255, 255, 255))
-            frame = tracker.draw_ellipse(frame, player["bbox"], color, track_id)
+            # Tampilkan nomor punggung di atas kepala jika terdeteksi
+            jersey_no = player_identifier.player_numbers_map.get(track_id, "???")
+            color = (0, 255, 0) if jersey_no != "???" else (255, 255, 255)
+            
+            frame = tracker.draw_ellipse(frame, player["bbox"], color)
+            cv2.putText(frame, f"#{jersey_no}", (int(player["bbox"][0]), int(player["bbox"][1]-10)), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-            # Segitiga merah = pemain yang pegang bola
             if raw_ball_possessions[frame_num] == track_id:
                 frame = tracker.draw_traingle(frame, player["bbox"], (0, 0, 255))
 
-        # Draw ball
-        for track_id, ball in ball_dict.items():
+        # Ball
+        ball_dict = tracks["ball"][frame_num]
+        for _, ball in ball_dict.items():
             frame = tracker.draw_traingle(frame, ball["bbox"], (0, 255, 0))
 
-        # Pass counter — increment saat frame_display tercapai
-        for pass_event in passes:
-            if pass_event['frame_display'] == frame_num:
-                current_pass_count += 1
-
-        # Draw stats (tanpa panah)
-        frame = tracker.draw_pass_statistics(frame, current_pass_count)
-
         out.write(frame)
-        frame_num += 1
 
-        if frame_num % 200 == 0:
-            print(f"   Rendering: {frame_num}/{total_frames}")
-
-    cap.release()
     out.release()
-    print(f"\nDone! Output: {output_path}")
-    print(f"Total passes: {current_pass_count}")
+    print(f"Selesai! Video disimpan di: {output_path}")
 
 if __name__ == '__main__':
     main()
