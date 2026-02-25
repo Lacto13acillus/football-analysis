@@ -37,7 +37,7 @@ def main():
     tracks['ball'] = interpolate_ball_positions(tracks['ball'])
     new_ball_count = sum(1 for b in tracks['ball'] if 1 in b)
     print(f"   Ball: {original_ball_count} -> {new_ball_count} frames (+{new_ball_count - original_ball_count} interpolated)")
-    
+
     if new_ball_count == 0:
         print("   *** FATAL: Ball NEVER detected! Check your YOLO model. ***")
         return
@@ -51,7 +51,7 @@ def main():
 
     # ===== STEP 3: Ball Possession =====
     print("\n[STEP 3] Detecting ball possession...")
-    
+
     cap_temp = cv2.VideoCapture(video_path)
     fps = int(cap_temp.get(cv2.CAP_PROP_FPS))
     if fps == 0:
@@ -60,7 +60,7 @@ def main():
     print(f"   FPS: {fps}")
 
     raw_ball_possessions = []
-    
+
     for frame_num, player_track in enumerate(tracks['players']):
         ball_bbox = tracks['ball'][frame_num].get(1, {}).get('bbox', [])
 
@@ -72,38 +72,18 @@ def main():
             )
             raw_ball_possessions.append(assigned_player)
 
-    # === DEBUG: Analisis possession ===
     valid_count = sum(1 for p in raw_ball_possessions if p != -1)
     unique_players = set(p for p in raw_ball_possessions if p != -1)
     print(f"   Possession valid: {valid_count}/{len(raw_ball_possessions)} frames")
     print(f"   Unique players with ball: {unique_players}")
-    
+
     if valid_count == 0:
         print("   *** FATAL: No player ever possesses the ball! ***")
-        print("   *** Try increasing max_player_ball_distance (currently 70) ***")
-        
-        print("\n   Checking closest player-ball distances in sample frames:")
-        sample_frames = list(range(0, len(raw_ball_possessions), max(1, len(raw_ball_possessions) // 10)))
-        for sf in sample_frames[:10]:
-            ball_data = tracks['ball'][sf].get(1)
-            if ball_data and 'bbox' in ball_data:
-                from utils.bbox_utils import get_center_of_bbox
-                ball_pos = get_center_of_bbox(ball_data['bbox'])
-                min_dist = 99999
-                closest_player = -1
-                for pid, pdata in tracks['players'][sf].items():
-                    pbbox = pdata['bbox']
-                    from utils.bbox_utils import measure_distance
-                    d = measure_distance((pbbox[0], pbbox[-1]), ball_pos)
-                    if d < min_dist:
-                        min_dist = d
-                        closest_player = pid
-                print(f"   Frame {sf}: closest player={closest_player}, distance={min_dist:.1f}px")
         return
 
     # ===== STEP 4: Pass Detection =====
     print("\n[STEP 4] Detecting passes...")
-    
+
     pass_detector = PassDetector(fps=fps)
     passes = pass_detector.detect_passes(tracks, raw_ball_possessions, debug=True)
     pass_stats = pass_detector.get_pass_statistics(passes)
@@ -136,8 +116,8 @@ def main():
         for track_id, player in player_dict.items():
             color = player.get("team_color", (255, 255, 255))
             frame = tracker.draw_ellipse(frame, player["bbox"], color, track_id)
-            
-            # Segitiga merah di atas pemain yang pegang bola
+
+            # Segitiga merah = pemain yang pegang bola
             if raw_ball_possessions[frame_num] == track_id:
                 frame = tracker.draw_traingle(frame, player["bbox"], (0, 0, 255))
 
@@ -145,7 +125,7 @@ def main():
         for track_id, ball in ball_dict.items():
             frame = tracker.draw_traingle(frame, ball["bbox"], (0, 255, 0))
 
-        # Pass counter — increment saat frame_display tercapai (bola sudah di penerima)
+        # Pass counter — increment saat frame_display tercapai
         for pass_event in passes:
             if pass_event['frame_display'] == frame_num:
                 current_pass_count += 1

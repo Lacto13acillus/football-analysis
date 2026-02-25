@@ -7,21 +7,27 @@ from collections import Counter
 class PassDetector:
     def __init__(self, fps=24):
         self.fps = fps
+
         # === POSSESSION SMOOTHING ===
         self.smoothing_window = 5
-        self.min_stable_frames = 3
+        self.min_stable_frames = 2  # DIUBAH: dari 3 -> 2 (tangkap segmen pendek)
+
         # === PASS VALIDATION ===
         self.min_pass_distance = 50
         self.max_pass_distance = 700
-        self.cooldown_frames = 10
-        self.min_possession_duration = 3
+        self.cooldown_frames = 8      # DIUBAH: dari 10 -> 8 (allow faster sequences)
+        self.min_possession_duration = 1  # DIUBAH: dari 3 -> 1 (one-touch pass)
+
         # === BALL MOVEMENT ===
-        self.ball_movement_check_radius = 15
-        self.ball_movement_threshold = 15
+        self.ball_movement_check_radius = 20  # DIUBAH: dari 15 -> 20 (cek lebih luas)
+        self.ball_movement_threshold = 5      # DIUBAH: dari 15 -> 5 (short passes)
+
         # === Toleransi pencarian player ===
-        self.player_search_radius = 10
-        # === BARU: Delay display ===
-        self.pass_display_delay = 5  # frame setelah penerima mulai pegang bola
+        self.player_search_radius = 15  # DIUBAH: dari 10 -> 15
+
+        # === Display delay ===
+        self.pass_display_delay = 5
+        self.min_display_gap = 8  # BARU: minimal 8 frame antar display (anti-jump)
 
     def smooth_possessions(self, raw_possessions):
         smoothed = list(raw_possessions)
@@ -35,7 +41,8 @@ class PassDetector:
                 smoothed[i] = -1
         return smoothed
 
-    def fill_short_gaps(self, possessions, max_gap=5):
+    def fill_short_gaps(self, possessions, max_gap=8):
+        """Gap fill — DIUBAH: max_gap dari 5 -> 8 untuk tangkap gap lebih panjang"""
         filled = list(possessions)
         last_valid = -1
         gap_start = -1
@@ -80,32 +87,49 @@ class PassDetector:
         return segments
 
     def validate_ball_movement(self, tracks, frame_start, frame_end):
+        """
+        DIUBAH: Perluas radius pencarian dan gunakan max movement
+        antar semua posisi bola yang ditemukan, bukan hanya first-last.
+        Ini menangani kasus dimana bola hilang di tengah lalu muncul kembali.
+        """
         check_start = max(0, frame_start - self.ball_movement_check_radius)
         check_end = min(len(tracks['ball']), frame_end + self.ball_movement_check_radius)
+
         ball_positions = []
         for f in range(check_start, check_end):
             ball_data = tracks['ball'][f].get(1)
             if ball_data and 'bbox' in ball_data:
                 pos = get_center_of_bbox(ball_data['bbox'])
                 ball_positions.append(pos)
+
         if len(ball_positions) < 2:
             return 0
+
+        # Hitung jarak langsung first-to-last
         direct_distance = measure_distance(ball_positions[0], ball_positions[-1])
-        return direct_distance
+
+        # BARU: Juga hitung max displacement dari titik manapun
+        # Ini menangani kasus bola pergi lalu kembali (direct_distance kecil tapi ada movement)
+        max_displacement = 0
+        for i in range(1, len(ball_positions)):
+            d = measure_distance(ball_positions[0], ball_positions[i])
+            if d > max_displacement:
+                max_displacement = d
+
+        return max(direct_distance, max_displacement)
 
     def find_player_nearby(self, tracks, player_id, target_frame, search_radius=None):
         """
         Cari data pemain di frame terdekat jika tidak ada di frame target.
-        Mengembalikan (player_data, actual_frame) atau (None, -1).
         """
         if search_radius is None:
             search_radius = self.player_search_radius
         total_frames = len(tracks['players'])
-        # Cek frame target dulu
+
         player_data = tracks['players'][target_frame].get(player_id)
         if player_data:
             return player_data, target_frame
-        # Cari di frame terdekat (expanding outward: ±1, ±2, ±3, ...)
+
         for offset in range(1, search_radius + 1):
             check_frame = target_frame - offset
             if 0 <= check_frame < total_frames:
@@ -120,7 +144,6 @@ class PassDetector:
         return None, -1
 
     def detect_passes(self, tracks, ball_possessions, debug=True):
-        # === DEBUG: Cek raw data ===
         if debug:
             valid_count = sum(1 for p in ball_possessions if p != -1)
             unique_players = set(p for p in ball_possessions if p != -1)
@@ -135,17 +158,17 @@ class PassDetector:
                 print(f"[DEBUG] *** PROBLEM: Only {len(unique_players)} player(s) ever had the ball! ***")
                 return []
 
-        # === TAHAP 1: Fill short gaps ===
-        filled = self.fill_short_gaps(ball_possessions, max_gap=5)
+        # TAHAP 1: Fill short gaps (max_gap=8)
+        filled = self.fill_short_gaps(ball_possessions, max_gap=8)
         if debug:
             print(f"[DEBUG] After gap-fill: {sum(1 for p in filled if p != -1)} frames with possession")
 
-        # === TAHAP 2: Smoothing ===
+        # TAHAP 2: Smoothing
         smoothed = self.smooth_possessions(filled)
         if debug:
             print(f"[DEBUG] After smoothing: {sum(1 for p in smoothed if p != -1)} frames")
 
-        # === TAHAP 3: Stable segments ===
+        # TAHAP 3: Stable segments
         segments = self.get_stable_segments(smoothed)
         if debug:
             print(f"[DEBUG] Stable segments found: {len(segments)}")
@@ -157,7 +180,7 @@ class PassDetector:
                 print(f"[DEBUG] *** PROBLEM: Less than 2 stable segments! ***")
                 return []
 
-        # === TAHAP 4: Detect passes ===
+        # TAHAP 4: Detect passes
         passes = []
         last_pass_frame = -999
         if debug:
@@ -186,7 +209,7 @@ class PassDetector:
                     print(f"[DEBUG]   SKIP: Cooldown ({transition_frame_end - last_pass_frame} < {self.cooldown_frames})")
                 continue
 
-            # Possession duration
+            # Possession duration (sekarang min=1, untuk one-touch)
             from_duration = seg_from['frame_end'] - seg_from['frame_start']
             if from_duration < self.min_possession_duration:
                 if debug:
@@ -218,7 +241,6 @@ class PassDetector:
             to_pos = get_center_of_bbox_bottom(to_player_data['bbox'])
             distance = measure_distance(from_pos, to_pos)
 
-            # Validasi jarak
             if distance < self.min_pass_distance:
                 if debug:
                     print(f"[DEBUG]   SKIP: Distance too short ({distance:.0f} < {self.min_pass_distance})")
@@ -228,7 +250,7 @@ class PassDetector:
                     print(f"[DEBUG]   SKIP: Distance too far ({distance:.0f} > {self.max_pass_distance})")
                 continue
 
-            # Validasi ball movement
+            # Validasi ball movement (sekarang pakai max displacement)
             ball_movement = self.validate_ball_movement(
                 tracks, transition_frame_start, transition_frame_end
             )
@@ -241,14 +263,20 @@ class PassDetector:
             if debug:
                 print(f"[DEBUG]   *** PASS DETECTED! dist={distance:.0f}px, ball_move={ball_movement:.0f}px ***")
 
-            # BARU: Delay display — pass dihitung saat bola sudah sampai ke penerima
+            # Display frame — delay ke receiver start + offset
             receiver_start = seg_to['frame_start']
             pass_display_frame = min(receiver_start + self.pass_display_delay, seg_to['frame_end'])
+
+            # BARU: Anti-jump — pastikan display frame tidak terlalu dekat dgn pass sebelumnya
+            if len(passes) > 0:
+                last_display = passes[-1]['frame_display']
+                if pass_display_frame - last_display < self.min_display_gap:
+                    pass_display_frame = last_display + self.min_display_gap
 
             pass_event = {
                 'frame_start': transition_frame_start,
                 'frame_end': transition_frame_end,
-                'frame_display': pass_display_frame,  # frame untuk counting di render
+                'frame_display': pass_display_frame,
                 'from_player': from_player,
                 'to_player': to_player,
                 'distance': distance,
@@ -261,7 +289,8 @@ class PassDetector:
             last_pass_frame = transition_frame_end
 
         if debug:
-            print(f"\n[DEBUG] === RESULT: {len(passes)} passes detected ===\n")
+            print(f"\n[DEBUG] === RESULT: {len(passes)} passes detected ===")
+            print(f"[DEBUG] Display frames: {[p['frame_display'] for p in passes]}\n")
 
         return passes
 
