@@ -8,9 +8,9 @@ import pickle
 import os
 
 def main():
-    video_path = 'input_videos/passing_new.mp4'
+    video_path = 'input_videos/passing.mp4'
     stub_path = 'stubs/track_stubs.pkl'
-    output_path = 'output_videos/passing_new.avi'
+    output_path = 'output_videos/passing_test.avi'
 
     tracker = Tracker('models/best.pt')
     player_ball_assigner = PlayerBallAssigner()
