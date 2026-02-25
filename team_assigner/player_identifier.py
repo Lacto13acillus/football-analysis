@@ -17,7 +17,7 @@ class PlayerIdentifier:
         if roi.size == 0: return None
 
         # Pre-processing untuk memperjelas angka
-        gray = cv2.cvtColor(roi, cv2.COLOR_BGR_GRAY)
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         results = self.reader.readtext(gray, allowlist='0123456789')
         
         for (bbox_ocr, text, prob) in results:
