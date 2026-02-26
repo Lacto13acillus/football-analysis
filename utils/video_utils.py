@@ -1,18 +1,15 @@
+from typing import List
 import cv2
-
-def read_video(video_path):
+import numpy as np
+def read_video(video_path: str) -> List[np.ndarray]:
     cap = cv2.VideoCapture(video_path)
-    frames = []
+    if not cap.isOpened():
+        raise FileNotFoundError(f"Unable to open video: {video_path}")
+    frames: List[np.ndarray] = []
     while True:
-        ret, frame = cap.read()
-        if not ret:
+        ok, frame = cap.read()
+        if not ok:
             break
         frames.append(frame)
+    cap.release()
     return frames
-
-def save_video(ouput_video_frames,output_video_path):
-    fourcc = cv2.VideoWriter_fourcc(*'XVID')
-    out = cv2.VideoWriter(output_video_path, fourcc, 24, (ouput_video_frames[0].shape[1], ouput_video_frames[0].shape[0]))
-    for frame in ouput_video_frames:
-        out.write(frame)
-    out.release()
