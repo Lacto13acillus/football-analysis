@@ -13,7 +13,7 @@ def main():
     stub_path = 'stubs/track_stubs.pkl'
     output_path = 'output_videos/passing_number.avi'
 
-    tracker = Tracker('models/best.pt')
+    tracker = Tracker('yolov8s.pt')
     player_ball_assigner = PlayerBallAssigner()
     player_identifier = PlayerIdentifier()
 

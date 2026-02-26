@@ -14,7 +14,7 @@ class Tracker:
       being persistent for counting; it uses role locking in main.py.
     """
     def __init__(self, model_path: str):
-        self.model = YOLO(model_path)
+        self.model = YOLO('yolov8s.pt')
         self.tracker = sv.ByteTrack()
     def detect_frames(self, frames: List[np.ndarray], batch_size: int = 20, conf: float = 0.15):
         detections = []
