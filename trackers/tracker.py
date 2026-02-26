@@ -8,7 +8,6 @@ from utils.bbox_utils import get_center_of_bbox, get_bbox_width, get_foot_positi
 
 class Tracker:
     def __init__(self, model_path):
-        # Ini akan otomatis mendownload model bawaan YOLO jika file belum ada
         self.model = YOLO(model_path)
         self.tracker = sv.ByteTrack()
 
@@ -42,33 +41,33 @@ class Tracker:
             tracks["players"].append({})
             tracks["ball"].append({})
 
-            # --- MENDETEKSI PEMAIN (Class: 'person') ---
+            # --- MENDETEKSI PEMAIN ---
             for frame_detection in detection_with_tracks:
                 bbox = frame_detection[0].tolist()
                 cls_id = frame_detection[3]
                 track_id = frame_detection[4]
                 confidence = frame_detection[2] if len(frame_detection) > 2 else 1.0
 
-                # UBAH: dari 'player' menjadi 'person'
                 if cls_id == cls_names_inv.get('person', -1):
                     tracks["players"][frame_num][track_id] = {
                         "bbox": bbox,
                         "confidence": float(confidence) if not isinstance(confidence, float) else confidence
                     }
 
-            # --- MENDETEKSI BOLA (Class: 'sports ball') ---
+            # --- MENDETEKSI BOLA ---
             ball_detections = []
             for frame_detection in detection_supervision:
                 bbox = frame_detection[0].tolist()
                 cls_id = frame_detection[3]
                 conf = frame_detection[2] if len(frame_detection) > 2 else 0.5
 
-                # UBAH: dari 'ball' menjadi 'sports ball'
                 if cls_id == cls_names_inv.get('sports ball', -1):
-                    ball_detections.append((bbox, conf))
+                    # Filter: Hanya akui bola jika AI sangat yakin (> 30%)
+                    if conf > 0.3: 
+                        ball_detections.append((bbox, conf))
 
             if ball_detections:
-                # Pilih bola dengan confidence tertinggi jika ada pantulan bayangan/objek mirip bola
+                # Jika ada beberapa objek mirip bola, ambil 1 yang paling meyakinkan
                 best_ball = max(ball_detections, key=lambda x: x[1])
                 tracks["ball"][frame_num][1] = {
                     "bbox": best_ball[0],
@@ -76,7 +75,6 @@ class Tracker:
                 }
 
         if stub_path is not None:
-            # Pastikan folder stubs ada sebelum menyimpan
             os.makedirs(os.path.dirname(stub_path), exist_ok=True)
             with open(stub_path, 'wb') as f:
                 pickle.dump(tracks, f)
@@ -87,11 +85,9 @@ class Tracker:
         from_pos = pass_event['from_pos']
         to_pos = pass_event['to_pos']
         color = (0, 255, 0)
-
-        # Panah lebih tebal dan jelas
         cv2.arrowedLine(frame, from_pos, to_pos, color, 3, tipLength=0.15)
         cv2.circle(frame, from_pos, 8, color, -1)
-        cv2.circle(frame, to_pos, 8, (0, 200, 255), -1)  # Warna berbeda untuk penerima
+        cv2.circle(frame, to_pos, 8, (0, 200, 255), -1)
         return frame
 
     def draw_pass_statistics(self, frame, current_pass_count):
@@ -100,8 +96,7 @@ class Tracker:
         frame = cv2.addWeighted(overlay, 0.6, frame, 0.4, 0)
 
         text = f"Passes: {current_pass_count}"
-        cv2.putText(frame, text, (40, 65),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+        cv2.putText(frame, text, (40, 65), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
         return frame
 
     def draw_ellipse(self, frame, bbox, color, track_id=None):
@@ -121,17 +116,14 @@ class Tracker:
             lineType=cv2.LINE_4
         )
 
-        # Tambahkan track_id label
         if track_id is not None:
             cv2.putText(frame, str(track_id), (x_center - 10, y2 + 20),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-
         return frame
 
     def draw_traingle(self, frame, bbox, color):
         y = int(bbox[1])
         x, _ = get_center_of_bbox(bbox)
-
         triangle_points = np.array([
             [x, y],
             [x - 10, y - 20],

@@ -12,8 +12,6 @@ def main():
     stub_path = 'stubs/track_stubs.pkl'
     output_path = 'output_videos/passing_drill_final.avi'
 
-    # UBAH: Menggunakan model bawaan YOLO (Pre-trained COCO)
-    # Model ini akan otomatis didownload jika belum ada di direktori Anda
     tracker = Tracker('yolov8m.pt')
     player_ball_assigner = PlayerBallAssigner()
     
@@ -26,11 +24,10 @@ def main():
     else:
         tracks = tracker.get_object_track(video_frames, read_from_stub=False, stub_path=stub_path)
 
-    # === STEP 1.5: Interpolasi Posisi Bola ===
     tracks['ball'] = interpolate_ball_positions(tracks['ball'])
 
-    # === STEP 2: DYNAMIC MAPPING DENGAN FOREGROUND FILTER ===
-    print("Mengeksekusi Dynamic Mapping per frame...")
+    # === STEP 2: MAPPING AKURAT 3 PEMAIN ===
+    print("Mengeksekusi Mapping Posisi Player...")
     id_votes = {} 
 
     for frame_num, players in enumerate(tracks['players']):
@@ -38,19 +35,19 @@ def main():
         for track_id, data in players.items():
             t_id = int(track_id)
             bbox = data['bbox']
+            # Hitung luas area pemain
             area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
             x_center = (bbox[0] + bbox[2]) / 2
             current_players.append({'track_id': t_id, 'area': area, 'x_center': x_center})
         
-        if not current_players:
-            continue
-            
-        max_area = max([p['area'] for p in current_players])
-        foreground_players = [p for p in current_players if p['area'] > max_area * 0.3]
+        # Sortir pemain dari ukuran yang paling besar ke yang paling kecil
+        current_players.sort(key=lambda x: x['area'], reverse=True)
         
-        if len(foreground_players) >= 3:
-            foreground_players.sort(key=lambda x: x['area'], reverse=True)
-            top_3 = foreground_players[:3]
+        # Ambil persis 3 pemain teratas (paling besar / paling dekat kamera)
+        top_3 = current_players[:3]
+        
+        if len(top_3) == 3:
+            # Urutkan ketiga pemain ini dari posisi Kiri ke Kanan
             top_3.sort(key=lambda x: x['x_center'])
             
             roles = ["Player A", "Player B", "Player C"]
@@ -65,10 +62,11 @@ def main():
     player_names = {}
     for track_id, votes in id_votes.items():
         best_role = max(votes, key=votes.get)
+        # Jika ID ini secara konsisten menjadi top 3, tetapkan namanya
         if votes[best_role] > 5: 
             player_names[int(track_id)] = best_role
 
-    print(f"Hasil Dynamic Mapping: {player_names}")
+    print(f"Hasil Mapping Akurat: {player_names}")
 
     stats_per_player = {"Player A": 0, "Player B": 0, "Player C": 0, "Other": 0}
 
@@ -94,7 +92,7 @@ def main():
     pass_detector = PassDetector(fps=fps)
     detected_passes = pass_detector.detect_passes(tracks, raw_ball_possessions, debug=False)
 
-    # === STEP 5: Render & Real-time Counter ===
+    # === STEP 5: Render Video ===
     print("Merender video akhir...")
     height, width, _ = video_frames[0].shape
     out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'XVID'), fps, (width, height))
@@ -125,6 +123,7 @@ def main():
         cv2.putText(frame, f"Player B : {stats_per_player['Player B']}", (40, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         cv2.putText(frame, f"Player C : {stats_per_player['Player C']}", (40, 145), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
+        # HANYA gambar 3 pemain utama (Player A, B, C)
         for track_id, player in player_dict.items():
             t_id = int(track_id)
             name = player_names.get(t_id, "Other")
@@ -134,13 +133,12 @@ def main():
                 frame = tracker.draw_ellipse(frame, player["bbox"], color)
                 cv2.putText(frame, name, (int(player["bbox"][0]), int(player["bbox"][1]-10)), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-            else:
-                color = (200, 200, 200)
-                frame = tracker.draw_ellipse(frame, player["bbox"], color)
 
-            if raw_ball_possessions[frame_num] == t_id:
-                frame = tracker.draw_traingle(frame, player["bbox"], (0, 0, 255))
+                # Segitiga penguasaan bola juga hanya digambar untuk pemain utama
+                if raw_ball_possessions[frame_num] == t_id:
+                    frame = tracker.draw_traingle(frame, player["bbox"], (0, 0, 255))
 
+        # Ball Tracker (Hanya 1 bola terkuat yang digambar)
         ball_dict = tracks["ball"][frame_num]
         for _, ball in ball_dict.items():
             frame = tracker.draw_traingle(frame, ball["bbox"], (0, 255, 0))
