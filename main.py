@@ -8,12 +8,10 @@ import pickle
 import os
 
 def main():
-    # Pastikan path video input dan output Anda sesuai dengan struktur folder Anda
     video_path = 'input_videos/passing_drill.mp4' 
     stub_path = 'stubs/track_stubs.pkl'
-    output_path = 'output_videos/passing_drill_output.avi'
+    output_path = 'output_videos/passing_drill_dynamic.avi'
 
-    # Inisialisasi Tracker dan Assigner
     tracker = Tracker('models/best.pt')
     player_ball_assigner = PlayerBallAssigner()
     
@@ -29,47 +27,51 @@ def main():
     # === STEP 1.5: Interpolasi Posisi Bola ===
     tracks['ball'] = interpolate_ball_positions(tracks['ball'])
 
-    # === STEP 2: Identifikasi 3 Pemain Utama Berdasarkan Area & Posisi X ===
-    print("Mengidentifikasi Player A, B, dan C berdasarkan posisi spasial...")
-    player_stats = {} 
-    
-    # Kumpulkan data ukuran (area) dan posisi sumbu X dari semua player yang terdeteksi
+    # === STEP 2: DYNAMIC MAPPING (VOTING SYSTEM) ===
+    print("Mengeksekusi Dynamic Mapping per frame...")
+    id_votes = {} # Menyimpan voting posisi untuk setiap track_id
+
     for frame_num, players in enumerate(tracks['players']):
+        current_players = []
         for track_id, data in players.items():
             bbox = data['bbox']
             area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
             x_center = (bbox[0] + bbox[2]) / 2
+            current_players.append({'track_id': track_id, 'area': area, 'x_center': x_center})
+        
+        # Hanya lakukan voting jika ada minimal 3 pemain di frame tersebut
+        if len(current_players) >= 3:
+            # Ambil 3 terbesar (menyaring pemain di background)
+            current_players.sort(key=lambda x: x['area'], reverse=True)
+            top_3 = current_players[:3]
             
-            if track_id not in player_stats:
-                player_stats[track_id] = {'areas': [], 'x_positions': []}
+            # Urutkan berdasarkan posisi X (Kiri ke Kanan)
+            top_3.sort(key=lambda x: x['x_center'])
             
-            player_stats[track_id]['areas'].append(area)
-            player_stats[track_id]['x_positions'].append(x_center)
+            roles = ["Player A", "Player B", "Player C"]
+            for i in range(3):
+                t_id = top_3[i]['track_id']
+                role = roles[i]
+                
+                if t_id not in id_votes:
+                    id_votes[t_id] = {"Player A": 0, "Player B": 0, "Player C": 0}
+                # Tambahkan 1 vote untuk posisi tersebut
+                id_votes[t_id][role] += 1
 
-    # Hitung rata-rata area dan median posisi X untuk setiap ID
-    id_summaries = []
-    for track_id, stats in player_stats.items():
-        avg_area = sum(stats['areas']) / len(stats['areas'])
-        median_x = sorted(stats['x_positions'])[len(stats['x_positions'])//2]
-        id_summaries.append({'track_id': track_id, 'avg_area': avg_area, 'median_x': median_x})
-
-    # Ambil 3 ID player dengan rata-rata area terbesar (menyaring pemain kecil di background)
-    id_summaries.sort(key=lambda x: x['avg_area'], reverse=True)
-    top_3_players = id_summaries[:3]
-    
-    # Urutkan ketiga ID tersebut berdasarkan posisi X (dari kiri ke kanan layar)
-    top_3_players.sort(key=lambda x: x['median_x'])
-
-    # Petakan ID ke Nama Pemain
+    # Finalisasi mapping berdasarkan voting terbanyak
     player_names = {}
-    if len(top_3_players) >= 3:
-        player_names[top_3_players[0]['track_id']] = "Player A" # Kiri (Baju Hitam)
-        player_names[top_3_players[1]['track_id']] = "Player B" # Tengah (Baju Putih)
-        player_names[top_3_players[2]['track_id']] = "Player C" # Kanan (Baju Biru/Hitam)
-    
-    print(f"Mapping Pemain Berhasil: {player_names}")
+    for track_id, votes in id_votes.items():
+        # Cari role dengan vote terbanyak untuk ID ini
+        best_role = max(votes, key=votes.get)
+        
+        # Filter: Pastikan ID ini stabil berada di top 3 minimal di 10 frame.
+        # Ini mencegah pemain background yang kebetulan lewat 1-2 frame salah dilabeli.
+        if votes[best_role] > 10: 
+            player_names[track_id] = best_role
 
-    # Inisialisasi variabel untuk menghitung jumlah passing
+    print(f"Hasil Dynamic Mapping: {player_names}")
+
+    # Inisialisasi variabel statistik
     stats_per_player = {"Player A": 0, "Player B": 0, "Player C": 0, "Other": 0}
 
     # === STEP 3: Possession Mapping ===
@@ -102,7 +104,7 @@ def main():
     for frame_num, frame in enumerate(video_frames):
         player_dict = tracks["players"][frame_num]
         
-        # Logika Penambahan Score Passing
+        # Tambah skor saat frame saat ini sama dengan frame di mana pass dikonfirmasi
         for pass_event in detected_passes:
             if pass_event['frame_display'] == frame_num:
                 sender_id = pass_event['from_player']
@@ -113,7 +115,7 @@ def main():
                 else:
                     stats_per_player["Other"] += 1
 
-        # Gambar UI Dashboard di Kiri Atas
+        # Gambar UI Dashboard
         overlay = frame.copy()
         cv2.rectangle(overlay, (20, 20), (300, 180), (0, 0, 0), -1)
         frame = cv2.addWeighted(overlay, 0.6, frame, 0.4, 0)
@@ -123,27 +125,24 @@ def main():
         cv2.putText(frame, f"Player B : {stats_per_player['Player B']}", (40, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         cv2.putText(frame, f"Player C : {stats_per_player['Player C']}", (40, 145), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
-        # Gambar Trackers (Ellipse & Nama) untuk setiap pemain
+        # Gambar Trackers (Ellipse & Nama)
         for track_id, player in player_dict.items():
             name = player_names.get(track_id, "Other")
             
-            # Hanya tampilkan highlight hijau dan nama untuk Player A, B, dan C
             if name != "Other":
-                color = (0, 255, 0) # Warna hijau
+                color = (0, 255, 0)
                 frame = tracker.draw_ellipse(frame, player["bbox"], color)
                 cv2.putText(frame, name, (int(player["bbox"][0]), int(player["bbox"][1]-10)), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-            # Jika pemain sedang menguasai bola, beri marker segitiga merah di atasnya
             if raw_ball_possessions[frame_num] == track_id:
                 frame = tracker.draw_traingle(frame, player["bbox"], (0, 0, 255))
 
-        # Ball Tracker (Segitiga hijau di atas bola)
+        # Ball Tracker
         ball_dict = tracks["ball"][frame_num]
         for _, ball in ball_dict.items():
             frame = tracker.draw_traingle(frame, ball["bbox"], (0, 255, 0))
 
-        # Tulis frame yang sudah digambar ke video output
         out.write(frame)
 
     out.release()
