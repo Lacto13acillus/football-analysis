@@ -6,31 +6,29 @@ from utils.bbox_utils import measure_distance, get_center_of_bbox_bottom
 
 class PassDetector:
     """
-    Detect passes using ball possession transitions + ball movement validation.
+    Detect passes using ball possession transitions + validation.
 
-    PARAMETER CHANGES:
-    - min_stable_frames:          2 -> 1   (quick-touch possession)
-    - min_pass_distance:         50 -> 25  (very close passing in drill)
-    - max_pass_distance:        700 -> 900 (safety margin)
-    - cooldown_frames:            8 -> 4   (fast drill, rapid passes)
-    - ball_movement_check_radius:20 -> 30  (wider validation window)
-    - ball_movement_threshold:    5 -> 2   (short pass = tiny displacement)
-    - min_display_gap:            8 -> 5   (show rapid passes)
-    - fill_short_gaps max_gap:    8 -> 12  (bridge longer gaps in possession)
+    TUNING NOTES (vs previous version):
+    - smoothing_window:  5 → 9   (kill 3-5 frame flicker between B/C)
+    - min_stable_frames: 1 → 4   (require real possession, not 1-frame noise)
+    - cooldown_frames:   4 → 15  (prevent double-counting from residual flicker)
+    - fill_short_gaps:  12 → 6   (too aggressive = false segment bridges)
+    - ball_movement_threshold: 2 → 15 (real pass = significant ball displacement)
+    - min_pass_distance: 25 → 40 (filter jitter)
     """
 
     def __init__(self, fps: float = 24.0):
         self.fps = float(fps)
-        self.smoothing_window = 5
-        self.min_stable_frames = 1
+        self.smoothing_window = 9
+        self.min_stable_frames = 4
         self.min_possession_duration = 1
-        self.min_pass_distance = 25
+        self.min_pass_distance = 40
         self.max_pass_distance = 900
-        self.cooldown_frames = 4
+        self.cooldown_frames = 15
         self.ball_movement_check_radius = 30
-        self.ball_movement_threshold = 2
+        self.ball_movement_threshold = 15
         self.pass_display_delay = 5
-        self.min_display_gap = 5
+        self.min_display_gap = 10
 
     def smooth_possessions(self, raw_possessions: Sequence[int]) -> List[int]:
         smoothed = list(raw_possessions)
@@ -44,7 +42,7 @@ class PassDetector:
                 smoothed[i] = -1
         return smoothed
 
-    def fill_short_gaps(self, possessions: Sequence[int], max_gap: int = 12) -> List[int]:
+    def fill_short_gaps(self, possessions: Sequence[int], max_gap: int = 6) -> List[int]:
         filled = list(possessions)
         last_valid = -1
         gap_start = -1
@@ -149,7 +147,7 @@ class PassDetector:
         allowed_player_ids: Optional[Set[int]] = None,
         role_to_trackid_per_frame: Optional[List[Dict[int, int]]] = None,
     ) -> List[Dict[str, Any]]:
-        filled = self.fill_short_gaps(ball_possessions, max_gap=12)
+        filled = self.fill_short_gaps(ball_possessions, max_gap=6)
         smoothed = self.smooth_possessions(filled)
 
         if allowed_player_ids is not None:

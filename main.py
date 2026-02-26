@@ -41,12 +41,6 @@ class RoleState:
     pos_history: deque = field(default_factory=lambda: deque(maxlen=8))
 
     def predicted_pos(self) -> Optional[Tuple[float, float]]:
-        """
-        Predict next position using linear velocity.
-        WHY: During crossing, two players move in OPPOSITE directions.
-        Without velocity, both are "near" the crossing point → ambiguous.
-        With velocity, each role predicts a DIFFERENT target → correct assignment.
-        """
         if len(self.pos_history) < 2:
             return self.foot_pos
         p_old = self.pos_history[-2]
@@ -66,7 +60,7 @@ class RoleState:
 
 
 # ──────────────────────────────────────────────────────────────
-# BRUTE-FORCE OPTIMAL MATCHING (replaces scipy Hungarian)
+# BRUTE-FORCE OPTIMAL MATCHING (no scipy needed)
 # ──────────────────────────────────────────────────────────────
 def optimal_assignment_3(
     roles: List[int],
@@ -74,18 +68,6 @@ def optimal_assignment_3(
     candidates: List[CandidatePlayer],
     max_jump_px: int,
 ) -> Dict[int, Optional[CandidatePlayer]]:
-    """
-    For exactly 3 roles, try all permutations of candidates (max 6)
-    and pick the assignment with lowest total cost.
-
-    Cost = distance from PREDICTED position to candidate foot.
-    If distance > max_jump_px, that pair is forbidden (infinite cost).
-
-    WHY brute-force instead of scipy:
-    - Only 3! = 6 permutations → negligible compute.
-    - Zero external dependency.
-    - Gives globally optimal result, same as Hungarian.
-    """
     n_roles = len(roles)
     n_cands = len(candidates)
 
@@ -94,22 +76,15 @@ def optimal_assignment_3(
 
     LARGE_COST = 1e9
 
-    # Get predicted positions for each role
     pred_positions: Dict[int, Optional[Tuple[float, float]]] = {}
     for r in roles:
         pred_positions[r] = role_states[r].predicted_pos()
 
-    # If fewer candidates than roles, pad with None
-    cand_indices = list(range(n_cands))
-
     best_assignment: Dict[int, Optional[CandidatePlayer]] = {r: None for r in roles}
     best_total_cost = float("inf")
 
-    # Generate all permutations of candidate indices for role slots
-    # If n_cands >= n_roles: permutations of length n_roles from n_cands indices
-    # If n_cands < n_roles: pad candidates with None placeholders
     if n_cands >= n_roles:
-        # Try all ways to pick n_roles candidates from n_cands (ordered)
+        cand_indices = list(range(n_cands))
         for perm in permutations(cand_indices, n_roles):
             total_cost = 0.0
             valid = True
@@ -118,7 +93,6 @@ def optimal_assignment_3(
                 cand = candidates[ci]
                 pred = pred_positions[role]
                 if pred is None:
-                    # No prediction → use small area-inverse cost (prefer larger)
                     total_cost += LARGE_COST / 2 - cand.area * 0.001
                 else:
                     d = measure_distance(
@@ -135,8 +109,6 @@ def optimal_assignment_3(
                 for ri, ci in enumerate(perm):
                     best_assignment[roles[ri]] = candidates[ci]
     else:
-        # Fewer candidates than roles → some roles will be unmatched
-        # Try all permutations of roles assigned to candidates
         for perm in permutations(range(n_roles), n_cands):
             total_cost = 0.0
             valid = True
@@ -161,7 +133,6 @@ def optimal_assignment_3(
                 best_total_cost = total_cost
                 best_assignment = assignment
 
-    # If no valid assignment found (all exceed max_jump), fall back to None
     if best_total_cost >= float("inf"):
         return {r: None for r in roles}
 
@@ -169,7 +140,7 @@ def optimal_assignment_3(
 
 
 # ──────────────────────────────────────────────────────────────
-# BUILD LOCKED ROLES (Hungarian-equivalent via brute-force)
+# BUILD LOCKED ROLES
 # ──────────────────────────────────────────────────────────────
 def build_locked_roles(
     tracks: Dict[str, List[Dict[int, Dict[str, Any]]]],
@@ -178,10 +149,6 @@ def build_locked_roles(
     min_area_ratio: float = 0.0025,
     lost_tolerance: int = 20,
 ) -> Tuple[Dict[int, Dict[int, str]], List[Dict[int, int]]]:
-    """
-    Role locking using optimal brute-force assignment + velocity prediction.
-    No scipy dependency. Equivalent to Hungarian for 3 players.
-    """
     if not video_frames:
         raise ValueError("video_frames is empty.")
     if "players" not in tracks or len(tracks["players"]) != len(video_frames):
@@ -219,7 +186,6 @@ def build_locked_roles(
         return candidates
 
     def initialize_roles(candidates: List[CandidatePlayer]) -> bool:
-        """Pick 3 largest, sort by X (left→right = A, B, C)."""
         top3 = sorted(candidates, key=lambda c: c.area, reverse=True)[:3]
         if len(top3) < 3:
             return False
@@ -229,7 +195,6 @@ def build_locked_roles(
             role_states[role].update(cand.track_id, cand.foot_pos)
         return True
 
-    # ── Main frame loop ──
     for f in range(len(video_frames)):
         players_f = tracks["players"][f]
         candidates = get_foreground_candidates(players_f)
@@ -241,7 +206,6 @@ def build_locked_roles(
             locked_ids_per_frame.append({ROLE_A: -1, ROLE_B: -1, ROLE_C: -1})
             continue
 
-        # Initialization gate
         all_lost = all(role_states[r].lost_count > lost_tolerance for r in roles)
         if not initialized or all_lost:
             ok = initialize_roles(candidates)
@@ -262,7 +226,6 @@ def build_locked_roles(
                 locked_ids_per_frame.append({ROLE_A: -1, ROLE_B: -1, ROLE_C: -1})
                 continue
 
-        # Optimal matching with velocity prediction (brute-force, no scipy)
         assignments = optimal_assignment_3(roles, role_states, candidates, max_jump_px)
 
         for role in roles:
@@ -272,11 +235,9 @@ def build_locked_roles(
             else:
                 role_states[role].mark_lost()
 
-        # If any role lost too long → full reinit
         if any(role_states[r].lost_count > lost_tolerance for r in roles):
             initialize_roles(candidates)
 
-        # Build output
         roles_dict = {}
         locked_ids = {}
         for role in roles:
@@ -303,16 +264,13 @@ def main() -> None:
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     os.makedirs(os.path.dirname(stub_path), exist_ok=True)
 
-    # Initialize components
     tracker = Tracker("yolov8m.pt")
-    player_ball_assigner = PlayerBallAssigner(max_player_ball_distance=200)
+    player_ball_assigner = PlayerBallAssigner(max_player_ball_distance=350)
 
-    # Read video
     video_frames = read_video(video_path)
     if not video_frames:
         raise RuntimeError("No frames read from video.")
 
-    # Track objects
     if os.path.exists(stub_path):
         with open(stub_path, "rb") as f:
             tracks = pickle.load(f)
@@ -322,13 +280,10 @@ def main() -> None:
     if "ball" not in tracks:
         tracks["ball"] = [{} for _ in range(len(video_frames))]
 
-    # Interpolate missing ball bboxes
     tracks["ball"] = interpolate_ball_positions(tracks["ball"])
 
-    # Lock A/B/C with optimal matching + velocity prediction
     frame_roles, locked_ids_per_frame = build_locked_roles(tracks, video_frames)
 
-    # ── DEBUG: Print initial role assignment ──
     role_name = {0: "Player A", 1: "Player B", 2: "Player C"}
     print(f"\n{'='*60}")
     print("INITIAL ROLE ASSIGNMENT (first valid frame):")
@@ -443,7 +398,6 @@ def main() -> None:
         fd = int(ev["frame_display"])
         events_by_display_frame.setdefault(fd, []).append(ev)
 
-    # Render loop
     for frame_num, frame in enumerate(video_frames):
         player_dict = tracks["players"][frame_num]
         locked_map = locked_ids_per_frame[frame_num]

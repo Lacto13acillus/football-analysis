@@ -5,19 +5,26 @@ from utils.bbox_utils import get_center_of_bbox, get_center_of_bbox_bottom, meas
 class PlayerBallAssigner:
     """
     Assign ball -> nearest player.
-    
-    CHANGE: Uses DUAL distance (foot + bbox center), takes the MINIMUM.
-    WHY: Player A's foot position might be far from ball (e.g., ball at waist level
-    or ball between legs), but bbox center might be closer. Taking min of both
-    gives more robust assignment.
-    
-    CHANGE: max_player_ball_distance 150 -> 200
-    WHY: In eye-level camera during passing drills, ball can be 150-200px away
-    from the nearest body reference point, especially during wind-up or follow-through.
+
+    Strategy (ordered by priority):
+    1. If ball center is INSIDE a player's bbox → distance = 0 (auto-assign).
+       WHY: For large bboxes (like Player A close to camera), foot distance is
+       unreliable, but if the ball is literally inside the bbox, that player
+       clearly has it.
+    2. Otherwise, take min of three distances:
+       - ball_center → player_foot
+       - ball_center → player_center
+       - ball_bottom → player_foot
     """
 
-    def __init__(self, max_player_ball_distance: float = 200.0):
+    def __init__(self, max_player_ball_distance: float = 350.0):
         self.max_player_ball_distance = float(max_player_ball_distance)
+
+    def _ball_inside_bbox(self, ball_center: Tuple[int, int], bbox: List[float]) -> bool:
+        """Check if ball center falls within player bbox."""
+        bx, by = ball_center
+        x1, y1, x2, y2 = bbox
+        return x1 <= bx <= x2 and y1 <= by <= y2
 
     def assign_ball_to_player(
         self,
@@ -39,14 +46,16 @@ class PlayerBallAssigner:
             if not bbox or len(bbox) != 4:
                 continue
 
-            foot = get_center_of_bbox_bottom(bbox)
-            center = get_center_of_bbox(bbox)
-
-            # Dual distance: take the minimum of foot and center distances
-            d_foot = measure_distance(ball_center, foot)
-            d_center = measure_distance(ball_center, center)
-            d_foot_bottom = measure_distance(ball_bottom, foot)
-            d = min(d_foot, d_center, d_foot_bottom)
+            # Priority 1: ball inside bbox → distance = 0
+            if self._ball_inside_bbox(ball_center, bbox):
+                d = 0.0
+            else:
+                foot = get_center_of_bbox_bottom(bbox)
+                center = get_center_of_bbox(bbox)
+                d_foot = measure_distance(ball_center, foot)
+                d_center = measure_distance(ball_center, center)
+                d_bottom = measure_distance(ball_bottom, foot)
+                d = min(d_foot, d_center, d_bottom)
 
             if best_dist is None or d < best_dist:
                 best_dist = d
