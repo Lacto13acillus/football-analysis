@@ -131,7 +131,7 @@ def main():
         # === Ball ===
         ball_dict = tracks["ball"][frame_num]
         for _, ball in ball_dict.items():
-            frame = tracker.draw_traingle(frame, ball["bbox"], (0, 255, 0))
+            frame = tracker.draw_triangle(frame, ball["bbox"], (0, 255, 0))
 
         out.write(frame)
 
