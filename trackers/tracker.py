@@ -74,10 +74,11 @@ class Tracker:
         cv2.circle(frame, from_pos, 8, color, -1)
         cv2.circle(frame, to_pos, 8, (0, 200, 255), -1)
         return frame
-    def draw_ellipse(self, frame: np.ndarray, bbox: List[float], color: Tuple[int, int, int]) -> np.ndarray:
+    def draw_ellipse(self, frame, bbox, color, track_id=None):
         y2 = int(bbox[3])
         x_center, _ = get_center_of_bbox(bbox)
         width = get_bbox_width(bbox)
+    
         cv2.ellipse(
             frame,
             center=(x_center, y2),
@@ -87,8 +88,13 @@ class Tracker:
             endAngle=235,
             color=color,
             thickness=2,
-            lineType=cv2.LINE_4,
+            lineType=cv2.LINE_4
         )
+    
+        if track_id is not None:
+            cv2.putText(frame, str(track_id), (x_center - 10, y2 + 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+    
         return frame
     def draw_triangle(self, frame: np.ndarray, bbox: List[float], color: Tuple[int, int, int]) -> np.ndarray:
         y = int(bbox[1])
