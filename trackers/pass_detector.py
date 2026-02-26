@@ -6,29 +6,25 @@ from utils.bbox_utils import measure_distance, get_center_of_bbox_bottom
 
 class PassDetector:
     """
-    Detect passes using ball possession transitions + validation.
-
-    TUNING NOTES (vs previous version):
-    - smoothing_window:  5 → 9   (kill 3-5 frame flicker between B/C)
-    - min_stable_frames: 1 → 4   (require real possession, not 1-frame noise)
-    - cooldown_frames:   4 → 15  (prevent double-counting from residual flicker)
-    - fill_short_gaps:  12 → 6   (too aggressive = false segment bridges)
-    - ball_movement_threshold: 2 → 15 (real pass = significant ball displacement)
-    - min_pass_distance: 25 → 40 (filter jitter)
+    FINAL TUNING:
+    - smoothing_window:  9 → 13  (kill ALL flicker < 13 frames)
+    - min_stable_frames: 4 → 6   (require solid possession segment)
+    - cooldown_frames:  15 → 20  (prevent any double-count)
+    - min_display_gap:  10 → 15  (visual spacing between arrows)
     """
 
     def __init__(self, fps: float = 24.0):
         self.fps = float(fps)
-        self.smoothing_window = 9
-        self.min_stable_frames = 4
+        self.smoothing_window = 13
+        self.min_stable_frames = 6
         self.min_possession_duration = 1
         self.min_pass_distance = 40
         self.max_pass_distance = 900
-        self.cooldown_frames = 15
+        self.cooldown_frames = 20
         self.ball_movement_check_radius = 30
         self.ball_movement_threshold = 15
         self.pass_display_delay = 5
-        self.min_display_gap = 10
+        self.min_display_gap = 15
 
     def smooth_possessions(self, raw_possessions: Sequence[int]) -> List[int]:
         smoothed = list(raw_possessions)

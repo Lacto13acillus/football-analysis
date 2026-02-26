@@ -3,25 +3,10 @@ from utils.bbox_utils import get_center_of_bbox, get_center_of_bbox_bottom, meas
 
 
 class PlayerBallAssigner:
-    """
-    Assign ball -> nearest player.
-
-    Strategy (ordered by priority):
-    1. If ball center is INSIDE a player's bbox → distance = 0 (auto-assign).
-       WHY: For large bboxes (like Player A close to camera), foot distance is
-       unreliable, but if the ball is literally inside the bbox, that player
-       clearly has it.
-    2. Otherwise, take min of three distances:
-       - ball_center → player_foot
-       - ball_center → player_center
-       - ball_bottom → player_foot
-    """
-
     def __init__(self, max_player_ball_distance: float = 350.0):
         self.max_player_ball_distance = float(max_player_ball_distance)
 
     def _ball_inside_bbox(self, ball_center: Tuple[int, int], bbox: List[float]) -> bool:
-        """Check if ball center falls within player bbox."""
         bx, by = ball_center
         x1, y1, x2, y2 = bbox
         return x1 <= bx <= x2 and y1 <= by <= y2
@@ -46,7 +31,6 @@ class PlayerBallAssigner:
             if not bbox or len(bbox) != 4:
                 continue
 
-            # Priority 1: ball inside bbox → distance = 0
             if self._ball_inside_bbox(ball_center, bbox):
                 d = 0.0
             else:

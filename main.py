@@ -20,9 +20,6 @@ from utils.bbox_utils import (
 from utils.video_utils import read_video
 
 
-# ──────────────────────────────────────────────────────────────
-# Data structures
-# ──────────────────────────────────────────────────────────────
 @dataclass
 class CandidatePlayer:
     track_id: int
@@ -34,7 +31,6 @@ class CandidatePlayer:
 
 @dataclass
 class RoleState:
-    """Per-role tracking state with velocity history."""
     track_id: int = -1
     foot_pos: Optional[Tuple[float, float]] = None
     lost_count: int = 10_000
@@ -59,9 +55,6 @@ class RoleState:
         self.lost_count += 1
 
 
-# ──────────────────────────────────────────────────────────────
-# BRUTE-FORCE OPTIMAL MATCHING (no scipy needed)
-# ──────────────────────────────────────────────────────────────
 def optimal_assignment_3(
     roles: List[int],
     role_states: Dict[int, "RoleState"],
@@ -139,9 +132,6 @@ def optimal_assignment_3(
     return best_assignment
 
 
-# ──────────────────────────────────────────────────────────────
-# BUILD LOCKED ROLES
-# ──────────────────────────────────────────────────────────────
 def build_locked_roles(
     tracks: Dict[str, List[Dict[int, Dict[str, Any]]]],
     video_frames: List[np.ndarray],
@@ -251,13 +241,24 @@ def build_locked_roles(
     return frame_roles, locked_ids_per_frame
 
 
-# ──────────────────────────────────────────────────────────────
-# MAIN
-# ──────────────────────────────────────────────────────────────
 def main() -> None:
     video_path = "input_videos/passing_close.mp4"
     stub_path = "stubs/track_stubs.pkl"
     output_path = "output_videos/passing_close.avi"
+
+    # ──────────────────────────────────────────────────────────
+    # CONFIGURABLE: Force initial possession for N frames
+    # WHY: At frame 0, Player A has the ball at his feet but the ball
+    # is detected closer to Player B (center of frame) due to Player A's
+    # enormous bbox (area=212K, very close to camera).
+    # The ball is physically at A's feet but the foot position (bbox bottom)
+    # is far from the ball center because the bbox is so tall.
+    #
+    # Set to 0 to disable this override.
+    # Set to ~30 if you know Player A starts with the ball.
+    # ──────────────────────────────────────────────────────────
+    INITIAL_POSSESSION_ROLE = 0     # 0 = Player A
+    INITIAL_POSSESSION_FRAMES = 30  # Force first 30 frames as Player A
 
     if not os.path.exists(video_path):
         raise FileNotFoundError(f"Video not found: {video_path}")
@@ -306,6 +307,13 @@ def main() -> None:
     for frame_num in range(len(video_frames)):
         frame_players = tracks["players"][frame_num]
         ball_bbox = tracks["ball"][frame_num].get(1, {}).get("bbox", [])
+
+        # ── INITIAL POSSESSION OVERRIDE ──
+        # Force Player A for first N frames (ball at A's feet but
+        # detected closer to B due to A's massive bbox)
+        if frame_num < INITIAL_POSSESSION_FRAMES:
+            role_based_possessions.append(INITIAL_POSSESSION_ROLE)
+            continue
 
         if not ball_bbox:
             role_based_possessions.append(-1)
