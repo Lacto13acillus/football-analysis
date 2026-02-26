@@ -49,11 +49,11 @@ def main():
             raw_ball_possessions.append(assigned_player)
 
     # Debug: Print mapping hasil OCR
-    print("\n=== JERSEY NUMBER MAPPING ===")
-    for tid, jnum in player_identifier.player_numbers_map.items():
-        history = player_identifier.detection_history.get(tid, {})
-        print(f"  Track ID {tid} => #{jnum}  (votes: {history})")
-    print("=============================\n")
+    # print("\n=== JERSEY NUMBER MAPPING ===")
+    # for tid, jnum in player_identifier.player_numbers_map.items():
+    #     history = player_identifier.detection_history.get(tid, {})
+    #     print(f"  Track ID {tid} => #{jnum}  (votes: {history})")
+    # print("=============================\n")
 
     # === STEP 3: Pass Detection ===
     cap_temp = cv2.VideoCapture(video_path)
