@@ -8,6 +8,7 @@ from utils.bbox_utils import get_center_of_bbox, get_bbox_width, get_foot_positi
 
 class Tracker:
     def __init__(self, model_path):
+        # Ini akan otomatis mendownload model bawaan YOLO jika file belum ada
         self.model = YOLO(model_path)
         self.tracker = sv.ByteTrack()
 
@@ -15,7 +16,7 @@ class Tracker:
         batch_size = 20
         detections = []
         for i in range(0, len(frames), batch_size):
-            detections_batch = self.model.predict(frames[i:i+batch_size], conf=0.15)  # Sedikit dinaikkan dari 0.1
+            detections_batch = self.model.predict(frames[i:i+batch_size], conf=0.15)
             detections += detections_batch
         return detections
 
@@ -36,36 +37,38 @@ class Tracker:
             cls_names_inv = {v: k for k, v in cls_names.items()}
 
             detection_supervision = sv.Detections.from_ultralytics(detection)
-
             detection_with_tracks = self.tracker.update_with_detections(detection_supervision)
 
             tracks["players"].append({})
             tracks["ball"].append({})
 
+            # --- MENDETEKSI PEMAIN (Class: 'person') ---
             for frame_detection in detection_with_tracks:
                 bbox = frame_detection[0].tolist()
                 cls_id = frame_detection[3]
                 track_id = frame_detection[4]
                 confidence = frame_detection[2] if len(frame_detection) > 2 else 1.0
 
-                if cls_id == cls_names_inv.get('player', -1):
+                # UBAH: dari 'player' menjadi 'person'
+                if cls_id == cls_names_inv.get('person', -1):
                     tracks["players"][frame_num][track_id] = {
                         "bbox": bbox,
                         "confidence": float(confidence) if not isinstance(confidence, float) else confidence
                     }
 
-            # Ball: ambil deteksi dengan confidence tertinggi jika ada multiple
+            # --- MENDETEKSI BOLA (Class: 'sports ball') ---
             ball_detections = []
             for frame_detection in detection_supervision:
                 bbox = frame_detection[0].tolist()
                 cls_id = frame_detection[3]
                 conf = frame_detection[2] if len(frame_detection) > 2 else 0.5
 
-                if cls_id == cls_names_inv.get('ball', -1):
+                # UBAH: dari 'ball' menjadi 'sports ball'
+                if cls_id == cls_names_inv.get('sports ball', -1):
                     ball_detections.append((bbox, conf))
 
             if ball_detections:
-                # Pilih bola dengan confidence tertinggi
+                # Pilih bola dengan confidence tertinggi jika ada pantulan bayangan/objek mirip bola
                 best_ball = max(ball_detections, key=lambda x: x[1])
                 tracks["ball"][frame_num][1] = {
                     "bbox": best_ball[0],
@@ -73,6 +76,8 @@ class Tracker:
                 }
 
         if stub_path is not None:
+            # Pastikan folder stubs ada sebelum menyimpan
+            os.makedirs(os.path.dirname(stub_path), exist_ok=True)
             with open(stub_path, 'wb') as f:
                 pickle.dump(tracks, f)
 
