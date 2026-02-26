@@ -145,9 +145,9 @@ def build_locked_roles(
         locked_ids_per_frame.append(locked_ids)
     return frame_roles, locked_ids_per_frame
 def main() -> None:
-    video_path = "input_videos/passing_drill.mp4"
+    video_path = "input_videos/passing_close.mp4"
     stub_path = "stubs/track_stubs.pkl"
-    output_path = "output_videos/passing_drill_final.avi"
+    output_path = "output_videos/passing_close.avi"
     if not os.path.exists(video_path):
         raise FileNotFoundError(f"Video not found: {video_path}")
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
