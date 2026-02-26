@@ -126,7 +126,7 @@ def main():
 
             # Segitiga possession
             if raw_ball_possessions[frame_num] == track_id:
-                frame = tracker.draw_traingle(frame, player["bbox"], (0, 0, 255))
+                frame = tracker.draw_triangle(frame, player["bbox"], (0, 0, 255))
 
         # === Ball ===
         ball_dict = tracks["ball"][frame_num]
