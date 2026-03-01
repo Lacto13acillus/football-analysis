@@ -3,7 +3,7 @@ from utils.bbox_utils import get_center_of_bbox, get_center_of_bbox_bottom, meas
 
 
 class PlayerBallAssigner:
-    def __init__(self, max_player_ball_distance: float = 350.0):
+    def __init__(self, max_player_ball_distance: float = 200.0):
         self.max_player_ball_distance = float(max_player_ball_distance)
 
     def _ball_inside_bbox(self, ball_center: Tuple[int, int], bbox: List[float]) -> bool:

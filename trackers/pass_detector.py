@@ -8,26 +8,21 @@ class PassDetector:
     def __init__(self, fps=24):
         self.fps = fps
 
-        # === UNTUK DRILL PASSING CEPAT ===
-        self.smoothing_window = 3       # DIUBAH: 5 -> 3
-        self.min_stable_frames = 1      # DIUBAH: 2 -> 1
+        self.smoothing_window = 3
+        self.min_stable_frames = 2        # DIUBAH: 1 -> 2 (filter noise)
 
-        # === PASS VALIDATION ===
-        self.min_pass_distance = 25     # DIUBAH: 50 -> 25
-        self.max_pass_distance = 800    # DIUBAH: 700 -> 800
-        self.cooldown_frames = 3        # DIUBAH: 8 -> 3
+        self.min_pass_distance = 35       # DIUBAH: 25 -> 35
+        self.max_pass_distance = 800
+        self.cooldown_frames = 5          # DIUBAH: 3 -> 5 (anti double-count)
         self.min_possession_duration = 1
 
-        # === BALL MOVEMENT ===
-        self.ball_movement_check_radius = 25  # DIUBAH: 20 -> 25
-        self.ball_movement_threshold = 3      # DIUBAH: 5 -> 3
+        self.ball_movement_check_radius = 25
+        self.ball_movement_threshold = 4  # DIUBAH: 3 -> 4
 
-        # === Toleransi pencarian player ===
-        self.player_search_radius = 20  # DIUBAH: 15 -> 20
+        self.player_search_radius = 20
 
-        # === Display delay ===
-        self.pass_display_delay = 3     # DIUBAH: 5 -> 3
-        self.min_display_gap = 3        # DIUBAH: 8 -> 3
+        self.pass_display_delay = 3
+        self.min_display_gap = 4          # DIUBAH: 3 -> 4
 
     def smooth_possessions(self, raw_possessions):
         smoothed = list(raw_possessions)
@@ -175,7 +170,7 @@ class PassDetector:
             if seg['player_id'] == merged[-1]['player_id']:
                 # Merge: extend frame_end
                 gap = seg['frame_start'] - merged[-1]['frame_end']
-                if gap <= 15:  # Jika gap kecil, gabung
+                if gap <= 10:  # Jika gap kecil, gabung
                     merged[-1]['frame_end'] = seg['frame_end']
                 else:
                     merged.append(seg)
