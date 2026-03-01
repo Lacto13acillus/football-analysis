@@ -1,52 +1,56 @@
-from collections import Counter
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Set
+import sys
+sys.path.append('../')
+from utils.bbox_utils import measure_distance, get_center_of_bbox_bottom, get_center_of_bbox
 import numpy as np
-from utils.bbox_utils import measure_distance, get_center_of_bbox_bottom
-
+from collections import Counter
 
 class PassDetector:
-    """
-    FINAL TUNING:
-    - smoothing_window:  9 → 13  (kill ALL flicker < 13 frames)
-    - min_stable_frames: 4 → 6   (require solid possession segment)
-    - cooldown_frames:  15 → 20  (prevent any double-count)
-    - min_display_gap:  10 → 15  (visual spacing between arrows)
-    """
+    def __init__(self, fps=24):
+        self.fps = fps
 
-    def __init__(self, fps: float = 24.0):
-        self.fps = float(fps)
-        self.smoothing_window = 13
-        self.min_stable_frames = 6
+        # === UNTUK DRILL PASSING CEPAT ===
+        self.smoothing_window = 3       # DIUBAH: 5 -> 3
+        self.min_stable_frames = 1      # DIUBAH: 2 -> 1
+
+        # === PASS VALIDATION ===
+        self.min_pass_distance = 25     # DIUBAH: 50 -> 25
+        self.max_pass_distance = 800    # DIUBAH: 700 -> 800
+        self.cooldown_frames = 3        # DIUBAH: 8 -> 3
         self.min_possession_duration = 1
-        self.min_pass_distance = 40
-        self.max_pass_distance = 900
-        self.cooldown_frames = 20
-        self.ball_movement_check_radius = 30
-        self.ball_movement_threshold = 15
-        self.pass_display_delay = 5
-        self.min_display_gap = 15
 
-    def smooth_possessions(self, raw_possessions: Sequence[int]) -> List[int]:
+        # === BALL MOVEMENT ===
+        self.ball_movement_check_radius = 25  # DIUBAH: 20 -> 25
+        self.ball_movement_threshold = 3      # DIUBAH: 5 -> 3
+
+        # === Toleransi pencarian player ===
+        self.player_search_radius = 20  # DIUBAH: 15 -> 20
+
+        # === Display delay ===
+        self.pass_display_delay = 3     # DIUBAH: 5 -> 3
+        self.min_display_gap = 3        # DIUBAH: 8 -> 3
+
+    def smooth_possessions(self, raw_possessions):
         smoothed = list(raw_possessions)
         half_window = self.smoothing_window // 2
         for i in range(half_window, len(raw_possessions) - half_window):
             window = raw_possessions[i - half_window : i + half_window + 1]
             valid = [p for p in window if p != -1]
-            if valid:
+            if len(valid) > 0:
                 smoothed[i] = Counter(valid).most_common(1)[0][0]
             else:
                 smoothed[i] = -1
         return smoothed
 
-    def fill_short_gaps(self, possessions: Sequence[int], max_gap: int = 6) -> List[int]:
+    def fill_short_gaps(self, possessions, max_gap=12):
+        """DIUBAH: max_gap 8 -> 12 untuk drill cepat"""
         filled = list(possessions)
         last_valid = -1
         gap_start = -1
         for i in range(len(filled)):
             if filled[i] != -1:
                 if last_valid != -1 and gap_start != -1:
-                    gap_len = i - gap_start
-                    if gap_len <= max_gap:
+                    gap_length = i - gap_start
+                    if gap_length <= max_gap:
                         for g in range(gap_start, i):
                             filled[g] = last_valid
                 last_valid = filled[i]
@@ -56,151 +60,235 @@ class PassDetector:
                     gap_start = i
         return filled
 
-    def get_stable_segments(self, smoothed_possessions: Sequence[int]) -> List[Dict[str, int]]:
-        segments: List[Dict[str, int]] = []
-        current = -1
-        start = 0
-        for f, pid in enumerate(smoothed_possessions):
-            if pid != current:
-                if current != -1:
-                    duration = f - start
+    def get_stable_segments(self, smoothed_possessions):
+        segments = []
+        current_player = -1
+        segment_start = 0
+        for frame_num, player_id in enumerate(smoothed_possessions):
+            if player_id != current_player:
+                if current_player != -1:
+                    duration = frame_num - segment_start
                     if duration >= self.min_stable_frames:
                         segments.append({
-                            "player_id": int(current),
-                            "frame_start": int(start),
-                            "frame_end": int(f - 1),
+                            'player_id': current_player,
+                            'frame_start': segment_start,
+                            'frame_end': frame_num - 1
                         })
-                current = pid
-                start = f
-        if current != -1:
-            duration = len(smoothed_possessions) - start
+                current_player = player_id
+                segment_start = frame_num
+        if current_player != -1:
+            duration = len(smoothed_possessions) - segment_start
             if duration >= self.min_stable_frames:
                 segments.append({
-                    "player_id": int(current),
-                    "frame_start": int(start),
-                    "frame_end": int(len(smoothed_possessions) - 1),
+                    'player_id': current_player,
+                    'frame_start': segment_start,
+                    'frame_end': len(smoothed_possessions) - 1
                 })
         return segments
 
-    def validate_ball_movement(self, tracks: Dict[str, Any], frame_idx: int) -> bool:
-        if "ball" not in tracks:
-            return False
-        start = max(0, frame_idx - self.ball_movement_check_radius)
-        end = min(len(tracks["ball"]) - 1, frame_idx + self.ball_movement_check_radius)
+    def validate_ball_movement(self, tracks, frame_start, frame_end):
+        check_start = max(0, frame_start - self.ball_movement_check_radius)
+        check_end = min(len(tracks['ball']), frame_end + self.ball_movement_check_radius)
 
-        positions: List[Tuple[int, int]] = []
-        for f in range(start, end + 1):
-            bb = tracks["ball"][f].get(1, {}).get("bbox", None)
-            if not bb:
-                continue
-            x = int((bb[0] + bb[2]) / 2)
-            y = int((bb[1] + bb[3]) / 2)
-            positions.append((x, y))
+        ball_positions = []
+        for f in range(check_start, check_end):
+            ball_data = tracks['ball'][f].get(1)
+            if ball_data and 'bbox' in ball_data:
+                pos = get_center_of_bbox(ball_data['bbox'])
+                ball_positions.append(pos)
 
-        if len(positions) < 2:
-            return False
+        if len(ball_positions) < 2:
+            return 0
 
-        disp = measure_distance(positions[0], positions[-1])
-        return disp >= self.ball_movement_threshold
+        direct_distance = measure_distance(ball_positions[0], ball_positions[-1])
 
-    def find_player_position(
-        self,
-        tracks: Dict[str, Any],
-        frame_idx: int,
-        player_id: int,
-        role_to_trackid_per_frame: Optional[List[Dict[int, int]]] = None,
-    ) -> Optional[Tuple[int, int]]:
-        if frame_idx < 0 or frame_idx >= len(tracks.get("players", [])):
-            return None
+        max_displacement = 0
+        for i in range(1, len(ball_positions)):
+            d = measure_distance(ball_positions[0], ball_positions[i])
+            if d > max_displacement:
+                max_displacement = d
 
-        if role_to_trackid_per_frame is not None:
-            if frame_idx >= len(role_to_trackid_per_frame):
-                return None
-            track_id = role_to_trackid_per_frame[frame_idx].get(int(player_id), -1)
-            if track_id == -1:
-                return None
-            pdata = tracks["players"][frame_idx].get(int(track_id), None)
-            if pdata is None:
-                return None
-            bbox = pdata.get("bbox", None)
-            if not bbox:
-                return None
-            return get_center_of_bbox_bottom(bbox)
+        return max(direct_distance, max_displacement)
 
-        pdata = tracks["players"][frame_idx].get(int(player_id), None)
-        if pdata is None:
-            return None
-        bbox = pdata.get("bbox", None)
-        if not bbox:
-            return None
-        return get_center_of_bbox_bottom(bbox)
+    def find_player_nearby(self, tracks, player_id, target_frame, search_radius=None):
+        if search_radius is None:
+            search_radius = self.player_search_radius
+        total_frames = len(tracks['players'])
 
-    def detect_passes(
-        self,
-        tracks: Dict[str, Any],
-        ball_possessions: Sequence[int],
-        debug: bool = False,
-        allowed_player_ids: Optional[Set[int]] = None,
-        role_to_trackid_per_frame: Optional[List[Dict[int, int]]] = None,
-    ) -> List[Dict[str, Any]]:
-        filled = self.fill_short_gaps(ball_possessions, max_gap=6)
+        player_data = tracks['players'][target_frame].get(player_id)
+        if player_data:
+            return player_data, target_frame
+
+        for offset in range(1, search_radius + 1):
+            check_frame = target_frame - offset
+            if 0 <= check_frame < total_frames:
+                player_data = tracks['players'][check_frame].get(player_id)
+                if player_data:
+                    return player_data, check_frame
+            check_frame = target_frame + offset
+            if 0 <= check_frame < total_frames:
+                player_data = tracks['players'][check_frame].get(player_id)
+                if player_data:
+                    return player_data, check_frame
+        return None, -1
+
+    def detect_passes(self, tracks, ball_possessions, debug=True):
+        if debug:
+            valid_count = sum(1 for p in ball_possessions if p != -1)
+            unique_players = set(p for p in ball_possessions if p != -1)
+            print(f"\n[DEBUG] === PASS DETECTION PIPELINE ===")
+            print(f"[DEBUG] Total frames: {len(ball_possessions)}")
+            print(f"[DEBUG] Frames with possession: {valid_count}/{len(ball_possessions)} ({100*valid_count/max(1,len(ball_possessions)):.1f}%)")
+            print(f"[DEBUG] Unique players detected: {unique_players}")
+            if valid_count == 0:
+                print(f"[DEBUG] *** NO possession detected! ***")
+                return []
+            if len(unique_players) < 2:
+                print(f"[DEBUG] *** Only {len(unique_players)} player(s)! ***")
+                return []
+
+        # TAHAP 1: Fill short gaps
+        filled = self.fill_short_gaps(ball_possessions, max_gap=12)
+        if debug:
+            print(f"[DEBUG] After gap-fill: {sum(1 for p in filled if p != -1)} frames")
+
+        # TAHAP 2: Smoothing
         smoothed = self.smooth_possessions(filled)
+        if debug:
+            print(f"[DEBUG] After smoothing: {sum(1 for p in smoothed if p != -1)} frames")
 
-        if allowed_player_ids is not None:
-            allowed = set(int(x) for x in allowed_player_ids)
-            smoothed = [p if p in allowed else -1 for p in smoothed]
-
+        # TAHAP 3: Stable segments
         segments = self.get_stable_segments(smoothed)
+        if debug:
+            print(f"[DEBUG] Stable segments found: {len(segments)}")
+            for i, seg in enumerate(segments):
+                dur = seg['frame_end'] - seg['frame_start']
+                print(f"[DEBUG]   Seg #{i}: Player {seg['player_id']}, "
+                      f"frames {seg['frame_start']}-{seg['frame_end']} (dur={dur})")
+            if len(segments) < 2:
+                print(f"[DEBUG] *** Less than 2 segments! ***")
+                return []
 
-        if len(segments) < 2:
-            return []
+        # TAHAP 4: Merge segment pendek yang sama player berturut-turut
+        merged = [segments[0]]
+        for seg in segments[1:]:
+            if seg['player_id'] == merged[-1]['player_id']:
+                # Merge: extend frame_end
+                gap = seg['frame_start'] - merged[-1]['frame_end']
+                if gap <= 15:  # Jika gap kecil, gabung
+                    merged[-1]['frame_end'] = seg['frame_end']
+                else:
+                    merged.append(seg)
+            else:
+                merged.append(seg)
+        segments = merged
+        if debug:
+            print(f"[DEBUG] After merging same-player segments: {len(segments)}")
+            for i, seg in enumerate(segments):
+                dur = seg['frame_end'] - seg['frame_start']
+                print(f"[DEBUG]   Merged #{i}: Player {seg['player_id']}, "
+                      f"frames {seg['frame_start']}-{seg['frame_end']} (dur={dur})")
 
-        passes: List[Dict[str, Any]] = []
-        last_pass_frame = -10_000
-        last_display_frame = -10_000
+        # TAHAP 5: Detect passes
+        passes = []
+        last_pass_frame = -999
+        if debug:
+            print(f"\n[DEBUG] === EVALUATING TRANSITIONS ===")
 
         for i in range(len(segments) - 1):
-            s1 = segments[i]
-            s2 = segments[i + 1]
-            from_id = int(s1["player_id"])
-            to_id = int(s2["player_id"])
+            seg_from = segments[i]
+            seg_to = segments[i + 1]
+            from_player = seg_from['player_id']
+            to_player = seg_to['player_id']
+            transition_frame_start = seg_from['frame_end']
+            transition_frame_end = seg_to['frame_start']
 
-            if from_id == -1 or to_id == -1 or from_id == to_id:
+            if debug:
+                print(f"\n[DEBUG] Transition #{i}: Player {from_player} -> Player {to_player}")
+
+            if from_player == to_player:
+                if debug:
+                    print(f"[DEBUG]   SKIP: Same player")
                 continue
 
-            transition_frame = int(s2["frame_start"])
-
-            if transition_frame - last_pass_frame < self.cooldown_frames:
+            if (transition_frame_end - last_pass_frame) < self.cooldown_frames:
+                if debug:
+                    print(f"[DEBUG]   SKIP: Cooldown ({transition_frame_end - last_pass_frame} < {self.cooldown_frames})")
                 continue
 
-            if not self.validate_ball_movement(tracks, transition_frame):
+            from_duration = seg_from['frame_end'] - seg_from['frame_start']
+            if from_duration < self.min_possession_duration:
+                if debug:
+                    print(f"[DEBUG]   SKIP: Too short ({from_duration} < {self.min_possession_duration})")
                 continue
 
-            from_pos = self.find_player_position(tracks, transition_frame, from_id, role_to_trackid_per_frame)
-            to_pos = self.find_player_position(tracks, transition_frame, to_id, role_to_trackid_per_frame)
+            from_player_data, from_actual_frame = self.find_player_nearby(
+                tracks, from_player, transition_frame_start
+            )
+            to_player_data, to_actual_frame = self.find_player_nearby(
+                tracks, to_player, transition_frame_end
+            )
 
-            if from_pos is None or to_pos is None:
+            if not from_player_data or not to_player_data:
+                if debug:
+                    print(f"[DEBUG]   SKIP: Player data missing")
                 continue
 
-            d = measure_distance(from_pos, to_pos)
-            if d < self.min_pass_distance or d > self.max_pass_distance:
+            from_pos = get_center_of_bbox_bottom(from_player_data['bbox'])
+            to_pos = get_center_of_bbox_bottom(to_player_data['bbox'])
+            distance = measure_distance(from_pos, to_pos)
+
+            if distance < self.min_pass_distance:
+                if debug:
+                    print(f"[DEBUG]   SKIP: Too close ({distance:.0f} < {self.min_pass_distance})")
+                continue
+            if distance > self.max_pass_distance:
+                if debug:
+                    print(f"[DEBUG]   SKIP: Too far ({distance:.0f} > {self.max_pass_distance})")
                 continue
 
-            frame_display = transition_frame + self.pass_display_delay
-            if frame_display - last_display_frame < self.min_display_gap:
-                frame_display = last_display_frame + self.min_display_gap
+            ball_movement = self.validate_ball_movement(
+                tracks, transition_frame_start, transition_frame_end
+            )
+            if ball_movement < self.ball_movement_threshold:
+                if debug:
+                    print(f"[DEBUG]   SKIP: Ball static ({ball_movement:.0f} < {self.ball_movement_threshold})")
+                continue
 
-            event = {
-                "from_player": from_id,
-                "to_player": to_id,
-                "frame_start": int(s1["frame_start"]),
-                "frame_end": int(s2["frame_end"]),
-                "frame_display": int(frame_display),
-                "from_pos": (int(from_pos[0]), int(from_pos[1])),
-                "to_pos": (int(to_pos[0]), int(to_pos[1])),
+            if debug:
+                print(f"[DEBUG]   *** PASS! dist={distance:.0f}px, ball={ball_movement:.0f}px ***")
+
+            receiver_start = seg_to['frame_start']
+            pass_display_frame = min(receiver_start + self.pass_display_delay, seg_to['frame_end'])
+
+            if len(passes) > 0:
+                last_display = passes[-1]['frame_display']
+                if pass_display_frame - last_display < self.min_display_gap:
+                    pass_display_frame = last_display + self.min_display_gap
+
+            pass_event = {
+                'frame_start': transition_frame_start,
+                'frame_end': transition_frame_end,
+                'frame_display': pass_display_frame,
+                'from_player': from_player,
+                'to_player': to_player,
+                'distance': distance,
+                'ball_movement': ball_movement,
+                'success': True,
+                'from_pos': from_pos,
+                'to_pos': to_pos,
             }
-            passes.append(event)
-            last_pass_frame = transition_frame
-            last_display_frame = frame_display
+            passes.append(pass_event)
+            last_pass_frame = transition_frame_end
+
+        if debug:
+            print(f"\n[DEBUG] === RESULT: {len(passes)} passes detected ===\n")
 
         return passes
+
+    def get_pass_statistics(self, passes):
+        stats = {
+            'total_passes': len(passes),
+            'avg_distance': np.mean([p['distance'] for p in passes]) if passes else 0,
+        }
+        return stats
