@@ -34,10 +34,6 @@ def bbox_area(bbox: List[float]) -> float:
 def interpolate_ball_positions(
     ball_positions: List[Dict[int, Dict[str, Any]]]
 ) -> List[Dict[int, Dict[str, Any]]]:
-    """
-    Fill missing ball bboxes via per-coordinate interpolation.
-    Ball detection may drop for a few frames due to motion blur or occlusion.
-    """
     if not ball_positions:
         return ball_positions
 

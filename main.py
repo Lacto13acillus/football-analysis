@@ -38,19 +38,12 @@ def main():
     print("Processing identities and possession...")
     raw_ball_possessions = []
 
-    # -------------------------------------------------------
-    #  FIX: Possession confidence threshold
-    #  Hanya akui possession jika bola BENAR-BENAR dekat
-    #  Ini mengurangi false possession yang menyebabkan
-    #  overcounting #3 (bola melintas dekat tapi bukan di kaki)
-    # -------------------------------------------------------
     POSSESSION_CONFIDENCE_DIST = 150.0
 
     for frame_num, frame_img in enumerate(video_frames):
         player_track = tracks['players'][frame_num]
         ball_bbox = tracks['ball'][frame_num].get(1, {}).get('bbox', [])
 
-        # Identifikasi nomor punggung
         player_identifier.update_identities(frame_img, player_track)
 
         if len(ball_bbox) == 0:
@@ -59,7 +52,6 @@ def main():
             assigned_player, dist = player_ball_assigner.assign_ball_to_player(
                 player_track, ball_bbox
             )
-            # FIX: Hanya count possession jika jarak cukup dekat
             if (assigned_player != -1
                     and dist is not None
                     and dist <= POSSESSION_CONFIDENCE_DIST):
@@ -67,45 +59,34 @@ def main():
             else:
                 raw_ball_possessions.append(-1)
 
-    # -------------------------------------------------------
-    #  FIX: Temporal consistency filter
-    #  Hapus possession "flicker" - jika pemain hanya punya
-    #  bola 1 frame lalu berubah, kemungkinan besar noise
-    # -------------------------------------------------------
-    filtered_possessions = list(raw_ball_possessions)
-    for i in range(1, len(filtered_possessions) - 1):
-        prev_p = filtered_possessions[i - 1]
-        curr_p = filtered_possessions[i]
-        next_p = filtered_possessions[i + 1]
-        # Jika frame ini berbeda dari sebelum DAN sesudah, itu noise
-        if curr_p != -1 and curr_p != prev_p and curr_p != next_p:
-            filtered_possessions[i] = -1  # Hapus noise
+    # Debug mapping
+    print("\n=== JERSEY NUMBER MAPPING ===")
+    for tid, jnum in player_identifier.player_numbers_map.items():
+        print(f"  Track ID {tid} => #{jnum}")
+    print("=============================\n")
 
-    raw_ball_possessions = filtered_possessions
-
-    # Debug: possession stats
-    valid_count = sum(1 for p in raw_ball_possessions if p != -1)
-    unique_ids = set(p for p in raw_ball_possessions if p != -1)
-    print(f"  Possession frames: {valid_count}/{len(raw_ball_possessions)}")
-    print(f"  Unique player IDs: {unique_ids}")
-    print(f"  Jersey mapping: {player_identifier.player_numbers_map}")
-
-    # === STEP 3: Pass Detection ===
+    # === STEP 3: Pass Detection (JERSEY-BASED) ===
     cap_temp = cv2.VideoCapture(video_path)
     fps = int(cap_temp.get(cv2.CAP_PROP_FPS)) or 24
     cap_temp.release()
 
     pass_detector = PassDetector(fps=fps)
-
-    # -------------------------------------------------------
-    #  FIX: Kirim player_identifier ke detect_passes
-    #  Ini memungkinkan filter same-jersey (anti re-ID)
-    # -------------------------------------------------------
     detected_passes = pass_detector.detect_passes(
         tracks, raw_ball_possessions,
         player_identifier=player_identifier,
         debug=True
     )
+
+    # === Convert jersey possessions untuk rendering ===
+    # Untuk segitiga possession di render, kita tetap butuh track ID
+    jersey_possessions_for_render = []
+    for tid in raw_ball_possessions:
+        if tid == -1:
+            jersey_possessions_for_render.append(None)
+        else:
+            jersey_possessions_for_render.append(
+                player_identifier.track_id_to_jersey(tid)
+            )
 
     # === STEP 4: Render & Real-time Counter ===
     print("Rendering final video...")
@@ -117,24 +98,19 @@ def main():
     for frame_num, frame in enumerate(video_frames):
         player_dict = tracks["players"][frame_num]
 
-        # === Hitung pass berdasarkan jersey number ===
+        # === Hitung pass (jersey-based) ===
         for pass_event in detected_passes:
             if pass_event['frame_display'] == frame_num:
-                sender_id = pass_event['from_player']
-                jersey_no = player_identifier.get_jersey_number_for_player(sender_id)
+                sender_jersey = pass_event['from_jersey']
+                receiver_jersey = pass_event['to_jersey']
 
-                if jersey_no in stats_per_jersey:
-                    stats_per_jersey[jersey_no] += 1
+                if sender_jersey in stats_per_jersey:
+                    stats_per_jersey[sender_jersey] += 1
                 else:
                     stats_per_jersey["Unknown"] += 1
 
-                # Debug log
-                receiver_id = pass_event['to_player']
-                receiver_jersey = player_identifier.get_jersey_number_for_player(
-                    receiver_id
-                )
-                print(f"[PASS] Frame {frame_num}: #{jersey_no} (ID:{sender_id}) "
-                      f"-> #{receiver_jersey} (ID:{receiver_id})")
+                print(f"[PASS] Frame {frame_num}: "
+                      f"#{sender_jersey} -> #{receiver_jersey}")
 
         # === UI DASHBOARD ===
         overlay = frame.copy()
@@ -157,11 +133,11 @@ def main():
             jersey_no = player_identifier.get_jersey_number_for_player(track_id)
 
             if jersey_no == "3":
-                color = (0, 255, 0)       # Hijau
+                color = (0, 255, 0)
             elif jersey_no == "19":
-                color = (255, 165, 0)     # Oranye
+                color = (255, 165, 0)
             else:
-                color = (200, 200, 200)   # Abu-abu
+                color = (200, 200, 200)
 
             frame = tracker.draw_ellipse(frame, player["bbox"], color, track_id)
 
@@ -170,8 +146,9 @@ def main():
                         (int(player["bbox"][0]), int(player["bbox"][1] - 10)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-            # Segitiga possession
-            if raw_ball_possessions[frame_num] == track_id:
+            # Segitiga possession — berdasarkan jersey match
+            current_possession_jersey = jersey_possessions_for_render[frame_num]
+            if current_possession_jersey == jersey_no:
                 frame = tracker.draw_triangle(frame, player["bbox"], (0, 0, 255))
 
         # === Ball ===
@@ -185,12 +162,12 @@ def main():
 
     # === Final Summary ===
     print("\n" + "=" * 50)
-    print("  PASSING STATISTICS SUMMARY")
+    print("       PASSING STATISTICS SUMMARY")
     print("=" * 50)
-    print(f"  Player #3  : {stats_per_jersey['3']} passes  (target: 4)")
-    print(f"  Player #19 : {stats_per_jersey['19']} passes  (target: 7)")
-    print(f"  Unknown    : {stats_per_jersey['Unknown']} passes  (target: 11)")
-    print(f"  TOTAL      : {sum(stats_per_jersey.values())} passes  (target: 22)")
+    print(f"  Player #3   : {stats_per_jersey['3']} passes  (target: 4)")
+    print(f"  Player #19  : {stats_per_jersey['19']} passes  (target: 7)")
+    print(f"  Unknown     : {stats_per_jersey['Unknown']} passes  (target: 11)")
+    print(f"  TOTAL       : {sum(stats_per_jersey.values())} passes  (target: 22)")
     print("=" * 50)
     print(f"\nVideo saved: {output_path}")
 

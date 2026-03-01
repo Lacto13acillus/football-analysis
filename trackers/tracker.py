@@ -9,10 +9,6 @@ from utils.bbox_utils import get_center_of_bbox, get_bbox_width
 
 
 class Tracker:
-    """
-    YOLOv8 detector + ByteTrack tracker wrapper.
-    """
-
     def __init__(self, model_path: str):
         self.model = YOLO(model_path)
         self.tracker = sv.ByteTrack()
@@ -38,7 +34,6 @@ class Tracker:
             return tracks
 
         detections = self.detect_frames(frames)
-
         tracks: Dict[str, List[Dict[int, Dict[str, Any]]]] = {
             "players": [], "ball": []
         }
@@ -46,14 +41,12 @@ class Tracker:
         for frame_num, det in enumerate(detections):
             cls_names = det.names
             cls_names_inv = {v: k for k, v in cls_names.items()}
-
             det_sv = sv.Detections.from_ultralytics(det)
             det_with_tracks = self.tracker.update_with_detections(det_sv)
 
             tracks["players"].append({})
             tracks["ball"].append({})
 
-            # Persons (tracked)
             for row in det_with_tracks:
                 bbox = row[0].tolist()
                 confidence = float(row[2]) if len(row) > 2 else 1.0
@@ -64,7 +57,6 @@ class Tracker:
                         "bbox": bbox, "confidence": confidence
                     }
 
-            # Ball (best single detection per frame)
             ball_candidates: List[Tuple[List[float], float]] = []
             for row in det_sv:
                 bbox = row[0].tolist()
@@ -88,8 +80,8 @@ class Tracker:
 
     def draw_pass_arrow(self, frame: np.ndarray,
                         pass_event: Dict[str, Any]) -> np.ndarray:
-        from_pos = tuple(pass_event["from_pos"])
-        to_pos = tuple(pass_event["to_pos"])
+        from_pos = tuple(int(v) for v in pass_event["from_pos"])
+        to_pos = tuple(int(v) for v in pass_event["to_pos"])
         color = (0, 255, 0)
         cv2.arrowedLine(frame, from_pos, to_pos, color, 3, tipLength=0.15)
         cv2.circle(frame, from_pos, 8, color, -1)
@@ -100,15 +92,12 @@ class Tracker:
         y2 = int(bbox[3])
         x_center, _ = get_center_of_bbox(bbox)
         width = get_bbox_width(bbox)
-
         cv2.ellipse(
-            frame,
-            center=(x_center, y2),
+            frame, center=(x_center, y2),
             axes=(int(width), int(0.35 * width)),
             angle=0.0, startAngle=-45, endAngle=235,
             color=color, thickness=2, lineType=cv2.LINE_4
         )
-
         if track_id is not None:
             cv2.putText(frame, str(track_id), (x_center - 10, y2 + 20),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)

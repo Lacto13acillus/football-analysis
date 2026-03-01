@@ -6,14 +6,8 @@ from utils.bbox_utils import get_center_of_bbox, get_center_of_bbox_bottom, meas
 
 class PlayerBallAssigner:
     """
-    Assigns ball possession to the nearest player within max distance.
-
-    PERUBAHAN:
-    - max_player_ball_distance: 200 -> 150
-      Mengurangi false possession ketika bola hanya MELINTAS dekat
-      pemain tapi belum benar-benar di kaki pemain tersebut.
-    - Ditambahkan _ball_inside_bbox() untuk prioritaskan overlap langsung.
-    - Multi-point distance check (kedua kaki + center bottom + center).
+    PERUBAHAN: max_player_ball_distance 200 → 150
+    Mengurangi false possession.
     """
 
     def __init__(self, max_player_ball_distance: float = 150.0):
@@ -45,24 +39,21 @@ class PlayerBallAssigner:
             if not bbox or len(bbox) != 4:
                 continue
 
-            # Prioritas 1: bola di dalam bounding box pemain
             if self._ball_inside_bbox(ball_center, bbox):
                 d = 0.0
             else:
-                # Hitung jarak dari berbagai titik referensi
                 foot_left = (bbox[0], bbox[3])
                 foot_right = (bbox[2], bbox[3])
                 foot_center = get_center_of_bbox_bottom(bbox)
                 center = get_center_of_bbox(bbox)
 
-                d_foot_l = measure_distance(ball_center, foot_left)
-                d_foot_r = measure_distance(ball_center, foot_right)
-                d_foot_c = measure_distance(ball_center, foot_center)
-                d_center = measure_distance(ball_center, center)
-                d_bottom = measure_distance(ball_bottom, foot_center)
-
-                # Ambil jarak minimum dari semua titik referensi
-                d = min(d_foot_l, d_foot_r, d_foot_c, d_center, d_bottom)
+                d = min(
+                    measure_distance(ball_center, foot_left),
+                    measure_distance(ball_center, foot_right),
+                    measure_distance(ball_center, foot_center),
+                    measure_distance(ball_center, center),
+                    measure_distance(ball_bottom, foot_center),
+                )
 
             if best_dist is None or d < best_dist:
                 best_dist = d
