@@ -1,4 +1,4 @@
-from trackers import Tracker
+from trackers.tracker import Tracker
 from trackers.player_ball_assigner import PlayerBallAssigner
 from trackers.pass_detector import PassDetector
 from team_assigner.player_identifier import PlayerIdentifier
@@ -8,13 +8,14 @@ import cv2
 import pickle
 import os
 
+
 def main():
     video_path = 'input_videos/passing_number.mp4'
     stub_path = 'stubs/track_stubs.pkl'
     output_path = 'output_videos/passing_number.avi'
 
     tracker = Tracker('yolov8s.pt')
-    player_ball_assigner = PlayerBallAssigner()
+    player_ball_assigner = PlayerBallAssigner(max_player_ball_distance=150.0)
     player_identifier = PlayerIdentifier()
 
     # === Statistik passing per nomor punggung ===
@@ -26,34 +27,68 @@ def main():
         with open(stub_path, 'rb') as f:
             tracks = pickle.load(f)
     else:
-        tracks = tracker.get_object_track(video_frames, read_from_stub=False, stub_path=stub_path)
+        tracks = tracker.get_object_track(
+            video_frames, read_from_stub=False, stub_path=stub_path
+        )
 
     # === STEP 1.5: Interpolasi Bola ===
     tracks['ball'] = interpolate_ball_positions(tracks['ball'])
 
-    # === STEP 2: Possession & OCR Mapping ===
+    # === STEP 2: Possession Detection ===
     print("Processing identities and possession...")
     raw_ball_possessions = []
+
+    # -------------------------------------------------------
+    #  FIX: Possession confidence threshold
+    #  Hanya akui possession jika bola BENAR-BENAR dekat
+    #  Ini mengurangi false possession yang menyebabkan
+    #  overcounting #3 (bola melintas dekat tapi bukan di kaki)
+    # -------------------------------------------------------
+    POSSESSION_CONFIDENCE_DIST = 150.0
 
     for frame_num, frame_img in enumerate(video_frames):
         player_track = tracks['players'][frame_num]
         ball_bbox = tracks['ball'][frame_num].get(1, {}).get('bbox', [])
 
-        # Identifikasi nomor punggung (dengan voting system)
+        # Identifikasi nomor punggung
         player_identifier.update_identities(frame_img, player_track)
 
         if len(ball_bbox) == 0:
             raw_ball_possessions.append(-1)
         else:
-            assigned_player, _ = player_ball_assigner.assign_ball_to_player(player_track, ball_bbox)
-            raw_ball_possessions.append(assigned_player)
+            assigned_player, dist = player_ball_assigner.assign_ball_to_player(
+                player_track, ball_bbox
+            )
+            # FIX: Hanya count possession jika jarak cukup dekat
+            if (assigned_player != -1
+                    and dist is not None
+                    and dist <= POSSESSION_CONFIDENCE_DIST):
+                raw_ball_possessions.append(assigned_player)
+            else:
+                raw_ball_possessions.append(-1)
 
-    # Debug: Print mapping hasil OCR
-    # print("\n=== JERSEY NUMBER MAPPING ===")
-    # for tid, jnum in player_identifier.player_numbers_map.items():
-    #     history = player_identifier.detection_history.get(tid, {})
-    #     print(f"  Track ID {tid} => #{jnum}  (votes: {history})")
-    # print("=============================\n")
+    # -------------------------------------------------------
+    #  FIX: Temporal consistency filter
+    #  Hapus possession "flicker" - jika pemain hanya punya
+    #  bola 1 frame lalu berubah, kemungkinan besar noise
+    # -------------------------------------------------------
+    filtered_possessions = list(raw_ball_possessions)
+    for i in range(1, len(filtered_possessions) - 1):
+        prev_p = filtered_possessions[i - 1]
+        curr_p = filtered_possessions[i]
+        next_p = filtered_possessions[i + 1]
+        # Jika frame ini berbeda dari sebelum DAN sesudah, itu noise
+        if curr_p != -1 and curr_p != prev_p and curr_p != next_p:
+            filtered_possessions[i] = -1  # Hapus noise
+
+    raw_ball_possessions = filtered_possessions
+
+    # Debug: possession stats
+    valid_count = sum(1 for p in raw_ball_possessions if p != -1)
+    unique_ids = set(p for p in raw_ball_possessions if p != -1)
+    print(f"  Possession frames: {valid_count}/{len(raw_ball_possessions)}")
+    print(f"  Unique player IDs: {unique_ids}")
+    print(f"  Jersey mapping: {player_identifier.player_numbers_map}")
 
     # === STEP 3: Pass Detection ===
     cap_temp = cv2.VideoCapture(video_path)
@@ -61,12 +96,23 @@ def main():
     cap_temp.release()
 
     pass_detector = PassDetector(fps=fps)
-    detected_passes = pass_detector.detect_passes(tracks, raw_ball_possessions)
+
+    # -------------------------------------------------------
+    #  FIX: Kirim player_identifier ke detect_passes
+    #  Ini memungkinkan filter same-jersey (anti re-ID)
+    # -------------------------------------------------------
+    detected_passes = pass_detector.detect_passes(
+        tracks, raw_ball_possessions,
+        player_identifier=player_identifier,
+        debug=True
+    )
 
     # === STEP 4: Render & Real-time Counter ===
     print("Rendering final video...")
     height, width, _ = video_frames[0].shape
-    out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'XVID'), fps, (width, height))
+    out = cv2.VideoWriter(
+        output_path, cv2.VideoWriter_fourcc(*'XVID'), fps, (width, height)
+    )
 
     for frame_num, frame in enumerate(video_frames):
         player_dict = tracks["players"][frame_num]
@@ -84,8 +130,11 @@ def main():
 
                 # Debug log
                 receiver_id = pass_event['to_player']
-                receiver_jersey = player_identifier.get_jersey_number_for_player(receiver_id)
-                print(f"[PASS] Frame {frame_num}: #{jersey_no} (ID:{sender_id}) -> #{receiver_jersey} (ID:{receiver_id})")
+                receiver_jersey = player_identifier.get_jersey_number_for_player(
+                    receiver_id
+                )
+                print(f"[PASS] Frame {frame_num}: #{jersey_no} (ID:{sender_id}) "
+                      f"-> #{receiver_jersey} (ID:{receiver_id})")
 
         # === UI DASHBOARD ===
         overlay = frame.copy()
@@ -96,7 +145,6 @@ def main():
                     cv2.FONT_HERSHEY_DUPLEX, 0.9, (0, 255, 255), 2)
         cv2.line(frame, (40, 65), (340, 65), (0, 255, 255), 1)
 
-        total_passes = sum(stats_per_jersey.values())
         cv2.putText(frame, f"Player #3  : {stats_per_jersey['3']}",
                     (40, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         cv2.putText(frame, f"Player #19 : {stats_per_jersey['19']}",
@@ -108,17 +156,15 @@ def main():
         for track_id, player in player_dict.items():
             jersey_no = player_identifier.get_jersey_number_for_player(track_id)
 
-            # Warna berdasarkan identifikasi
             if jersey_no == "3":
                 color = (0, 255, 0)       # Hijau
             elif jersey_no == "19":
                 color = (255, 165, 0)     # Oranye
             else:
-                color = (200, 200, 200)   # Abu-abu untuk Unknown
+                color = (200, 200, 200)   # Abu-abu
 
             frame = tracker.draw_ellipse(frame, player["bbox"], color, track_id)
 
-            # Label nomor punggung di atas kepala
             label = f"#{jersey_no}" if jersey_no != "Unknown" else f"?{track_id}"
             cv2.putText(frame, label,
                         (int(player["bbox"][0]), int(player["bbox"][1] - 10)),
@@ -138,14 +184,14 @@ def main():
     out.release()
 
     # === Final Summary ===
-    print("\n" + "=" * 40)
+    print("\n" + "=" * 50)
     print("  PASSING STATISTICS SUMMARY")
-    print("=" * 40)
-    print(f"  Player #3  : {stats_per_jersey['3']} passes")
-    print(f"  Player #19 : {stats_per_jersey['19']} passes")
-    print(f"  Unknown    : {stats_per_jersey['Unknown']} passes")
-    print(f"  TOTAL      : {sum(stats_per_jersey.values())} passes")
-    print("=" * 40)
+    print("=" * 50)
+    print(f"  Player #3  : {stats_per_jersey['3']} passes  (target: 4)")
+    print(f"  Player #19 : {stats_per_jersey['19']} passes  (target: 7)")
+    print(f"  Unknown    : {stats_per_jersey['Unknown']} passes  (target: 11)")
+    print(f"  TOTAL      : {sum(stats_per_jersey.values())} passes  (target: 22)")
+    print("=" * 50)
     print(f"\nVideo saved: {output_path}")
 
 

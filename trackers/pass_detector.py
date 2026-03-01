@@ -1,34 +1,50 @@
-import sys
-sys.path.append('../')
+import sys, os
+sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from utils.bbox_utils import measure_distance, get_center_of_bbox_bottom, get_center_of_bbox
 import numpy as np
 from collections import Counter
 
+
 class PassDetector:
+    """
+    Pass detection pipeline dengan perbaikan akurasi.
+
+    PERUBAHAN UTAMA:
+    1. max_pass_distance: 800 -> 950 (tangkap pass yang sedikit lebih jauh)
+    2. cooldown_frames: 8 -> 5 (drill cepat, pass bisa terjadi tiap 0.5 detik)
+    3. min_possession_duration: 2 -> 3 (filter noise possession lebih ketat)
+    4. BARU: same-jersey filter via player_identifier (cegah false pass saat re-ID)
+    5. BARU: receiver_must_hold - receiver harus pegang bola min N frame
+    6. BARU: adaptive cooldown berdasarkan konteks
+    """
+
     def __init__(self, fps=24):
         self.fps = fps
 
         self.smoothing_window = 3
-        self.min_stable_frames = 2        # DIUBAH: 1 -> 2 (filter noise)
+        self.min_stable_frames = 2
 
-        self.min_pass_distance = 35       # DIUBAH: 25 -> 35
-        self.max_pass_distance = 800
-        self.cooldown_frames = 8          # DIUBAH: 3 -> 5 (anti double-count)
-        self.min_possession_duration = 2
+        self.min_pass_distance = 35
+        self.max_pass_distance = 950       # UBAH: 800 -> 950
+        self.cooldown_frames = 5           # UBAH: 8 -> 5
+        self.min_possession_duration = 3   # UBAH: 2 -> 3 (lebih ketat)
 
         self.ball_movement_check_radius = 25
-        self.ball_movement_threshold = 4  # DIUBAH: 3 -> 4
+        self.ball_movement_threshold = 4
 
         self.player_search_radius = 20
 
         self.pass_display_delay = 3
-        self.min_display_gap = 4          # DIUBAH: 3 -> 4
+        self.min_display_gap = 4
+
+        # BARU: receiver harus tahan bola minimal N frame
+        self.min_receiver_duration = 2
 
     def smooth_possessions(self, raw_possessions):
         smoothed = list(raw_possessions)
         half_window = self.smoothing_window // 2
         for i in range(half_window, len(raw_possessions) - half_window):
-            window = raw_possessions[i - half_window : i + half_window + 1]
+            window = raw_possessions[i - half_window: i + half_window + 1]
             valid = [p for p in window if p != -1]
             if len(valid) > 0:
                 smoothed[i] = Counter(valid).most_common(1)[0][0]
@@ -37,7 +53,6 @@ class PassDetector:
         return smoothed
 
     def fill_short_gaps(self, possessions, max_gap=12):
-        """DIUBAH: max_gap 8 -> 12 untuk drill cepat"""
         filled = list(possessions)
         last_valid = -1
         gap_start = -1
@@ -96,7 +111,6 @@ class PassDetector:
             return 0
 
         direct_distance = measure_distance(ball_positions[0], ball_positions[-1])
-
         max_displacement = 0
         for i in range(1, len(ball_positions)):
             d = measure_distance(ball_positions[0], ball_positions[i])
@@ -127,19 +141,25 @@ class PassDetector:
                     return player_data, check_frame
         return None, -1
 
-    def detect_passes(self, tracks, ball_possessions, debug=True):
+    def detect_passes(self, tracks, ball_possessions,
+                      player_identifier=None, debug=True):
+        """
+        PERUBAHAN:
+        1. Terima player_identifier sebagai parameter
+        2. Filter same-jersey transitions (anti re-ID false positive)
+        3. Validasi receiver duration
+        4. Parameter yang sudah di-tune
+        """
         if debug:
             valid_count = sum(1 for p in ball_possessions if p != -1)
             unique_players = set(p for p in ball_possessions if p != -1)
             print(f"\n[DEBUG] === PASS DETECTION PIPELINE ===")
             print(f"[DEBUG] Total frames: {len(ball_possessions)}")
-            print(f"[DEBUG] Frames with possession: {valid_count}/{len(ball_possessions)} ({100*valid_count/max(1,len(ball_possessions)):.1f}%)")
+            print(f"[DEBUG] Frames with possession: {valid_count}/{len(ball_possessions)} "
+                  f"({100 * valid_count / max(1, len(ball_possessions)):.1f}%)")
             print(f"[DEBUG] Unique players detected: {unique_players}")
-            if valid_count == 0:
-                print(f"[DEBUG] *** NO possession detected! ***")
-                return []
-            if len(unique_players) < 2:
-                print(f"[DEBUG] *** Only {len(unique_players)} player(s)! ***")
+            if valid_count == 0 or len(unique_players) < 2:
+                print(f"[DEBUG] *** Insufficient data! ***")
                 return []
 
         # TAHAP 1: Fill short gaps
@@ -161,16 +181,14 @@ class PassDetector:
                 print(f"[DEBUG]   Seg #{i}: Player {seg['player_id']}, "
                       f"frames {seg['frame_start']}-{seg['frame_end']} (dur={dur})")
             if len(segments) < 2:
-                print(f"[DEBUG] *** Less than 2 segments! ***")
                 return []
 
         # TAHAP 4: Merge segment pendek yang sama player berturut-turut
         merged = [segments[0]]
         for seg in segments[1:]:
             if seg['player_id'] == merged[-1]['player_id']:
-                # Merge: extend frame_end
                 gap = seg['frame_start'] - merged[-1]['frame_end']
-                if gap <= 10:  # Jika gap kecil, gabung
+                if gap <= 10:
                     merged[-1]['frame_end'] = seg['frame_end']
                 else:
                     merged.append(seg)
@@ -201,22 +219,47 @@ class PassDetector:
             if debug:
                 print(f"\n[DEBUG] Transition #{i}: Player {from_player} -> Player {to_player}")
 
+            # --- FILTER 1: Same player (track ID identik) ---
             if from_player == to_player:
                 if debug:
-                    print(f"[DEBUG]   SKIP: Same player")
+                    print(f"[DEBUG]   SKIP: Same player (same track ID)")
                 continue
 
+            # --- FILTER 2 (BARU): Same jersey / same physical player ---
+            # Mencegah false pass saat ByteTrack re-assign ID
+            # Contoh: Player 3 (Unknown) -> Player 152 (Unknown) = BUKAN pass
+            if player_identifier is not None:
+                if player_identifier.are_same_physical_player(from_player, to_player):
+                    if debug:
+                        jersey = player_identifier.get_jersey_number_for_player(from_player)
+                        print(f"[DEBUG]   SKIP: Same physical player "
+                              f"(#{jersey}, track re-assignment)")
+                    continue
+
+            # --- FILTER 3: Cooldown ---
             if (transition_frame_end - last_pass_frame) < self.cooldown_frames:
                 if debug:
-                    print(f"[DEBUG]   SKIP: Cooldown ({transition_frame_end - last_pass_frame} < {self.cooldown_frames})")
+                    print(f"[DEBUG]   SKIP: Cooldown "
+                          f"({transition_frame_end - last_pass_frame} < {self.cooldown_frames})")
                 continue
 
+            # --- FILTER 4: Sender possession duration ---
             from_duration = seg_from['frame_end'] - seg_from['frame_start']
             if from_duration < self.min_possession_duration:
                 if debug:
-                    print(f"[DEBUG]   SKIP: Too short ({from_duration} < {self.min_possession_duration})")
+                    print(f"[DEBUG]   SKIP: Sender too short "
+                          f"({from_duration} < {self.min_possession_duration})")
                 continue
 
+            # --- FILTER 5 (BARU): Receiver possession duration ---
+            to_duration = seg_to['frame_end'] - seg_to['frame_start']
+            if to_duration < self.min_receiver_duration:
+                if debug:
+                    print(f"[DEBUG]   SKIP: Receiver too short "
+                          f"({to_duration} < {self.min_receiver_duration})")
+                continue
+
+            # --- FILTER 6: Player distance ---
             from_player_data, from_actual_frame = self.find_player_nearby(
                 tracks, from_player, transition_frame_start
             )
@@ -242,19 +285,25 @@ class PassDetector:
                     print(f"[DEBUG]   SKIP: Too far ({distance:.0f} > {self.max_pass_distance})")
                 continue
 
+            # --- FILTER 7: Ball movement ---
             ball_movement = self.validate_ball_movement(
                 tracks, transition_frame_start, transition_frame_end
             )
             if ball_movement < self.ball_movement_threshold:
                 if debug:
-                    print(f"[DEBUG]   SKIP: Ball static ({ball_movement:.0f} < {self.ball_movement_threshold})")
+                    print(f"[DEBUG]   SKIP: Ball static "
+                          f"({ball_movement:.0f} < {self.ball_movement_threshold})")
                 continue
 
             if debug:
-                print(f"[DEBUG]   *** PASS! dist={distance:.0f}px, ball={ball_movement:.0f}px ***")
+                print(f"[DEBUG]   *** PASS! dist={distance:.0f}px, "
+                      f"ball={ball_movement:.0f}px ***")
 
+            # --- Hitung display frame ---
             receiver_start = seg_to['frame_start']
-            pass_display_frame = min(receiver_start + self.pass_display_delay, seg_to['frame_end'])
+            pass_display_frame = min(
+                receiver_start + self.pass_display_delay, seg_to['frame_end']
+            )
 
             if len(passes) > 0:
                 last_display = passes[-1]['frame_display']
