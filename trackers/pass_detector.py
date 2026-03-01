@@ -13,8 +13,8 @@ class PassDetector:
 
         self.min_pass_distance = 35       # DIUBAH: 25 -> 35
         self.max_pass_distance = 800
-        self.cooldown_frames = 5          # DIUBAH: 3 -> 5 (anti double-count)
-        self.min_possession_duration = 1
+        self.cooldown_frames = 8          # DIUBAH: 3 -> 5 (anti double-count)
+        self.min_possession_duration = 2
 
         self.ball_movement_check_radius = 25
         self.ball_movement_threshold = 4  # DIUBAH: 3 -> 4
