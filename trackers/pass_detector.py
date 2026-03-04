@@ -262,25 +262,30 @@ class PassDetector:
     def _normalize_possessions_by_jersey(
         self,
         possessions: List[int]
-    ) -> List[int]:
+        ) -> List[int]:
         """
         Normalisasi possession berdasarkan jersey number.
         Mencegah ByteTrack ID switching menyebabkan false pass.
+        KECUALI jersey "Unknown" - biarkan track ID asli agar
+        pemain berbeda tidak digabung.
         """
         if not self._player_identifier:
             return possessions
-
+    
         jersey_canonical: Dict[str, int] = {}
         normalized = list(possessions)
-
+    
         for i, pid in enumerate(possessions):
             if pid == -1:
                 continue
             jersey = self._get_jersey(pid)
+            # Jangan normalisasi "Unknown" - biarkan track ID asli
+            if jersey == "Unknown":
+                continue
             if jersey not in jersey_canonical:
                 jersey_canonical[jersey] = pid
             normalized[i] = jersey_canonical[jersey]
-
+    
         return normalized
 
     def get_stable_segments(
