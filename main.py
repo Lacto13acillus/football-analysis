@@ -18,7 +18,8 @@ from draw_gate            import (
     draw_gate_on_frame,
     draw_ball_trajectory_on_frame,
     draw_pass_arrow,
-    draw_stats_panel
+    draw_stats_panel,
+    draw_target_cone_on_frame
 )
 from utils.bbox_utils import extract_ball_trajectory
 
@@ -29,55 +30,38 @@ from utils.bbox_utils import extract_ball_trajectory
 # ============================================================
 
 CONFIG = {
-    # --- Path file ---
     "input_video" : "input_videos/passing_number.mp4",
     "output_video": "output_videos/passing_number.avi",
     "model_path"  : "/home/dika/football-analysis/models/best.pt",
     "stub_path"   : "stubs/tracks_cache.pkl",
-    # Set False dulu karena tracker.py sudah diubah (cone anchor baru)
-    # Setelah run pertama berhasil, set True untuk pakai cache
-    "use_stub"    : False,
+    "use_stub"    : True,
     "fps"         : 30,
-    # ============================================================
-    # MAPPING JERSEY - sesuaikan setelah lihat log track ID pemain
-    # ============================================================
     "jersey_mapping": {
         1: "#3",
         2: "#19",
-        3: "Unknown"
+        3: "Unknown",
+        4: "Unknown",
+        5: "#3",
+        6: "#19",
+        7: "Unknown",
+        8: "#3",
+        9: "#19",
     },
     # ============================================================
-    # KONFIGURASI GATE
-    #
-    # LANGKAH 1: Jalankan dulu dengan semua None dan range lebar
-    #            Lihat log "[TRACKER] Anchor cone ID X" untuk tahu
-    #            posisi masing-masing cone
-    #
-    # LANGKAH 2: Dari log, tentukan 2 cone yang membentuk gawang
-    #            Berdasarkan output Anda:
-    #            - Cone 0: (738.5, 597.0)  <- kiri
-    #            - Cone 1: (1328.2, 576.6) <- kanan jauh
-    #            - Cone 2: (1053.2, 551.1) <- tengah kanan
-    #            - Cone 3: (944.7, 307.1)  <- atas (dekat pemain)
-    #
-    #            Kandidat gate (jarak 60-400px, Y mirip):
-    #            - Cone 0 + Cone 2: ~318px (Y: 597 vs 551)
-    #            - Cone 1 + Cone 2: ~276px (Y: 576 vs 551) <- PALING LIKELY
-    #            - Cone 2 + Cone 3: ~267px (Y: 551 vs 307) <- vertikal
-    #
-    # LANGKAH 3: Set manual_gate_cone_ids sesuai hasil debug
+    # KONFIGURASI TARGET CONE
+    # Dari log: Cone ID 3 di (932.4, 276.4) = cone paling atas
     # ============================================================
-    # Coba dulu dengan range lebih lebar untuk auto-detect
-    "manual_gate_cone_ids"     : None,      # Isi setelah debug, contoh: (1, 2)
-    "gate_position_hint"       : None,
-    "expected_gate_width_range": (60.0, 400.0),   # <-- DIPERLEBAR dari 260 ke 400
-    # --- Possession ---
-    "max_possession_distance": 70.0,
-    # --- Visualisasi ---
-    "show_gate"       : True,
-    "debug_trajectory": False,
-    "show_pass_arrows": True,
-    "show_stats_panel": True,
+    "manual_target_cone_id"  : 3,       # ID cone target (cone paling atas)
+    "target_selection_mode"  : "highest", # Fallback jika manual None
+    "target_proximity_radius": 120.0,   # Radius sukses dalam pixel
+                                        # Naikkan jika terlalu banyak GAGAL
+                                        # Turunkan jika terlalu banyak SUKSES palsu
+    "max_possession_distance": 120.0,
+    "show_gate"              : False,   # Gate tidak dipakai lagi
+    "show_target_cone"       : True,    # Tampilkan target cone di video
+    "debug_trajectory"       : False,
+    "show_pass_arrows"       : True,
+    "show_stats_panel"       : True,
 }
 
 
@@ -232,18 +216,20 @@ def render_frames(
         # ------------------------------------------------------
         # 1. Gambar gate (jika tersedia dan diaktifkan)
         # ------------------------------------------------------
-        gate = pass_detector.get_gate()
-        if gate and config.get("show_gate", True):
-            # Gate berubah warna hijau terang saat pass sukses sedang terjadi
-            gate_active = any(
+        target_info = pass_detector.get_target_cone()
+        if target_info and config.get("show_target_cone", True):
+            _, target_pos = target_info
+            radius        = config.get("target_proximity_radius", 120.0)
+            # Target aktif jika ada pass sukses yang sedang berlangsung
+            target_active = any(
                 p['frame_start'] <= frame_num <= p['frame_end'] and p['success']
                 for p in detected_passes
             )
-            annotated = draw_gate_on_frame(
+            annotated = draw_target_cone_on_frame(
                 annotated,
-                gate_cone_left  = gate[0],
-                gate_cone_right = gate[1],
-                is_active       = gate_active
+                target_pos       = target_pos,
+                proximity_radius = radius,
+                is_active        = target_active
             )
 
         # ------------------------------------------------------
@@ -492,31 +478,22 @@ def main():
     # ==========================================================
     # TAHAP 4: Inisialisasi Pass Detector & Gate
     # ==========================================================
-    print("\n[MAIN] TAHAP 4: Inisialisasi Pass Detector & Gate...")
-
+    print("\n[MAIN] TAHAP 4: Inisialisasi Pass Detector & Target Cone...")
     pass_detector = PassDetector(fps=fps)
     pass_detector.set_jersey_map(player_identifier)
-
-    # Terapkan konfigurasi gate dari CONFIG
-    pass_detector.manual_gate_cone_ids      = CONFIG.get("manual_gate_cone_ids")
-    pass_detector.gate_position_hint        = CONFIG.get("gate_position_hint")
-    pass_detector.expected_gate_width_range = CONFIG.get(
-        "expected_gate_width_range", (80.0, 260.0)
-    )
-
-    # Inisialisasi gate dari data tracks
-    gate_ok = pass_detector.initialize_gate(
+    # Konfigurasi target cone
+    pass_detector.manual_target_cone_id  = CONFIG.get("manual_target_cone_id")
+    pass_detector.target_selection_mode  = CONFIG.get("target_selection_mode", "highest")
+    pass_detector.target_proximity_radius = CONFIG.get("target_proximity_radius", 120.0)
+    target_ok = pass_detector.initialize_target_cone(
         tracks,
         cone_key      = 'cones',
         sample_frames = 30,
         debug         = True
     )
-
-    if not gate_ok:
-        print("[MAIN] WARNING: Gate tidak berhasil diidentifikasi!")
+    if not target_ok:
+        print("[MAIN] WARNING: Target cone tidak teridentifikasi!")
         print("[MAIN]          Semua pass akan dianggap SUKSES.")
-        print("[MAIN]          Solusi: Jalankan debug_find_gate_ids.py")
-        print("[MAIN]          lalu set CONFIG['manual_gate_cone_ids'] = (id1, id2)\n")
 
     # ==========================================================
     # TAHAP 5: Assignment Possession Bola Per Frame

@@ -305,3 +305,75 @@ def draw_stats_panel(
             y_offset += line_h
 
     return output
+
+def draw_target_cone_on_frame(
+    frame           : np.ndarray,
+    target_pos      : Tuple[float, float],
+    proximity_radius: float = 120.0,
+    is_active       : bool  = False,
+    color_normal    : Tuple[int, int, int] = (0, 165, 255),  # Oranye
+    color_active    : Tuple[int, int, int] = (0, 255, 80),   # Hijau
+    alpha           : float = 0.25
+) -> np.ndarray:
+    """
+    Gambar visualisasi target cone dan radius keberhasilan.
+
+    Menampilkan:
+    - Lingkaran di posisi target cone
+    - Lingkaran radius sukses (transparan)
+    - Label 'TARGET'
+
+    Args:
+        frame           : frame video BGR
+        target_pos      : posisi (x, y) target cone
+        proximity_radius: radius keberhasilan dalam pixel
+        is_active       : True jika bola sedang mendekati target
+        color_normal    : warna normal (oranye)
+        color_active    : warna aktif (hijau)
+        alpha           : transparansi area radius
+
+    Returns:
+        Frame dengan visualisasi target cone
+    """
+    output = frame.copy()
+    color  = color_active if is_active else color_normal
+    cx, cy = int(target_pos[0]), int(target_pos[1])
+    radius = int(proximity_radius)
+
+    # --- Lingkaran radius sukses (semi-transparan) ---
+    overlay = output.copy()
+    cv2.circle(overlay, (cx, cy), radius, color, -1)
+    cv2.addWeighted(overlay, alpha, output, 1 - alpha, 0, output)
+
+    # --- Border lingkaran radius ---
+    cv2.circle(output, (cx, cy), radius, color, 2)
+
+    # --- Garis crosshair di target ---
+    line_len = 18
+    cv2.line(output, (cx - line_len, cy), (cx + line_len, cy), color, 2)
+    cv2.line(output, (cx, cy - line_len), (cx, cy + line_len), color, 2)
+
+    # --- Titik pusat ---
+    cv2.circle(output, (cx, cy), 10, color,          -1)
+    cv2.circle(output, (cx, cy), 12, (255, 255, 255),  2)
+
+    # --- Label TARGET ---
+    label = "TARGET"
+    (lw, lh), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+    lx = cx - lw // 2
+    ly = cy - radius - 14
+    cv2.rectangle(output,
+                  (lx - 4, ly - lh - 2),
+                  (lx + lw + 4, ly + 4),
+                  color, -1)
+    cv2.putText(output, label,
+                (lx, ly),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+
+    # --- Label radius ---
+    radius_text = f"r={radius}px"
+    cv2.putText(output, radius_text,
+                (cx - 28, cy + radius + 18),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1)
+
+    return output

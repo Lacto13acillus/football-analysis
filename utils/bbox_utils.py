@@ -411,3 +411,91 @@ def interpolate_ball_positions(
             "confidence": 1.0
         }})
     return out
+
+def identify_target_cone(
+    stabilized_cones     : Dict[int, Tuple[float, float]],
+    manual_target_cone_id: Optional[int] = None,
+    selection_mode       : str = "highest"  # "highest" = Y terkecil = paling atas
+) -> Optional[Tuple[int, Tuple[float, float]]]:
+    """
+    Identifikasi satu cone target dari semua cone yang terdeteksi.
+    STRATEGI (prioritas berurutan):
+    1. Manual ID  - langsung gunakan cone ID yang ditentukan (PALING AKURAT)
+    2. Auto       - pilih cone berdasarkan selection_mode:
+                    "highest" = cone dengan Y terkecil (paling atas di layar)
+                    "lowest"  = cone dengan Y terbesar (paling bawah)
+                    "leftmost"= cone dengan X terkecil (paling kiri)
+    Args:
+        stabilized_cones     : output dari stabilize_cone_positions()
+        manual_target_cone_id: cone ID jika sudah diketahui, atau None
+        selection_mode       : metode auto-selection jika manual tidak diset
+    Returns:
+        (cone_id, (x, y)) atau None jika gagal
+    """
+    if not stabilized_cones:
+        return None
+    # --- STRATEGI 1: Manual ID ---
+    if manual_target_cone_id is not None:
+        if manual_target_cone_id in stabilized_cones:
+            pos = stabilized_cones[manual_target_cone_id]
+            print(f"[TARGET] Menggunakan manual target cone ID: {manual_target_cone_id}")
+            print(f"[TARGET] Posisi target: ({pos[0]:.1f}, {pos[1]:.1f})")
+            return manual_target_cone_id, pos
+        else:
+            print(f"[TARGET] WARNING: Manual cone ID {manual_target_cone_id} "
+                  f"tidak ditemukan!")
+    # --- STRATEGI 2: Auto berdasarkan selection_mode ---
+    if selection_mode == "highest":
+        # Y terkecil = paling atas di layar (koordinat image)
+        best_id  = min(stabilized_cones, key=lambda k: stabilized_cones[k][1])
+    elif selection_mode == "lowest":
+        best_id  = max(stabilized_cones, key=lambda k: stabilized_cones[k][1])
+    elif selection_mode == "leftmost":
+        best_id  = min(stabilized_cones, key=lambda k: stabilized_cones[k][0])
+    elif selection_mode == "rightmost":
+        best_id  = max(stabilized_cones, key=lambda k: stabilized_cones[k][0])
+    else:
+        print(f"[TARGET] WARNING: selection_mode '{selection_mode}' tidak dikenal!")
+        return None
+    pos = stabilized_cones[best_id]
+    print(f"[TARGET] Auto-select cone ID {best_id} via mode='{selection_mode}'")
+    print(f"[TARGET] Posisi target: ({pos[0]:.1f}, {pos[1]:.1f})")
+    return best_id, pos
+def check_ball_reached_target_cone(
+    ball_trajectory  : List[Tuple[int, int]],
+    target_cone_pos  : Tuple[float, float],
+    proximity_radius : float = 120.0,
+    min_points       : int = 3
+) -> Tuple[bool, str]:
+    """
+    Cek apakah trajectory bola mendekati cone target dalam radius tertentu.
+    Berbeda dari gate intersection, di sini kita cek apakah
+    ADA TITIK MANAPUN dalam trajectory yang jaraknya <= proximity_radius
+    dari posisi cone target.
+    Juga menghitung 'closest approach distance' untuk debugging.
+    Args:
+        ball_trajectory : list (x, y) dari extract_ball_trajectory()
+        target_cone_pos : posisi (x, y) cone target
+        proximity_radius: radius keberhasilan dalam pixel
+        min_points      : minimum titik trajectory agar valid
+    Returns:
+        (reached: bool, reason: str)
+    """
+    if len(ball_trajectory) < min_points:
+        return False, (f"Trajectory terlalu pendek "
+                       f"({len(ball_trajectory)} titik, min={min_points})")
+    # Cari jarak terdekat bola ke target cone sepanjang trajectory
+    min_distance = float('inf')
+    min_idx      = -1
+    for i, point in enumerate(ball_trajectory):
+        dist = measure_distance(point, target_cone_pos)
+        if dist < min_distance:
+            min_distance = dist
+            min_idx      = i
+    if min_distance <= proximity_radius:
+        return True, (f"Bola mendekati target: jarak minimum "
+                      f"{min_distance:.1f}px di titik ke-{min_idx} "
+                      f"(radius={proximity_radius:.0f}px)")
+    else:
+        return False, (f"Bola tidak mencapai target: jarak minimum "
+                       f"{min_distance:.1f}px > radius {proximity_radius:.0f}px")
