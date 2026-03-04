@@ -14,7 +14,7 @@ def main():
     stub_path = 'stubs/track_stubs.pkl'
     output_path = 'output_videos/passing_number.avi'
 
-    tracker = Tracker('best.pt')
+    tracker = Tracker('models/best.pt')
     player_ball_assigner = PlayerBallAssigner(max_player_ball_distance=150.0)
     player_identifier = PlayerIdentifier()
 
