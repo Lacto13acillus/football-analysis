@@ -124,18 +124,6 @@ class PassDetector:
         """
         Inisialisasi posisi target cone dari data tracks.
         Harus dipanggil SEBELUM detect_passes().
-
-        Berbeda dari initialize_gate(), fungsi ini hanya
-        mengidentifikasi SATU cone target, bukan pasangan cone.
-
-        Args:
-            tracks       : dict hasil tracker
-            cone_key     : nama key untuk data cone di tracks
-            sample_frames: jumlah frame untuk averaging posisi cone
-            debug        : tampilkan info debug ke console
-
-        Returns:
-            True jika target cone berhasil diidentifikasi
         """
         if cone_key not in tracks or not tracks[cone_key]:
             print(f"[TARGET] WARNING: Key '{cone_key}' tidak ada di tracks!")
@@ -212,7 +200,7 @@ class PassDetector:
             tracks,
             frame_start,
             frame_end,
-            buffer_frames=0    # <-- PENTING: tanpa buffer
+            buffer_frames=0
         )
         if debug:
             print(f"[TARGET] Evaluasi pass frame {frame_start}-{frame_end}: "
@@ -402,18 +390,6 @@ class PassDetector:
     ) -> Optional[Tuple[int, int]]:
         """
         Dapatkan posisi pemain untuk pass event dengan multiple fallback.
-        Fallback order:
-        1. Frame tepat di transisi
-        2. Frame dalam search_radius di sekitar transisi
-        3. Frame mana saja dalam segment pemain
-        4. None jika benar-benar tidak ada data
-        Args:
-            tracks      : dict hasil tracker
-            player_id   : track ID pemain
-            frame_target: frame target utama
-            segment     : segment possession pemain ini
-        Returns:
-            (x, y) posisi kaki pemain, atau None
         """
         # Fallback 1 & 2: cari di sekitar frame transisi
         player_data, found_frame = self.find_player_nearby(
@@ -493,14 +469,22 @@ class PassDetector:
             transition_frame_end   = seg_to['frame_start']
             from_jersey = self._get_jersey(from_player)
             to_jersey   = self._get_jersey(to_player)
-            # Skip jersey sama (ID switching)
+
+            # =========================================================
+            # PERBAIKAN: Skip jersey sama, KECUALI keduanya "Unknown"
+            # dengan track ID berbeda (pemain berbeda yang belum
+            # teridentifikasi jersey-nya)
+            # =========================================================
             if from_jersey == to_jersey:
                 if from_jersey == "Unknown" and from_player != to_player:
-                    pass  # Jangan skip, ini pemain berbeda yang belum teridentifikasi
-            else:
-                if debug:
-                    print(f"[PASS] Skip: jersey sama ({from_jersey})")
-                continue
+                    # Pemain berbeda, jersey belum teridentifikasi -> lanjut
+                    if debug:
+                        print(f"[PASS] Unknown berbeda (track {from_player} -> {to_player}), lanjut proses")
+                else:
+                    if debug:
+                        print(f"[PASS] Skip: jersey sama ({from_jersey})")
+                    continue
+
             # Skip cooldown
             if (transition_frame_end - last_pass_frame) < self.cooldown_frames:
                 if debug:
@@ -551,7 +535,7 @@ class PassDetector:
             # Hitung closest_dist
             trajectory   = extract_ball_trajectory(
                 tracks, transition_frame_start, transition_frame_end,
-                buffer_frames=0    # <-- buffer=0 juga di sini
+                buffer_frames=0
             )
             closest_dist = float('inf')
             if self._target_cone_pos and trajectory:
@@ -613,12 +597,6 @@ class PassDetector:
     def get_pass_statistics(self, passes: List[Dict]) -> Dict:
         """
         Hitung statistik keseluruhan dan per pemain.
-
-        Returns:
-            Dict dengan keys:
-            total_passes, successful_passes, failed_passes,
-            accuracy_pct, avg_distance, avg_distance_successful,
-            avg_closest_dist, per_player
         """
         total  = len(passes)
         sukses = [p for p in passes if p['success']]
