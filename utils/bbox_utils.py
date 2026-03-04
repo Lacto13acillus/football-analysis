@@ -60,3 +60,17 @@ def interpolate_ball_positions(
         out.append({1: {"bbox": [float(x1), float(y1), float(x2), float(y2)],
                         "confidence": 1.0}})
     return out
+
+
+# === BARU: FUNGSI MATEMATIKA UNTUK DETEKSI SUCCESS/FAILED ===
+
+def ccw(A, B, C):
+    """Mengecek perputaran (counter-clockwise) dari 3 titik"""
+    return (C[1] - A[1]) * (B[0] - A[0]) > (B[1] - A[1]) * (C[0] - A[0])
+
+def check_line_intersection(A, B, C, D):
+    """
+    Cek apakah garis lintasan bola (A ke B) 
+    memotong garis imajiner antar cone (C ke D).
+    """
+    return ccw(A, C, D) != ccw(B, C, D) and ccw(A, B, C) != ccw(A, B, D)

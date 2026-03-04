@@ -18,8 +18,12 @@ def main():
     player_ball_assigner = PlayerBallAssigner(max_player_ball_distance=150.0)
     player_identifier = PlayerIdentifier()
 
-    # === Statistik passing per nomor punggung ===
-    stats_per_jersey = {"3": 0, "19": 0, "Unknown": 0}
+    # === BARU: Statistik passing per nomor punggung (Success/Failed) ===
+    stats_per_jersey = {
+        "3": {"success": 0, "failed": 0},
+        "19": {"success": 0, "failed": 0},
+        "Unknown": {"success": 0, "failed": 0}
+    }
 
     # === STEP 1: Get Tracks ===
     video_frames = read_video(video_path)
@@ -37,7 +41,6 @@ def main():
     # === STEP 2: Possession Detection ===
     print("Processing identities and possession...")
     raw_ball_possessions = []
-
     POSSESSION_CONFIDENCE_DIST = 150.0
 
     for frame_num, frame_img in enumerate(video_frames):
@@ -59,13 +62,7 @@ def main():
             else:
                 raw_ball_possessions.append(-1)
 
-    # Debug mapping
-    print("\n=== JERSEY NUMBER MAPPING ===")
-    for tid, jnum in player_identifier.player_numbers_map.items():
-        print(f"  Track ID {tid} => #{jnum}")
-    print("=============================\n")
-
-    # === STEP 3: Pass Detection (JERSEY-BASED) ===
+    # === STEP 3: Pass Detection ===
     cap_temp = cv2.VideoCapture(video_path)
     fps = int(cap_temp.get(cv2.CAP_PROP_FPS)) or 24
     cap_temp.release()
@@ -73,12 +70,9 @@ def main():
     pass_detector = PassDetector(fps=fps)
     detected_passes = pass_detector.detect_passes(
         tracks, raw_ball_possessions,
-        player_identifier=player_identifier,
         debug=True
     )
 
-    # === Convert jersey possessions untuk rendering ===
-    # Untuk segitiga possession di render, kita tetap butuh track ID
     jersey_possessions_for_render = []
     for tid in raw_ball_possessions:
         if tid == -1:
@@ -95,6 +89,8 @@ def main():
         output_path, cv2.VideoWriter_fourcc(*'XVID'), fps, (width, height)
     )
 
+    active_pass_events = [] # Menyimpan event passing sementara untuk digambar (Pass Arrow)
+
     for frame_num, frame in enumerate(video_frames):
         player_dict = tracks["players"][frame_num]
 
@@ -103,30 +99,46 @@ def main():
             if pass_event['frame_display'] == frame_num:
                 sender_jersey = pass_event['from_jersey']
                 receiver_jersey = pass_event['to_jersey']
+                status = pass_event['success']
 
-                if sender_jersey in stats_per_jersey:
-                    stats_per_jersey[sender_jersey] += 1
+                if sender_jersey not in stats_per_jersey:
+                    sender_jersey = "Unknown"
+
+                if status:
+                    stats_per_jersey[sender_jersey]['success'] += 1
                 else:
-                    stats_per_jersey["Unknown"] += 1
+                    stats_per_jersey[sender_jersey]['failed'] += 1
 
-                print(f"[PASS] Frame {frame_num}: "
-                      f"#{sender_jersey} -> #{receiver_jersey}")
+                print(f"[PASS] Frame {frame_num}: #{sender_jersey} -> #{receiver_jersey} | Status: {'SUCCESS' if status else 'FAILED'}")
+                
+                # Masukkan pass_event ke list agar panahnya tergambar selama 24 frame (kurang lebih 1 detik)
+                pass_event['draw_until'] = frame_num + fps
+                active_pass_events.append(pass_event)
+
+        # === Gambar Visual Pass Arrow ===
+        active_pass_events = [pe for pe in active_pass_events if frame_num <= pe['draw_until']]
+        for pe in active_pass_events:
+            frame = tracker.draw_pass_arrow(frame, pe)
 
         # === UI DASHBOARD ===
         overlay = frame.copy()
-        cv2.rectangle(overlay, (20, 20), (380, 200), (0, 0, 0), -1)
+        cv2.rectangle(overlay, (20, 20), (450, 200), (0, 0, 0), -1)
         frame = cv2.addWeighted(overlay, 0.6, frame, 0.4, 0)
 
-        cv2.putText(frame, "LIVE PASS COUNT", (40, 55),
-                    cv2.FONT_HERSHEY_DUPLEX, 0.9, (0, 255, 255), 2)
-        cv2.line(frame, (40, 65), (340, 65), (0, 255, 255), 1)
+        cv2.putText(frame, "LIVE PASS COUNT (Succ/Fail)", (40, 55),
+                    cv2.FONT_HERSHEY_DUPLEX, 0.7, (0, 255, 255), 2)
+        cv2.line(frame, (40, 65), (420, 65), (0, 255, 255), 1)
 
-        cv2.putText(frame, f"Player #3  : {stats_per_jersey['3']}",
-                    (40, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        cv2.putText(frame, f"Player #19 : {stats_per_jersey['19']}",
-                    (40, 135), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        cv2.putText(frame, f"Other      : {stats_per_jersey['Unknown']}",
-                    (40, 170), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (150, 150, 150), 2)
+        p3_stats = stats_per_jersey['3']
+        p19_stats = stats_per_jersey['19']
+        ukn_stats = stats_per_jersey['Unknown']
+
+        cv2.putText(frame, f"Player #3  : {p3_stats['success']} Succ | {p3_stats['failed']} Fail",
+                    (40, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        cv2.putText(frame, f"Player #19 : {p19_stats['success']} Succ | {p19_stats['failed']} Fail",
+                    (40, 135), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 165, 0), 2)
+        cv2.putText(frame, f"Other      : {ukn_stats['success']} Succ | {ukn_stats['failed']} Fail",
+                    (40, 170), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (150, 150, 150), 2)
 
         # === Gambar Player Trackers ===
         for track_id, player in player_dict.items():
@@ -146,7 +158,6 @@ def main():
                         (int(player["bbox"][0]), int(player["bbox"][1] - 10)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-            # Segitiga possession — berdasarkan jersey match
             current_possession_jersey = jersey_possessions_for_render[frame_num]
             if current_possession_jersey == jersey_no:
                 frame = tracker.draw_triangle(frame, player["bbox"], (0, 0, 255))
@@ -162,15 +173,13 @@ def main():
 
     # === Final Summary ===
     print("\n" + "=" * 50)
-    print("       PASSING STATISTICS SUMMARY")
+    print("      PASSING STATISTICS SUMMARY (Success / Failed)")
     print("=" * 50)
-    print(f"  Player #3   : {stats_per_jersey['3']} passes  (target: 4)")
-    print(f"  Player #19  : {stats_per_jersey['19']} passes  (target: 7)")
-    print(f"  Unknown     : {stats_per_jersey['Unknown']} passes  (target: 11)")
-    print(f"  TOTAL       : {sum(stats_per_jersey.values())} passes  (target: 22)")
+    print(f"  Player #3   : {p3_stats['success']} Success | {p3_stats['failed']} Failed")
+    print(f"  Player #19  : {p19_stats['success']} Success | {p19_stats['failed']} Failed")
+    print(f"  Unknown     : {ukn_stats['success']} Success | {ukn_stats['failed']} Failed")
     print("=" * 50)
     print(f"\nVideo saved: {output_path}")
-
 
 if __name__ == '__main__':
     main()
