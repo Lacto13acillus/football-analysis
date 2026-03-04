@@ -30,8 +30,8 @@ from utils.bbox_utils import extract_ball_trajectory
 
 CONFIG = {
     # --- Path file ---
-    "input_video" : "input/video_latihan.mp4",
-    "output_video": "output/video_output.mp4",
+    "input_video" : "input_videos/passing_number.mp4",
+    "output_video": "output_videos/passing_number.avi",
     "model_path"  : "/home/dika/football-analysis/models/best.pt",
     "stub_path"   : "stubs/tracks_cache.pkl",
 
