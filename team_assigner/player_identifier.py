@@ -1,49 +1,89 @@
+# player_identifier.py
+# Memetakan ByteTrack ID ke nomor Jersey (#3, #19, Unknown)
+# Karena pengenalan jersey otomatis kompleks, gunakan mapping manual.
+
+from typing import Dict, Optional
+
+
 class PlayerIdentifier:
-    """
-    Jersey number mapper.
-    Maps track IDs (yang bisa berubah mid-video oleh ByteTrack)
-    ke nomor punggung tetap.
+    def __init__(self, track_id_to_jersey: Optional[Dict[int, str]] = None):
+        """
+        Inisialisasi mapping track ID ke nomor jersey.
 
-    BARU:
-    - track_id_to_jersey(): convert track ID → jersey string
-    - are_same_physical_player(): cek apakah 2 track ID = 1 pemain fisik
-    - get_all_track_ids_for_jersey(): kebalikan mapping
-    """
+        Args:
+            track_id_to_jersey: dict {track_id: jersey_string}
+                Contoh: {1: "#3", 2: "#19", 3: "Unknown"}
+                Jika None, semua player akan diberi label berdasarkan track ID.
+        """
+        # Mapping default: kosong, akan terisi saat runtime
+        self._track_to_jersey: Dict[int, str] = track_id_to_jersey or {}
 
-    def __init__(self):
-        self.player_numbers_map = {}
-        # ByteTrack bisa re-assign ID mid-video, jadi map keduanya
-        self.manual_map = {
-            1: "3",
-            150: "3",
-            2: "19",
-            151: "19",
-            3: "Unknown",
-            152: "Unknown",
+        # Reverse mapping untuk pencarian jersey -> track_id
+        self._jersey_to_track: Dict[str, int] = {
+            v: k for k, v in self._track_to_jersey.items()
         }
 
-    def update_identities(self, frame, player_tracks):
-        for track_id in player_tracks:
-            if track_id in self.manual_map:
-                self.player_numbers_map[track_id] = self.manual_map[track_id]
-            elif track_id not in self.player_numbers_map:
-                self.player_numbers_map[track_id] = "Unknown"
+        print(f"[IDENTIFIER] Mapping jersey dimuat: {self._track_to_jersey}")
 
-    def get_jersey_number_for_player(self, track_id):
-        return self.player_numbers_map.get(track_id, "Unknown")
-
-    def track_id_to_jersey(self, track_id):
-        """Alias for get_jersey_number_for_player"""
-        return self.get_jersey_number_for_player(track_id)
-
-    def are_same_physical_player(self, tid_a, tid_b):
+    def set_mapping(self, track_id: int, jersey: str) -> None:
         """
-        Cek apakah dua track ID adalah pemain fisik yang sama.
-        Contoh: track ID 1 dan 150 → keduanya #3 → True
-        """
-        return self.get_jersey_number_for_player(tid_a) == \
-               self.get_jersey_number_for_player(tid_b)
+        Set mapping untuk satu pemain.
 
-    def get_all_track_ids_for_jersey(self, jersey):
-        """Dapatkan semua track ID yang pernah di-assign ke jersey tertentu"""
-        return [tid for tid, j in self.player_numbers_map.items() if j == jersey]
+        Args:
+            track_id: ByteTrack track ID
+            jersey  : nomor jersey, contoh '#3', '#19', atau 'Unknown'
+        """
+        self._track_to_jersey[track_id] = jersey
+        self._jersey_to_track[jersey] = track_id
+        print(f"[IDENTIFIER] Mapping baru: Track ID {track_id} -> Jersey {jersey}")
+
+    def get_jersey_number_for_player(self, track_id: int) -> str:
+        """
+        Dapatkan nomor jersey dari track ID.
+
+        Args:
+            track_id: ByteTrack track ID
+
+        Returns:
+            String jersey (e.g., '#3', '#19', 'Unknown', atau 'ID:{track_id}')
+        """
+        return self._track_to_jersey.get(track_id, f"ID:{track_id}")
+
+    def get_track_id_for_jersey(self, jersey: str) -> Optional[int]:
+        """
+        Dapatkan track ID dari nomor jersey.
+
+        Args:
+            jersey: string jersey (e.g., '#3')
+
+        Returns:
+            Track ID atau None jika tidak ditemukan
+        """
+        return self._jersey_to_track.get(jersey, None)
+
+    def is_same_player(self, track_id_a: int, track_id_b: int) -> bool:
+        """
+        Cek apakah dua track ID merujuk ke pemain yang sama (jersey sama).
+        Berguna untuk handle ID switching dari ByteTrack.
+        """
+        jersey_a = self.get_jersey_number_for_player(track_id_a)
+        jersey_b = self.get_jersey_number_for_player(track_id_b)
+
+        # Jika keduanya "ID:xxx" (tidak dikenal), anggap berbeda
+        if jersey_a.startswith("ID:") or jersey_b.startswith("ID:"):
+            return track_id_a == track_id_b
+
+        return jersey_a == jersey_b
+
+    def get_all_mappings(self) -> Dict[int, str]:
+        """Kembalikan semua mapping yang ada."""
+        return dict(self._track_to_jersey)
+
+    def print_mappings(self) -> None:
+        """Tampilkan semua mapping ke console."""
+        print("\n[IDENTIFIER] === PLAYER MAPPINGS ===")
+        if not self._track_to_jersey:
+            print("[IDENTIFIER] Belum ada mapping. Jalankan debug_find_gate_ids.py dulu.")
+        for tid, jersey in sorted(self._track_to_jersey.items()):
+            print(f"[IDENTIFIER]   Track ID {tid:3d} -> Jersey {jersey}")
+        print("[IDENTIFIER] ========================\n")
