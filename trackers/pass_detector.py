@@ -1,6 +1,6 @@
 # pass_detector.py
 # Mendeteksi event passing dan mengevaluasi apakah bola mencapai cone target.
-# 
+#
 # LOGIKA SUKSES (diperbarui):
 #   Pass SUKSES = trajectory bola mendekati cone TARGET (cone paling atas)
 #   dalam radius yang ditentukan.
@@ -262,30 +262,35 @@ class PassDetector:
     def _normalize_possessions_by_jersey(
         self,
         possessions: List[int]
-        ) -> List[int]:
+    ) -> List[int]:
         """
         Normalisasi possession berdasarkan jersey number.
         Mencegah ByteTrack ID switching menyebabkan false pass.
-        KECUALI jersey "Unknown" - biarkan track ID asli agar
-        pemain berbeda tidak digabung.
+
+        PERBAIKAN: Skip normalisasi untuk jersey "Unknown" agar
+        track ID tetap unik - memungkinkan deteksi pass antara
+        dua pemain Unknown yang berbeda.
         """
         if not self._player_identifier:
             return possessions
-    
+
         jersey_canonical: Dict[str, int] = {}
         normalized = list(possessions)
-    
+
         for i, pid in enumerate(possessions):
             if pid == -1:
                 continue
             jersey = self._get_jersey(pid)
-            # Jangan normalisasi "Unknown" - biarkan track ID asli
+
+            # PERBAIKAN: Jangan normalisasi "Unknown" agar track ID
+            # tetap unik untuk pemain berbeda yang belum teridentifikasi
             if jersey == "Unknown":
                 continue
+
             if jersey not in jersey_canonical:
                 jersey_canonical[jersey] = pid
             normalized[i] = jersey_canonical[jersey]
-    
+
         return normalized
 
     def get_stable_segments(
