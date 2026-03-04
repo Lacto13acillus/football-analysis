@@ -449,7 +449,13 @@ class PassDetector:
         # --- Preprocessing ---
         filled   = self.fill_short_gaps(ball_possessions, max_gap=12)
         filled   = self._normalize_possessions_by_jersey(filled)
+        if debug:
+            unique_before_smooth = set(p for p in filled if p != -1)
+            print(f"[PASS] Unique IDs sebelum smooth : {unique_before_smooth}")
         smoothed = self.smooth_possessions(filled)
+        if debug:
+            unique_after_smooth = set(p for p in smoothed if p != -1)
+            print(f"[PASS] Unique IDs setelah smooth : {unique_after_smooth}")
         segments = self.get_stable_segments(smoothed)
         if debug:
             print(f"[PASS] Stable segments          : {len(segments)}")
@@ -467,6 +473,11 @@ class PassDetector:
         segments = merged
         if debug:
             print(f"[PASS] Segments setelah merge   : {len(segments)}")
+            # DEBUG: tampilkan semua segmen dengan track ID dan jersey
+            for idx, seg in enumerate(segments):
+                jersey = self._get_jersey(seg['player_id'])
+                print(f"[PASS]   Seg {idx:2d}: track {seg['player_id']:2d} "
+                      f"({jersey:>8s}) | frame {seg['frame_start']:3d}-{seg['frame_end']:3d}")
         # --- Deteksi dan evaluasi passes ---
         passes          = []
         last_pass_frame = -999
