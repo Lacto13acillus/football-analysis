@@ -112,37 +112,33 @@ def point_to_segment_distance(
 
 
 def extract_ball_trajectory(
-    tracks: Dict,
-    frame_start: int,
-    frame_end: int,
-    buffer_frames: int = 5
+    tracks       : Dict,
+    frame_start  : int,
+    frame_end    : int,
+    buffer_frames: int = 0       # <-- Default 0 untuk evaluasi akurat
 ) -> List[Tuple[int, int]]:
     """
     Ambil semua titik tengah bola dari frame_start hingga frame_end.
-    Menggunakan trajectory NYATA (titik per frame), bukan garis lurus.
-
+    PENTING: buffer_frames default 0 untuk evaluasi pass agar tidak
+    terjadi kontaminasi trajectory antar pass yang berdekatan.
+    Gunakan buffer_frames > 0 hanya untuk visualisasi trajectory.
     Args:
-        tracks       : dict hasil tracker berisi tracks['ball'][frame_num]
+        tracks       : dict hasil tracker
         frame_start  : frame awal event passing
         frame_end    : frame akhir event passing
-        buffer_frames: frame tambahan sebelum/sesudah event untuk akurasi
-
+        buffer_frames: frame tambahan sebelum/sesudah (default 0)
     Returns:
         List of (x, y) koordinat titik tengah bola per frame
     """
-    trajectory = []
+    trajectory   = []
     total_frames = len(tracks['ball'])
-
-    # Tambah buffer agar trajectory lebih lengkap
     start = max(0, frame_start - buffer_frames)
-    end = min(total_frames - 1, frame_end + buffer_frames)
-
+    end   = min(total_frames - 1, frame_end + buffer_frames)
     for f in range(start, end + 1):
         ball_data = tracks['ball'][f].get(1)
         if ball_data and 'bbox' in ball_data:
             cx, cy = get_center_of_bbox(ball_data['bbox'])
             trajectory.append((cx, cy))
-
     return trajectory
 
 

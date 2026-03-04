@@ -53,7 +53,7 @@ CONFIG = {
     # ============================================================
     "manual_target_cone_id"  : 3,       # ID cone target (cone paling atas)
     "target_selection_mode"  : "highest", # Fallback jika manual None
-    "target_proximity_radius": 120.0,   # Radius sukses dalam pixel
+    "target_proximity_radius": 80,   # Radius sukses dalam pixel
                                         # Naikkan jika terlalu banyak GAGAL
                                         # Turunkan jika terlalu banyak SUKSES palsu
     "max_possession_distance": 70,
