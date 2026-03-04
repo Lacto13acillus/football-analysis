@@ -492,7 +492,7 @@ class PassDetector:
                         print(f"[PASS] Unknown berbeda (track {from_player} -> {to_player}), lanjut proses")
                 else:
                     if debug:
-                        print(f"[PASS] Skip: jersey sama ({from_jersey})")
+                        print(f"[PASS] Skip: jersey sama ({from_jersey}) | track {from_player} -> {to_player}")
                     continue
 
             # Skip cooldown
