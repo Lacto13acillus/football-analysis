@@ -104,53 +104,50 @@ def parse_args():
 def print_pass_details(passes: List[Dict], stats: Dict) -> None:
     """
     Cetak ringkasan statistik dan detail setiap pass event ke console.
-
-    Args:
-        passes: list pass event dari detect_passes()
-        stats : dict statistik dari get_pass_statistics()
     """
     sep = "=" * 62
-
     print(f"\n{sep}")
     print("   STATISTIK HASIL ANALISIS PASSING")
     print(sep)
     print(f"  Total Pass           : {stats['total_passes']}")
-    print(f"  Sukses (lewat gate)  : {stats['successful_passes']}")
-    print(f"  Gagal  (tidak gate)  : {stats['failed_passes']}")
+    print(f"  Sukses (ke target)   : {stats['successful_passes']}")  # Ubah label
+    print(f"  Gagal  (tidak target): {stats['failed_passes']}")       # Ubah label
     print(f"  Akurasi              : {stats['accuracy_pct']}%")
     print(f"  Rata2 Jarak Semua    : {stats['avg_distance']} px")
     print(f"  Rata2 Jarak Sukses   : {stats['avg_distance_successful']} px")
+    print(f"  Rata2 Closest Dist   : {stats.get('avg_closest_dist', 0.0)} px")
     print("-" * 62)
-
-    # Statistik per pemain dengan progress bar sederhana
+    # Statistik per pemain dengan progress bar
     print("  Statistik Per Pemain (sebagai Pengirim):")
     for jersey, pstat in stats.get('per_player', {}).items():
         filled = int(pstat['accuracy_pct'] / 10)
         bar    = "█" * filled + "░" * (10 - filled)
+        avg_cl = pstat.get('avg_closest', 0.0)
         print(f"    #{jersey:<10}: {pstat['success']:>2}/{pstat['total']:>2} pass "
-              f"| {bar} {pstat['accuracy_pct']:>5.1f}%")
+              f"| {bar} {pstat['accuracy_pct']:>5.1f}% "
+              f"| avg_closest={avg_cl:.0f}px")
     print(sep)
-
     if not passes:
         print("  Tidak ada pass event terdeteksi.\n")
         return
-
     # Tabel detail setiap pass
     print("\n  Detail Semua Pass Events:")
     print(f"  {'No':<4} {'Dari':<11} {'Ke':<11} "
-          f"{'Jarak':>8} {'Bola':>8} {'Status':<10} Alasan Gate")
-    print("  " + "-" * 68)
-
+          f"{'Jarak':>8} {'Bola':>8} {'Closest':>9} {'Status':<10} Alasan")
+    print("  " + "-" * 78)
     for i, p in enumerate(passes):
-        status = "SUKSES" if p['success'] else "GAGAL"
+        status   = "SUKSES" if p['success'] else "GAGAL"
+        # Gunakan 'target_reason', fallback ke 'gate_reason' untuk kompatibilitas
+        reason = p.get('target_reason', p.get('gate_reason', '-'))
+        closest  = p.get('closest_dist', 0.0)
         print(f"  {i+1:<4} "
               f"#{p['from_jersey']:<10} "
               f"#{p['to_jersey']:<10} "
               f"{p['distance']:>7.0f}px "
               f"{p['ball_movement']:>7.0f}px "
+              f"{closest:>8.0f}px "
               f"{status:<10} "
-              f"{p['gate_reason']}")
-
+              f"{reason}")
     print()
 
 

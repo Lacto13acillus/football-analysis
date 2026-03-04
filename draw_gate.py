@@ -212,31 +212,19 @@ def draw_pass_arrow(
 
 
 def draw_stats_panel(
-    frame: np.ndarray,
-    stats: dict,
-    position: Tuple[int, int] = (20, 20),
+    frame      : np.ndarray,
+    stats      : dict,
+    position   : Tuple[int, int] = (20, 20),
     panel_width: int = 280
 ) -> np.ndarray:
-    """
-    Gambar panel statistik passing di sudut frame.
-
-    Args:
-        frame      : frame video
-        stats      : output dari PassDetector.get_pass_statistics()
-        position   : (x, y) pojok kiri atas panel
-        panel_width: lebar panel dalam pixel
-
-    Returns:
-        Frame dengan panel statistik
-    """
+    """Gambar panel statistik passing di sudut frame."""
     output  = frame.copy()
     px, py  = position
     line_h  = 26
     padding = 10
 
-    # Hitung tinggi panel dinamis berdasarkan jumlah baris
     per_player = stats.get('per_player', {})
-    n_rows     = 5 + len(per_player)
+    n_rows     = 6 + len(per_player)   # +1 untuk avg_closest
     panel_h    = n_rows * line_h + padding * 2
 
     # Background panel semi-transparan
@@ -264,13 +252,14 @@ def draw_stats_panel(
              (px + panel_width - padding, py + padding + 24),
              (100, 100, 100), 1)
 
-    # Baris statistik
+    # Baris statistik - label diupdate ke "target"
     rows = [
-        ("Total Pass",    str(stats['total_passes']),        (200, 200, 200)),
-        ("Sukses",        str(stats['successful_passes']),   (0, 220, 0)),
-        ("Gagal",         str(stats['failed_passes']),       (0, 80, 220)),
-        ("Akurasi",       f"{stats['accuracy_pct']}%",       (0, 200, 255)),
-        ("Rata2 Jarak",   f"{stats['avg_distance']}px",      (180, 180, 180)),
+        ("Total Pass",     str(stats['total_passes']),               (200, 200, 200)),
+        ("Sukses",         str(stats['successful_passes']),          (0, 220, 0)),
+        ("Gagal",          str(stats['failed_passes']),              (0, 80, 220)),
+        ("Akurasi",        f"{stats['accuracy_pct']}%",              (0, 200, 255)),
+        ("Rata2 Jarak",    f"{stats['avg_distance']}px",             (180, 180, 180)),
+        ("Avg Closest",    f"{stats.get('avg_closest_dist', 0.0)}px",(150, 150, 255)),
     ]
 
     y_offset = py + padding + 24 + line_h
@@ -279,7 +268,7 @@ def draw_stats_panel(
                     (px + padding, y_offset),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (160, 160, 160), 1)
         cv2.putText(output, value,
-                    (px + panel_width - padding - 60, y_offset),
+                    (px + panel_width - padding - 65, y_offset),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 1)
         y_offset += line_h
 
@@ -295,10 +284,12 @@ def draw_stats_panel(
         y_offset += line_h
 
         for jersey, pstats in per_player.items():
-            text = (f"#{jersey}: {pstats['success']}/{pstats['total']} "
-                    f"({pstats['accuracy_pct']}%)")
-            acc  = pstats['accuracy_pct']
-            color = (0, 220, 0) if acc >= 70 else (0, 180, 255) if acc >= 40 else (0, 80, 220)
+            acc   = pstats['accuracy_pct']
+            text  = (f"#{jersey}: {pstats['success']}/{pstats['total']} "
+                     f"({acc:.0f}%)")
+            color = ((0, 220, 0)   if acc >= 70 else
+                     (0, 180, 255) if acc >= 40 else
+                     (0, 80, 220))
             cv2.putText(output, text,
                         (px + padding + 8, y_offset),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1)
