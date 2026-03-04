@@ -495,6 +495,9 @@ class PassDetector:
             to_jersey   = self._get_jersey(to_player)
             # Skip jersey sama (ID switching)
             if from_jersey == to_jersey:
+                if from_jersey == "Unknown" and from_player != to_player:
+                    pass  # Jangan skip, ini pemain berbeda yang belum teridentifikasi
+            else:
                 if debug:
                     print(f"[PASS] Skip: jersey sama ({from_jersey})")
                 continue
