@@ -56,7 +56,7 @@ CONFIG = {
     "target_proximity_radius": 120.0,   # Radius sukses dalam pixel
                                         # Naikkan jika terlalu banyak GAGAL
                                         # Turunkan jika terlalu banyak SUKSES palsu
-    "max_possession_distance": 120.0,
+    "max_possession_distance": 70,
     "show_gate"              : False,   # Gate tidak dipakai lagi
     "show_target_cone"       : True,    # Tampilkan target cone di video
     "debug_trajectory"       : False,
