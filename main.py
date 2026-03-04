@@ -34,49 +34,50 @@ CONFIG = {
     "output_video": "output_videos/passing_number.avi",
     "model_path"  : "/home/dika/football-analysis/models/best.pt",
     "stub_path"   : "stubs/tracks_cache.pkl",
-
-    # Gunakan cache tracking (set True setelah pertama kali dijalankan)
+    # Set False dulu karena tracker.py sudah diubah (cone anchor baru)
+    # Setelah run pertama berhasil, set True untuk pakai cache
     "use_stub"    : False,
-
-    # FPS fallback jika tidak bisa dibaca dari video
-    "fps"         : 24,
-
+    "fps"         : 30,
     # ============================================================
-    # MAPPING JERSEY
-    # Format: {track_id_dari_bytetrack: 'label_jersey'}
-    # Jalankan debug_find_gate_ids.py untuk melihat track ID pemain
+    # MAPPING JERSEY - sesuaikan setelah lihat log track ID pemain
     # ============================================================
     "jersey_mapping": {
         1: "#3",
         2: "#19",
         3: "Unknown"
     },
-
     # ============================================================
     # KONFIGURASI GATE
     #
-    # OPSI 1 (PALING AKURAT): Manual cone IDs
-    #   Jalankan debug_find_gate_ids.py untuk menemukan ID yang benar
-    #   Contoh: "manual_gate_cone_ids": (3, 5)
+    # LANGKAH 1: Jalankan dulu dengan semua None dan range lebar
+    #            Lihat log "[TRACKER] Anchor cone ID X" untuk tahu
+    #            posisi masing-masing cone
     #
-    # OPSI 2: Hint koordinat gate di video (pixel x, y)
-    #   Contoh: "gate_position_hint": ((420.0, 310.0), (530.0, 330.0))
+    # LANGKAH 2: Dari log, tentukan 2 cone yang membentuk gawang
+    #            Berdasarkan output Anda:
+    #            - Cone 0: (738.5, 597.0)  <- kiri
+    #            - Cone 1: (1328.2, 576.6) <- kanan jauh
+    #            - Cone 2: (1053.2, 551.1) <- tengah kanan
+    #            - Cone 3: (944.7, 307.1)  <- atas (dekat pemain)
     #
-    # OPSI 3: Auto-detect (set None untuk kedua opsi di atas)
-    #   Sistem mencari 2 cone paling terisolasi dalam range lebar valid
+    #            Kandidat gate (jarak 60-400px, Y mirip):
+    #            - Cone 0 + Cone 2: ~318px (Y: 597 vs 551)
+    #            - Cone 1 + Cone 2: ~276px (Y: 576 vs 551) <- PALING LIKELY
+    #            - Cone 2 + Cone 3: ~267px (Y: 551 vs 307) <- vertikal
+    #
+    # LANGKAH 3: Set manual_gate_cone_ids sesuai hasil debug
     # ============================================================
-    "manual_gate_cone_ids"     : None,
+    # Coba dulu dengan range lebih lebar untuk auto-detect
+    "manual_gate_cone_ids"     : None,      # Isi setelah debug, contoh: (1, 2)
     "gate_position_hint"       : None,
-    "expected_gate_width_range": (80.0, 260.0),
-
-    # --- Possession assignment ---
+    "expected_gate_width_range": (60.0, 400.0),   # <-- DIPERLEBAR dari 260 ke 400
+    # --- Possession ---
     "max_possession_distance": 70.0,
-
-    # --- Opsi visualisasi ---
-    "show_gate"       : True,    # Gambar gate di video output
-    "debug_trajectory": False,   # Gambar trajectory bola (mode debug)
-    "show_pass_arrows": True,    # Gambar panah passing
-    "show_stats_panel": True,    # Gambar panel statistik di pojok
+    # --- Visualisasi ---
+    "show_gate"       : True,
+    "debug_trajectory": False,
+    "show_pass_arrows": True,
+    "show_stats_panel": True,
 }
 
 
