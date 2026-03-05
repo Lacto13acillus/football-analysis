@@ -5,15 +5,16 @@
 #   Pass SUKSES = trajectory bola mendekati cone TARGET (cone paling atas)
 #   dalam radius yang ditentukan.
 #
-# FILTER PEMAIN (DIPERBAIKI v2.3):
+# FILTER PEMAIN:
 #   Hanya player dengan jersey #3 dan #19 yang diproses SEBAGAI PENGIRIM.
 #   Player Unknown BOLEH menjadi PENERIMA passing.
 #
-# PERUBAHAN v2.4:
-#   - smoothing_window: 7 → 5 (kurangi over-smoothing agar segmen pendek
-#     #3/#19 tidak hilang)
-#   - eval_buffer_after: 8 → 15 (capture bola menggelinding lebih lama)
-#   - fill_short_gaps max_gap: 12 → 20 (isi gap lebih panjang)
+# PERUBAHAN v2.5:
+#   - FIX: _get_player_position_for_pass() fallback ke semua track ID
+#     yang di-map ke jersey yang sama (mengatasi normalisasi canonical)
+#   - smoothing_window: 5
+#   - eval_buffer_after: 15
+#   - fill_short_gaps max_gap: 20
 
 import sys
 sys.path.append('../')
@@ -43,10 +44,6 @@ class PassDetector:
         self.fps = fps
 
         # --- Parameter smoothing possession ---
-        # PERBAIKAN v2.4: 7 → 5
-        # 7 frame terlalu agresif, menghilangkan segmen pendek #3/#19
-        # yang valid. 5 frame (167ms pada 30FPS) cukup untuk anti-jitter
-        # tanpa menghapus possession asli.
         self.smoothing_window        = 5
         self.min_stable_frames       = 1
 
@@ -66,14 +63,9 @@ class PassDetector:
         self.min_display_gap       = 3
 
         # --- Filter pemain yang diproses ---
-        # Hanya jersey dalam set ini yang boleh menjadi PENGIRIM passing
         self.allowed_jerseys = {"#3", "#19"}
 
         # --- Parameter buffer trajectory untuk evaluasi ---
-        # PERBAIKAN v2.4: buffer_after 8 → 15
-        # Bola butuh lebih banyak frame untuk mendekati cone target
-        # terutama pada passing jarak jauh. 15 frame = 500ms pada 30FPS.
-        # buffer_before=0 mencegah kontaminasi dari pass sebelumnya.
         self.eval_buffer_before = 0
         self.eval_buffer_after  = 15
 
@@ -193,11 +185,6 @@ class PassDetector:
     ) -> Tuple[bool, str]:
         """
         Evaluasi apakah bola mendekati cone target selama pass event.
-
-        PERBAIKAN v2.4:
-        - eval_buffer_after=15 (naik dari 8) agar trajectory bola
-          yang masih menggelinding ke cone setelah possession berpindah
-          tetap ter-capture.
         """
         if self._target_cone_pos is None:
             return True, "Target cone tidak diinisialisasi - semua pass = SUKSES"
@@ -238,9 +225,6 @@ class PassDetector:
     def smooth_possessions(self, raw_possessions: List[int]) -> List[int]:
         """
         Haluskan possession dengan sliding window majority vote.
-
-        PERBAIKAN v2.4: smoothing_window 7 → 5
-        (167ms pada 30FPS) agar segmen pendek #3/#19 tidak terhapus.
         """
         smoothed    = list(raw_possessions)
         half_window = self.smoothing_window // 2
@@ -262,10 +246,6 @@ class PassDetector:
     ) -> List[int]:
         """
         Isi gap pendek (-1) di antara possession yang sama.
-
-        PERBAIKAN v2.4: max_gap 12 → 20
-        Isi gap lebih panjang agar segmen possession tidak terputus
-        oleh beberapa frame tanpa deteksi.
         """
         filled     = list(possessions)
         last_valid = -1
@@ -425,19 +405,62 @@ class PassDetector:
     ) -> Optional[Tuple[int, int]]:
         """
         Dapatkan posisi pemain untuk pass event dengan multiple fallback.
+
+        PERBAIKAN v2.5:
+        Setelah normalisasi jersey, possession di-map ke track ID canonical
+        (misal track 2 untuk #19). Tapi di frame tertentu, yang aktif
+        mungkin track ID lain (misal track 5 yang juga #19).
+
+        Fallback chain:
+        1. Cari track_id asli di frame target ± search_radius
+        2. Cari track_id asli di seluruh segmen
+        3. (BARU) Cari SEMUA track ID yang di-map ke jersey yang sama
+           di frame target ± search_radius
+        4. (BARU) Cari SEMUA track ID jersey sama di seluruh segmen
         """
+        # === Fallback 1: Track ID asli di frame target ± radius ===
         player_data, found_frame = self.find_player_nearby(
             tracks, player_id, frame_target
         )
         if player_data:
             return get_center_of_bbox_bottom(player_data['bbox'])
 
+        # === Fallback 2: Track ID asli di seluruh segmen ===
         seg_start = segment['frame_start']
         seg_end   = segment['frame_end']
         for f in range(seg_start, min(seg_end + 1, len(tracks['players']))):
             player_data = tracks['players'][f].get(player_id)
             if player_data:
                 return get_center_of_bbox_bottom(player_data['bbox'])
+
+        # === Fallback 3 (BARU): Track ID lain dengan jersey sama ===
+        # Ini mengatasi kasus di mana normalisasi canonical menggunakan
+        # track ID yang sudah tidak aktif (misal track 2 untuk #19),
+        # padahal yang aktif di frame ini adalah track 5 (juga #19).
+        if self._player_identifier:
+            jersey = self._get_jersey(player_id)
+            if jersey != "Unknown" and not jersey.startswith("ID:"):
+                all_track_ids = self._player_identifier.get_all_track_ids_for_jersey(jersey)
+
+                # Cari di frame target ± search_radius
+                for alt_tid in all_track_ids:
+                    if alt_tid == player_id:
+                        continue  # Sudah dicoba di Fallback 1
+                    alt_data, alt_frame = self.find_player_nearby(
+                        tracks, alt_tid, frame_target
+                    )
+                    if alt_data:
+                        return get_center_of_bbox_bottom(alt_data['bbox'])
+
+                # === Fallback 4 (BARU): Track ID jersey sama di seluruh segmen ===
+                for alt_tid in all_track_ids:
+                    if alt_tid == player_id:
+                        continue  # Sudah dicoba di Fallback 2
+                    for f in range(seg_start, min(seg_end + 1, len(tracks['players']))):
+                        alt_data = tracks['players'][f].get(alt_tid)
+                        if alt_data:
+                            return get_center_of_bbox_bottom(alt_data['bbox'])
+
         return None
 
     def detect_passes(
@@ -577,7 +600,7 @@ class PassDetector:
                           f"terlalu singkat ({from_duration} frames)")
                 continue
 
-            # Cari posisi pemain dengan multi-fallback
+            # Cari posisi pemain dengan multi-fallback (DIPERBAIKI v2.5)
             from_pos = self._get_player_position_for_pass(
                 tracks, from_player, transition_frame_start, seg_from
             )

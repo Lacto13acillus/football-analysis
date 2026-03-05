@@ -73,7 +73,7 @@ CONFIG = {
     # Pass dengan closest 122px dan 126px sebelumnya GAGAL hanya
     # karena margin 22-26px. Dengan radius 120, pass-pass ini
     # yang memang mendekati cone akan dihitung SUKSES.
-    "target_proximity_radius": 120,
+    "target_proximity_radius": 100,
 
     # ============================================================
     # KONFIGURASI POSSESSION
