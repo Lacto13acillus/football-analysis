@@ -52,10 +52,12 @@ CONFIG = {
     # Tidak perlu lagi menambahkan mapping untuk Track 5, 6, 7, dll.
     # ============================================================
     "jersey_mapping": {
-        1: "#19",
+        1: "#3",
         2: "#19",
-        3: "#3",
-        4: "Unknown",
+        3: "Unknown",
+        4: "#3",
+        5: "#19",
+        6: "#Unknown"
     },
 
     # Parameter re-identification
