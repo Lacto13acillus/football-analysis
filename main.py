@@ -78,7 +78,7 @@ CONFIG = {
     # terdeteksi. Data debug menunjukkan T1 berjarak 97-182px
     # dari bola saat menerima passing.
     # ============================================================
-    "max_possession_distance": 150,
+    "max_possession_distance": 130,
 
     "show_gate"              : False,
     "show_target_cone"       : True,
