@@ -9,11 +9,11 @@
 #   Hanya player dengan jersey #3 dan #19 yang diproses SEBAGAI PENGIRIM.
 #   Player Unknown BOLEH menjadi PENERIMA passing.
 #
-# PERUBAHAN v2.3:
-#   - FIX: Filter hanya pada from_jersey (bukan to_jersey)
-#   - FIX: buffer_frames=0 → buffer_after=8 untuk capture ball approach
-#   - FIX: smoothing_window=3 → 7 (233ms pada 30FPS, anti-jitter)
-#   - FIX: Ball trajectory menggunakan bottom-center (ground level)
+# PERUBAHAN v2.4:
+#   - smoothing_window: 7 → 5 (kurangi over-smoothing agar segmen pendek
+#     #3/#19 tidak hilang)
+#   - eval_buffer_after: 8 → 15 (capture bola menggelinding lebih lama)
+#   - fill_short_gaps max_gap: 12 → 20 (isi gap lebih panjang)
 
 import sys
 sys.path.append('../')
@@ -43,11 +43,11 @@ class PassDetector:
         self.fps = fps
 
         # --- Parameter smoothing possession ---
-        # PERBAIKAN: 3 -> 7 (pada 30FPS: 3 frame=100ms terlalu pendek,
-        # menyebabkan false positive saat perebutan bola.
-        # 7 frame=233ms cukup untuk melewati jitter tanpa
-        # menghilangkan possession asli)
-        self.smoothing_window        = 7
+        # PERBAIKAN v2.4: 7 → 5
+        # 7 frame terlalu agresif, menghilangkan segmen pendek #3/#19
+        # yang valid. 5 frame (167ms pada 30FPS) cukup untuk anti-jitter
+        # tanpa menghapus possession asli.
+        self.smoothing_window        = 5
         self.min_stable_frames       = 1
 
         # --- Parameter validasi pass ---
@@ -70,14 +70,12 @@ class PassDetector:
         self.allowed_jerseys = {"#3", "#19"}
 
         # --- Parameter buffer trajectory untuk evaluasi ---
-        # PERBAIKAN: buffer_frames=0 memotong trajectory tepat di
-        # batas possession. Bola mungkin baru mendekati cone target
-        # beberapa frame SETELAH possession berpindah.
-        # buffer_after=8 menambah 8 frame ke depan agar trajectory
-        # bola yang masih menggelinding ke cone ter-capture.
+        # PERBAIKAN v2.4: buffer_after 8 → 15
+        # Bola butuh lebih banyak frame untuk mendekati cone target
+        # terutama pada passing jarak jauh. 15 frame = 500ms pada 30FPS.
         # buffer_before=0 mencegah kontaminasi dari pass sebelumnya.
         self.eval_buffer_before = 0
-        self.eval_buffer_after  = 8
+        self.eval_buffer_after  = 15
 
         # ============================================================
         # KONFIGURASI TARGET CONE
@@ -196,11 +194,10 @@ class PassDetector:
         """
         Evaluasi apakah bola mendekati cone target selama pass event.
 
-        PERBAIKAN v2.3:
-        - Menggunakan asymmetric buffer: buffer_before=0, buffer_after=8
-          agar trajectory bola yang masih menggelinding ke cone setelah
-          possession berpindah tetap ter-capture, tanpa kontaminasi
-          dari pass event sebelumnya.
+        PERBAIKAN v2.4:
+        - eval_buffer_after=15 (naik dari 8) agar trajectory bola
+          yang masih menggelinding ke cone setelah possession berpindah
+          tetap ter-capture.
         """
         if self._target_cone_pos is None:
             return True, "Target cone tidak diinisialisasi - semua pass = SUKSES"
@@ -208,9 +205,7 @@ class PassDetector:
         frame_start = pass_event['frame_start']
         frame_end   = pass_event['frame_end']
 
-        # PERBAIKAN: Asymmetric buffer
-        # buffer_before=0 mencegah kontaminasi dari pass sebelumnya
-        # buffer_after=8  capture bola yang masih menggelinding ke cone
+        # Asymmetric buffer
         trajectory = extract_ball_trajectory(
             tracks,
             frame_start,
@@ -244,9 +239,8 @@ class PassDetector:
         """
         Haluskan possession dengan sliding window majority vote.
 
-        PERBAIKAN v2.3: smoothing_window dinaikkan dari 3 ke 7
-        (233ms pada 30FPS) untuk mengurangi false positives saat
-        perebutan bola.
+        PERBAIKAN v2.4: smoothing_window 7 → 5
+        (167ms pada 30FPS) agar segmen pendek #3/#19 tidak terhapus.
         """
         smoothed    = list(raw_possessions)
         half_window = self.smoothing_window // 2
@@ -264,9 +258,15 @@ class PassDetector:
     def fill_short_gaps(
         self,
         possessions: List[int],
-        max_gap    : int = 12
+        max_gap    : int = 20
     ) -> List[int]:
-        """Isi gap pendek (-1) di antara possession yang sama."""
+        """
+        Isi gap pendek (-1) di antara possession yang sama.
+
+        PERBAIKAN v2.4: max_gap 12 → 20
+        Isi gap lebih panjang agar segmen possession tidak terputus
+        oleh beberapa frame tanpa deteksi.
+        """
         filled     = list(possessions)
         last_valid = -1
         gap_start  = -1
@@ -450,8 +450,8 @@ class PassDetector:
         """
         Deteksi semua event passing dan evaluasi ke target cone.
 
-        PERBAIKAN v2.3:
-        - Filter HANYA pada from_jersey (pengirim).
+        FILTER:
+        - Hanya from_jersey yang difilter (pengirim).
           Unknown BOLEH menjadi penerima.
         """
         if player_identifier:
@@ -483,7 +483,7 @@ class PassDetector:
             return []
 
         # --- Preprocessing ---
-        filled   = self.fill_short_gaps(ball_possessions, max_gap=12)
+        filled   = self.fill_short_gaps(ball_possessions, max_gap=20)
         filled   = self._normalize_possessions_by_jersey(filled)
 
         if debug:
@@ -540,15 +540,7 @@ class PassDetector:
             to_jersey   = self._get_jersey(to_player)
 
             # =========================================================
-            # FILTER DIPERBAIKI v2.3:
-            #
-            # SEBELUM (BUG):
-            #   if from_jersey not in allowed and to_jersey not in allowed: continue
-            #   if to_jersey not in allowed: continue   <-- BUG: buang #19->Unknown
-            #
-            # SESUDAH (FIX):
-            #   Hanya filter PENGIRIM. Unknown BOLEH jadi PENERIMA.
-            #   Ini memastikan pass #3->Unknown dan #19->Unknown dihitung.
+            # FILTER: Hanya filter PENGIRIM. Unknown BOLEH jadi PENERIMA.
             # =========================================================
             if from_jersey not in self.allowed_jerseys:
                 if debug:

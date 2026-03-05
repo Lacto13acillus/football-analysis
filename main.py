@@ -1,12 +1,11 @@
 # main.py
 # Pipeline utama: baca video -> deteksi -> tracking -> analisis -> render -> simpan
 #
-# PERUBAHAN v2.3:
-# - PlayerIdentifier dengan dynamic spatial re-identification
-# - Filter pass diperbaiki: hanya filter from_jersey
-# - Smoothing window: 3 -> 7
-# - Buffer trajectory: asymmetric (before=0, after=8)
-# - Ball trajectory: ground-level (bottom-center)
+# PERUBAHAN v2.4:
+# - max_possession_distance: 80 → 130
+# - target_proximity_radius: 100 → 120
+# - PlayerBallAssigner dihubungkan ke PlayerIdentifier (jersey priority)
+# - Semua perubahan parameter pass_detector sudah di file pass_detector.py
 
 import os
 import sys
@@ -46,10 +45,9 @@ CONFIG = {
     # ============================================================
     # JERSEY MAPPING (SEED AWAL)
     #
-    # v2.3: Ini adalah SEED mapping untuk frame awal.
+    # Ini adalah SEED mapping untuk frame awal.
     # PlayerIdentifier akan OTOMATIS re-assign jersey saat
     # ByteTrack mereset ID berdasarkan kedekatan posisi.
-    # Tidak perlu lagi menambahkan mapping untuk Track 5, 6, 7, dll.
     # ============================================================
     "jersey_mapping": {
         1: "#3",
@@ -70,12 +68,21 @@ CONFIG = {
     # ============================================================
     "manual_target_cone_id"  : 3,
     "target_selection_mode"  : "highest",
-    "target_proximity_radius": 100,
+
+    # PERBAIKAN v2.4: 100 → 120
+    # Pass dengan closest 122px dan 126px sebelumnya GAGAL hanya
+    # karena margin 22-26px. Dengan radius 120, pass-pass ini
+    # yang memang mendekati cone akan dihitung SUKSES.
+    "target_proximity_radius": 120,
 
     # ============================================================
     # KONFIGURASI POSSESSION
     # ============================================================
-    "max_possession_distance": 80,
+    # PERBAIKAN v2.4: 80 → 130
+    # Possession rate sebelumnya hanya 29.7% (70% frame tanpa possession).
+    # Dengan 130px, lebih banyak frame di mana #3/#19 dianggap menguasai
+    # bola, sehingga lebih banyak segmen possession terdeteksi.
+    "max_possession_distance": 130,
 
     "show_gate"              : False,
     "show_target_cone"       : True,
@@ -396,9 +403,10 @@ def main():
     """
     Fungsi utama yang menjalankan seluruh pipeline analitik passing.
 
-    v2.3 PERUBAHAN:
-    - TAHAP 3: PlayerIdentifier dengan dynamic re-ID
-    - TAHAP 5: update_frame() dipanggil setiap frame SEBELUM possession assignment
+    v2.4 PERUBAHAN:
+    - TAHAP 5: PlayerBallAssigner dihubungkan ke PlayerIdentifier
+               agar jersey priority bonus aktif
+    - CONFIG: max_possession_distance 80→130, target_proximity_radius 100→120
     """
 
     args = parse_args()
@@ -417,8 +425,8 @@ def main():
         CONFIG["expected_gate_width_range"] = (9999.0, 99999.0)
 
     print("\n" + "=" * 62)
-    print("   FOOTBALL PASSING ANALYTICS v2.3")
-    print("   Dynamic Re-ID + Fixed Pass Filter + Asymmetric Buffer")
+    print("   FOOTBALL PASSING ANALYTICS v2.4")
+    print("   Dynamic Re-ID + Jersey Priority + Tuned Parameters")
     print("=" * 62)
     print(f"  Input        : {CONFIG['input_video']}")
     print(f"  Output       : {CONFIG['output_video']}")
@@ -427,6 +435,7 @@ def main():
     print(f"  Debug traj   : {'Ya' if CONFIG['debug_trajectory'] else 'Tidak'}")
     print(f"  Possession d : {CONFIG['max_possession_distance']}px")
     print(f"  Re-ID thresh : {CONFIG['reassign_distance_threshold']}px")
+    print(f"  Target radius: {CONFIG['target_proximity_radius']}px")
     print("=" * 62)
 
     # ==========================================================
@@ -496,17 +505,14 @@ def main():
         lost_timeout_frames         = CONFIG.get("lost_timeout_frames", 60)
     )
 
-    # -------------------------------------------------------
-    # KUNCI v2.3: Jalankan update_frame() untuk SETIAP frame
+    # Jalankan update_frame() untuk SETIAP frame
     # agar re-identifikasi spasial berjalan otomatis.
-    # Ini harus dilakukan SEBELUM possession assignment.
-    # -------------------------------------------------------
     print("[MAIN] Menjalankan dynamic re-identification per frame...")
     for frame_num in range(n_player_frames):
         player_identifier.update_frame(
             frame_num     = frame_num,
             player_tracks = tracks['players'][frame_num],
-            debug         = (frame_num % 100 == 0)  # Print setiap 100 frame
+            debug         = (frame_num % 100 == 0)
         )
 
     player_identifier.print_mappings()
@@ -547,6 +553,10 @@ def main():
     assigner = PlayerBallAssigner(
         max_possession_distance = CONFIG.get("max_possession_distance", 70.0)
     )
+
+    # ★★★ BARU v2.4: Hubungkan player identifier agar jersey priority aktif ★★★
+    assigner.set_player_identifier(player_identifier)
+
     ball_possessions = assigner.assign_ball_to_players_bulk(tracks)
 
     possession_count: Dict[str, int] = {}
