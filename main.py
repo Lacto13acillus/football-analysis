@@ -1,5 +1,10 @@
 # main.py
 # Pipeline utama: baca video -> deteksi -> tracking -> analisis -> render -> simpan
+#
+# PERUBAHAN:
+# - Statistik panel di video ditampilkan secara REALTIME (progressive),
+#   bukan langsung menampilkan hasil akhir dari frame pertama.
+# - Hanya player #3 dan #19 yang diproses (filter di pass_detector.py).
 
 import os
 import sys
@@ -10,11 +15,11 @@ from typing import List, Dict, Optional
 
 sys.path.append('../')
 
-from trackers              import Tracker
-from team_assigner.player_identifier    import PlayerIdentifier
-from trackers.player_ball_assigner import PlayerBallAssigner
-from trackers.pass_detector        import PassDetector
-from draw_gate            import (
+from trackers                          import Tracker
+from team_assigner.player_identifier   import PlayerIdentifier
+from trackers.player_ball_assigner     import PlayerBallAssigner
+from trackers.pass_detector            import PassDetector
+from draw_gate import (
     draw_gate_on_frame,
     draw_ball_trajectory_on_frame,
     draw_pass_arrow,
@@ -53,7 +58,7 @@ CONFIG = {
     # ============================================================
     "manual_target_cone_id"  : 3,       # ID cone target (cone paling atas)
     "target_selection_mode"  : "highest", # Fallback jika manual None
-    "target_proximity_radius": 100,   # Radius sukses dalam pixel
+    "target_proximity_radius": 100,     # Radius sukses dalam pixel
                                         # Naikkan jika terlalu banyak GAGAL
                                         # Turunkan jika terlalu banyak SUKSES palsu
     "max_possession_distance": 70,
@@ -98,6 +103,85 @@ def parse_args():
 
 
 # ============================================================
+# STATISTIK PROGRESSIVE (REALTIME)
+# ============================================================
+
+def compute_progressive_stats(
+    detected_passes: List[Dict],
+    up_to_frame    : int
+) -> Dict:
+    """
+    Hitung statistik kumulatif hanya dari pass events yang sudah
+    ditampilkan (frame_display <= up_to_frame).
+    Statistik bertambah secara realtime seiring frame berjalan.
+
+    Args:
+        detected_passes: list semua pass event yang terdeteksi
+        up_to_frame    : nomor frame saat ini
+
+    Returns:
+        Dict statistik kumulatif sampai frame ini
+    """
+    # Filter pass yang sudah terjadi sampai frame ini
+    passes_so_far = [
+        p for p in detected_passes
+        if p['frame_display'] <= up_to_frame
+    ]
+
+    total  = len(passes_so_far)
+    sukses = [p for p in passes_so_far if p['success']]
+    gagal  = [p for p in passes_so_far if not p['success']]
+
+    # Per player
+    per_player: Dict[str, Dict] = {}
+    for p in passes_so_far:
+        jersey = p['from_jersey']
+        if jersey not in per_player:
+            per_player[jersey] = {
+                'total'       : 0,
+                'success'     : 0,
+                'failed'      : 0,
+                'accuracy_pct': 0.0,
+                'avg_closest' : 0.0,
+                '_closest_sum': 0.0
+            }
+        per_player[jersey]['total'] += 1
+        per_player[jersey]['_closest_sum'] += p.get('closest_dist', 0.0)
+        if p['success']:
+            per_player[jersey]['success'] += 1
+        else:
+            per_player[jersey]['failed'] += 1
+
+    for jersey, stat in per_player.items():
+        stat['accuracy_pct'] = round(
+            stat['success'] / stat['total'] * 100, 1
+        ) if stat['total'] > 0 else 0.0
+        stat['avg_closest'] = round(
+            stat['_closest_sum'] / stat['total'], 1
+        ) if stat['total'] > 0 else 0.0
+        del stat['_closest_sum']
+
+    return {
+        'total_passes'           : total,
+        'successful_passes'      : len(sukses),
+        'failed_passes'          : len(gagal),
+        'accuracy_pct'           : round(len(sukses) / total * 100, 1)
+                                   if total > 0 else 0.0,
+        'avg_distance'           : round(float(np.mean(
+                                       [p['distance'] for p in passes_so_far])), 1)
+                                   if passes_so_far else 0.0,
+        'avg_distance_successful': round(float(np.mean(
+                                       [p['distance'] for p in sukses])), 1)
+                                   if sukses else 0.0,
+        'avg_closest_dist'       : round(float(np.mean(
+                                       [p.get('closest_dist', 0)
+                                        for p in passes_so_far])), 1)
+                                   if passes_so_far else 0.0,
+        'per_player'             : per_player
+    }
+
+
+# ============================================================
 # CETAK DETAIL PASS EVENTS KE CONSOLE
 # ============================================================
 
@@ -110,8 +194,8 @@ def print_pass_details(passes: List[Dict], stats: Dict) -> None:
     print("   STATISTIK HASIL ANALISIS PASSING")
     print(sep)
     print(f"  Total Pass           : {stats['total_passes']}")
-    print(f"  Sukses (ke target)   : {stats['successful_passes']}")  # Ubah label
-    print(f"  Gagal  (tidak target): {stats['failed_passes']}")       # Ubah label
+    print(f"  Sukses (ke target)   : {stats['successful_passes']}")
+    print(f"  Gagal  (tidak target): {stats['failed_passes']}")
     print(f"  Akurasi              : {stats['accuracy_pct']}%")
     print(f"  Rata2 Jarak Semua    : {stats['avg_distance']} px")
     print(f"  Rata2 Jarak Sukses   : {stats['avg_distance_successful']} px")
@@ -137,12 +221,11 @@ def print_pass_details(passes: List[Dict], stats: Dict) -> None:
     print("  " + "-" * 78)
     for i, p in enumerate(passes):
         status   = "SUKSES" if p['success'] else "GAGAL"
-        # Gunakan 'target_reason', fallback ke 'gate_reason' untuk kompatibilitas
         reason = p.get('target_reason', p.get('gate_reason', '-'))
         closest  = p.get('closest_dist', 0.0)
         print(f"  {i+1:<4} "
-              f"#{p['from_jersey']:<10} "
-              f"#{p['to_jersey']:<10} "
+              f"{p['from_jersey']:<10} "
+              f"{p['to_jersey']:<10} "
               f"{p['distance']:>7.0f}px "
               f"{p['ball_movement']:>7.0f}px "
               f"{closest:>8.0f}px "
@@ -162,20 +245,19 @@ def render_frames(
     detected_passes  : List[Dict],
     player_identifier: PlayerIdentifier,
     pass_detector    : PassDetector,
-    stats            : Dict,
     config           : Dict
 ) -> List[np.ndarray]:
     """
     Render semua frame dengan annotasi lengkap.
 
     Annotasi yang digambar per frame:
-    1. Gate cone (garis + area semi-transparan)
+    1. Target cone (lingkaran radius semi-transparan)
     2. Bounding box pemain + label jersey
     3. Indikator possession (lingkaran di kaki pemain)
     4. Bounding box bola
     5. Trajectory bola rolling (mode debug)
     6. Panah passing + label SUKSES/GAGAL (di frame_display)
-    7. Panel statistik di pojok kiri atas
+    7. Panel statistik REALTIME di pojok kiri atas
 
     Args:
         frames           : list frame video asli
@@ -183,8 +265,7 @@ def render_frames(
         ball_possessions : list possession per frame
         detected_passes  : list pass events dari PassDetector
         player_identifier: objek PlayerIdentifier
-        pass_detector    : objek PassDetector (untuk akses gate)
-        stats            : dict statistik dari get_pass_statistics()
+        pass_detector    : objek PassDetector (untuk akses target cone)
         config           : dict konfigurasi
 
     Returns:
@@ -211,7 +292,7 @@ def render_frames(
         annotated = frame.copy()
 
         # ------------------------------------------------------
-        # 1. Gambar gate (jika tersedia dan diaktifkan)
+        # 1. Gambar target cone (jika tersedia dan diaktifkan)
         # ------------------------------------------------------
         target_info = pass_detector.get_target_cone()
         if target_info and config.get("show_target_cone", True):
@@ -324,12 +405,18 @@ def render_frames(
             )
 
         # ------------------------------------------------------
-        # 6. Gambar panel statistik di pojok kiri atas
+        # 6. Gambar panel statistik REALTIME di pojok kiri atas
+        #    Statistik dihitung secara progressive - hanya pass
+        #    yang sudah ditampilkan (frame_display <= frame_num)
+        #    yang dihitung, sehingga angka bertambah seiring waktu.
         # ------------------------------------------------------
         if config.get("show_stats_panel", True):
+            realtime_stats = compute_progressive_stats(
+                detected_passes, frame_num
+            )
             annotated = draw_stats_panel(
                 annotated,
-                stats       = stats,
+                stats       = realtime_stats,
                 position    = (20, 20),
                 panel_width = 295
             )
@@ -363,11 +450,11 @@ def main():
     1.  Baca video input
     2.  Deteksi & tracking objek (YOLOv8 + ByteTrack)
     3.  Identifikasi jersey pemain
-    4.  Inisialisasi PassDetector & Gate
+    4.  Inisialisasi PassDetector & Target Cone
     5.  Assignment possession bola per frame
-    6.  Deteksi pass events & evaluasi gate
+    6.  Deteksi pass events & evaluasi target cone
     7.  Hitung statistik
-    8.  Render video output dengan annotasi
+    8.  Render video output dengan annotasi (stats REALTIME)
     9.  Simpan video output
     """
 
@@ -384,15 +471,14 @@ def main():
     if args.debug:
         CONFIG["debug_trajectory"] = True
     if args.no_gate:
-        # Nonaktifkan semua opsi gate
         CONFIG["manual_gate_cone_ids"]      = None
         CONFIG["gate_position_hint"]        = None
-        CONFIG["expected_gate_width_range"] = (9999.0, 99999.0)  # Tidak ada yang valid
+        CONFIG["expected_gate_width_range"] = (9999.0, 99999.0)
 
     # Cetak header
     print("\n" + "=" * 62)
-    print("   FOOTBALL PASSING ANALYTICS v2.0")
-    print("   Gate-Based Pass Accuracy Detection")
+    print("   FOOTBALL PASSING ANALYTICS v2.1")
+    print("   Target Cone Pass Accuracy - Realtime Stats")
     print("=" * 62)
     print(f"  Input        : {CONFIG['input_video']}")
     print(f"  Output       : {CONFIG['output_video']}")
@@ -473,14 +559,14 @@ def main():
     player_identifier.print_mappings()
 
     # ==========================================================
-    # TAHAP 4: Inisialisasi Pass Detector & Gate
+    # TAHAP 4: Inisialisasi Pass Detector & Target Cone
     # ==========================================================
     print("\n[MAIN] TAHAP 4: Inisialisasi Pass Detector & Target Cone...")
     pass_detector = PassDetector(fps=fps)
     pass_detector.set_jersey_map(player_identifier)
     # Konfigurasi target cone
-    pass_detector.manual_target_cone_id  = CONFIG.get("manual_target_cone_id")
-    pass_detector.target_selection_mode  = CONFIG.get("target_selection_mode", "highest")
+    pass_detector.manual_target_cone_id   = CONFIG.get("manual_target_cone_id")
+    pass_detector.target_selection_mode   = CONFIG.get("target_selection_mode", "highest")
     pass_detector.target_proximity_radius = CONFIG.get("target_proximity_radius", 120.0)
     target_ok = pass_detector.initialize_target_cone(
         tracks,
@@ -517,9 +603,9 @@ def main():
         print(f"[MAIN]   #{jersey:<12}: {count:>5} frames ({pct:.1f}%)")
 
     # ==========================================================
-    # TAHAP 6: Deteksi Pass Events & Evaluasi Gate
+    # TAHAP 6: Deteksi Pass Events & Evaluasi Target Cone
     # ==========================================================
-    print("\n[MAIN] TAHAP 6: Deteksi passing & evaluasi gate...")
+    print("\n[MAIN] TAHAP 6: Deteksi passing & evaluasi target cone...")
 
     detected_passes = pass_detector.detect_passes(
         tracks,
@@ -529,7 +615,7 @@ def main():
     )
 
     # ==========================================================
-    # TAHAP 7: Hitung Statistik
+    # TAHAP 7: Hitung Statistik (untuk console output)
     # ==========================================================
     print("\n[MAIN] TAHAP 7: Menghitung statistik...")
 
@@ -539,9 +625,9 @@ def main():
     print_pass_details(detected_passes, stats)
 
     # ==========================================================
-    # TAHAP 8: Render Video Output
+    # TAHAP 8: Render Video Output (Stats REALTIME)
     # ==========================================================
-    print("\n[MAIN] TAHAP 8: Merender video output dengan annotasi...")
+    print("\n[MAIN] TAHAP 8: Merender video output dengan annotasi REALTIME...")
 
     output_frames = render_frames(
         frames            = frames,
@@ -550,7 +636,6 @@ def main():
         detected_passes   = detected_passes,
         player_identifier = player_identifier,
         pass_detector     = pass_detector,
-        stats             = stats,
         config            = CONFIG
     )
 

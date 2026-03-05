@@ -5,6 +5,10 @@
 #   Pass SUKSES = trajectory bola mendekati cone TARGET (cone paling atas)
 #   dalam radius yang ditentukan.
 #   Abaikan 3 cone yang berjejer di tengah lapangan.
+#
+# FILTER PEMAIN:
+#   Hanya player dengan jersey #3 dan #19 yang diproses.
+#   Player Unknown atau jersey lain diabaikan.
 
 import sys
 sys.path.append('../')
@@ -51,6 +55,10 @@ class PassDetector:
         self.player_search_radius  = 20
         self.pass_display_delay    = 3
         self.min_display_gap       = 3
+
+        # --- Filter pemain yang diproses ---
+        # Hanya jersey dalam set ini yang akan dideteksi passing-nya
+        self.allowed_jerseys = {"#3", "#19"}
 
         # ============================================================
         # KONFIGURASI TARGET CONE
@@ -425,6 +433,7 @@ class PassDetector:
     ) -> List[Dict]:
         """
         Deteksi semua event passing dan evaluasi ke target cone.
+        Hanya memproses pass dari/ke player dalam self.allowed_jerseys.
         """
         if player_identifier:
             self._player_identifier = player_identifier
@@ -435,6 +444,7 @@ class PassDetector:
             print(f"[PASS] Total frames            : {len(ball_possessions)}")
             print(f"[PASS] Frame dengan possession  : {valid_count}/{len(ball_possessions)}")
             print(f"[PASS] Unique player IDs        : {unique_players}")
+            print(f"[PASS] Filter jersey aktif      : {self.allowed_jerseys}")
             if self._target_cone_pos:
                 print(f"[PASS] Target cone posisi       : "
                       f"({self._target_cone_pos[0]:.1f}, {self._target_cone_pos[1]:.1f})")
@@ -492,6 +502,22 @@ class PassDetector:
             to_jersey   = self._get_jersey(to_player)
 
             # =========================================================
+            # FILTER: Hanya proses pass dari/ke player #3 dan #19
+            # Abaikan semua player "Unknown" atau jersey lain
+            # =========================================================
+            if from_jersey not in self.allowed_jerseys:
+                if debug:
+                    print(f"[PASS] Skip: pengirim {from_jersey} bukan pemain target "
+                          f"(hanya {self.allowed_jerseys})")
+                continue
+
+            if to_jersey not in self.allowed_jerseys:
+                if debug:
+                    print(f"[PASS] Skip: penerima {to_jersey} bukan pemain target "
+                          f"(hanya {self.allowed_jerseys})")
+                continue
+
+            # =========================================================
             # PERBAIKAN: Skip jersey sama, KECUALI keduanya "Unknown"
             # dengan track ID berbeda (pemain berbeda yang belum
             # teridentifikasi jersey-nya)
@@ -515,7 +541,7 @@ class PassDetector:
             from_duration = seg_from['frame_end'] - seg_from['frame_start']
             if from_duration < self.min_possession_duration:
                 if debug:
-                    print(f"[PASS] Skip: possession #{from_jersey} "
+                    print(f"[PASS] Skip: possession {from_jersey} "
                           f"terlalu singkat ({from_duration} frames)")
                 continue
             # Cari posisi pemain dengan multi-fallback
@@ -527,8 +553,8 @@ class PassDetector:
             )
             if not from_pos or not to_pos:
                 if debug:
-                    print(f"[PASS] Skip: posisi pemain #{from_jersey} atau "
-                          f"#{to_jersey} tidak ditemukan sama sekali")
+                    print(f"[PASS] Skip: posisi pemain {from_jersey} atau "
+                          f"{to_jersey} tidak ditemukan sama sekali")
                 continue
             distance = measure_distance(from_pos, to_pos)
             if not (self.min_pass_distance <= distance <= self.max_pass_distance):
@@ -594,7 +620,7 @@ class PassDetector:
             last_pass_frame = transition_frame_end
             if debug:
                 status = "SUKSES" if success else "GAGAL"
-                print(f"[PASS] Pass #{from_jersey} -> #{to_jersey}: "
+                print(f"[PASS] Pass {from_jersey} -> {to_jersey}: "
                       f"jarak={distance:.0f}px | "
                       f"bola={ball_movement:.0f}px | "
                       f"closest={closest_dist:.0f}px | "
