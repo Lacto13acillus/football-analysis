@@ -57,7 +57,8 @@ CONFIG = {
         3: "Unknown",
         4: "#3",
         5: "#19",
-        6: "#Unknown"
+        6: "Unknown",
+        7: "Unknown"
     },
 
     # Parameter re-identification
