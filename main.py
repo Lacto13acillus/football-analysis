@@ -1,10 +1,11 @@
 # main.py
 # Pipeline utama: baca video -> deteksi -> tracking -> analisis -> render -> simpan
 #
-# PERUBAHAN:
-# - Statistik panel di video ditampilkan secara REALTIME (progressive),
-#   bukan langsung menampilkan hasil akhir dari frame pertama.
-# - Hanya player #3 dan #19 yang diproses (filter di pass_detector.py).
+# PERUBAHAN v2.2:
+# - Jersey mapping diperbaiki berdasarkan analisis posisi track
+# - Track 1 = #19 (bukan #3), Track 6 = #3 (re-ID Track 3)
+# - max_possession_distance = 150 agar sentuhan T1 terdeteksi
+# - Statistik panel REALTIME (progressive)
 
 import os
 import sys
@@ -31,7 +32,6 @@ from utils.bbox_utils import extract_ball_trajectory
 
 # ============================================================
 # KONFIGURASI UTAMA
-# Sesuaikan seluruh nilai di bawah ini sebelum menjalankan program
 # ============================================================
 
 CONFIG = {
@@ -41,29 +41,47 @@ CONFIG = {
     "stub_path"   : "stubs/tracks_cache.pkl",
     "use_stub"    : True,
     "fps"         : 30,
+
+    # ============================================================
+    # JERSEY MAPPING — Berdasarkan analisis posisi track:
+    #
+    # Track 1: avg (1258,600), mobile, Y 329-882  = #19 (aktif frame 260-486)
+    # Track 2: avg (1168,590), mobile, Y 384-871  = #19 (aktif frame 0-225)
+    # Track 3: avg (1003,192), stasioner, Y 163-235 = #3 (dekat cone, frame 0-485)
+    # Track 4: avg (1654,699), jauh                = Unknown (frame 487+)
+    # Track 5: avg (861,510),  mobile, Y 395-828  = #19 (re-ID, frame 487+)
+    # Track 6: avg (1045,168), stasioner, Y 151-196 = #3 (re-ID Track 3, frame 487+)
+    # Track 7: 4 frame only                        = Unknown (noise)
+    # ============================================================
     "jersey_mapping": {
-        1: "#3",
-        2: "#19",
-        3: "#3",
-        4: "Unknown",
-        5: "#3",
-        6: "#19",
-        7: "Unknown",
-        8: "#3",
-        9: "#19",
+        1: "#19",       # FIX: mobile player, aktif passing frame 260-486
+        2: "#19",       # Mobile player, aktif passing frame 0-225
+        3: "#3",        # Stasioner dekat cone target
+        4: "Unknown",   # Jauh dari aksi
+        5: "#19",       # Re-ID mobile player, frame 487+
+        6: "#3",        # Re-ID Track 3, stasioner dekat cone, frame 487+
+        7: "Unknown",   # Noise (4 frame)
+        8: "#3",        # Fallback
+        9: "#19",       # Fallback
     },
+
     # ============================================================
     # KONFIGURASI TARGET CONE
-    # Dari log: Cone ID 3 di (932.4, 276.4) = cone paling atas
     # ============================================================
-    "manual_target_cone_id"  : 3,       # ID cone target (cone paling atas)
-    "target_selection_mode"  : "highest", # Fallback jika manual None
-    "target_proximity_radius": 100,     # Radius sukses dalam pixel
-                                        # Naikkan jika terlalu banyak GAGAL
-                                        # Turunkan jika terlalu banyak SUKSES palsu
-    "max_possession_distance": 70,
-    "show_gate"              : False,   # Gate tidak dipakai lagi
-    "show_target_cone"       : True,    # Tampilkan target cone di video
+    "manual_target_cone_id"  : 3,
+    "target_selection_mode"  : "highest",
+    "target_proximity_radius": 100,
+
+    # ============================================================
+    # KONFIGURASI POSSESSION
+    # Dinaikkan dari 70 -> 150 agar sentuhan bola Track 1 (#19)
+    # terdeteksi. Data debug menunjukkan T1 berjarak 97-182px
+    # dari bola saat menerima passing.
+    # ============================================================
+    "max_possession_distance": 150,
+
+    "show_gate"              : False,
+    "show_target_cone"       : True,
     "debug_trajectory"       : False,
     "show_pass_arrows"       : True,
     "show_stats_panel"       : True,
@@ -477,7 +495,7 @@ def main():
 
     # Cetak header
     print("\n" + "=" * 62)
-    print("   FOOTBALL PASSING ANALYTICS v2.1")
+    print("   FOOTBALL PASSING ANALYTICS v2.2")
     print("   Target Cone Pass Accuracy - Realtime Stats")
     print("=" * 62)
     print(f"  Input        : {CONFIG['input_video']}")
@@ -485,6 +503,7 @@ def main():
     print(f"  Model        : {CONFIG['model_path']}")
     print(f"  Gunakan cache: {'Ya' if CONFIG['use_stub'] else 'Tidak'}")
     print(f"  Debug traj   : {'Ya' if CONFIG['debug_trajectory'] else 'Tidak'}")
+    print(f"  Possession d : {CONFIG['max_possession_distance']}px")
     print("=" * 62)
 
     # ==========================================================
