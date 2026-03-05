@@ -44,7 +44,7 @@ CONFIG = {
     "jersey_mapping": {
         1: "#3",
         2: "#19",
-        3: "Unknown",
+        3: "#3",
         4: "Unknown",
         5: "#3",
         6: "#19",

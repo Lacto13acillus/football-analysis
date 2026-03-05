@@ -505,10 +505,10 @@ class PassDetector:
             # FILTER: Hanya proses pass dari/ke player #3 dan #19
             # Abaikan semua player "Unknown" atau jersey lain
             # =========================================================
-            if from_jersey not in self.allowed_jerseys:
+            if from_jersey not in self.allowed_jerseys and to_jersey not in self.allowed_jerseys:
                 if debug:
-                    print(f"[PASS] Skip: pengirim {from_jersey} bukan pemain target "
-                          f"(hanya {self.allowed_jerseys})")
+                    print(f"[PASS] Skip: {from_jersey} -> {to_jersey}, "
+                          f"keduanya bukan pemain target (hanya {self.allowed_jerseys})")
                 continue
 
             if to_jersey not in self.allowed_jerseys:
