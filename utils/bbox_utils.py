@@ -1,5 +1,9 @@
 # utils/bbox_utils.py
 # Fungsi-fungsi helper matematika untuk bounding box, gate, dan trajectory bola
+#
+# PERUBAHAN v2.3:
+#   - extract_ball_trajectory: asymmetric buffer + ground-level ball position
+#   - Semua fungsi lain TIDAK BERUBAH
 
 from typing import Dict, Any, List, Tuple, Optional
 import numpy as np
@@ -7,7 +11,7 @@ import pandas as pd
 
 
 # ============================================================
-# FUNGSI DASAR BOUNDING BOX
+# FUNGSI DASAR BOUNDING BOX (TIDAK BERUBAH)
 # ============================================================
 
 def get_center_of_bbox(bbox: List[float]) -> Tuple[int, int]:
@@ -17,7 +21,7 @@ def get_center_of_bbox(bbox: List[float]) -> Tuple[int, int]:
 
 
 def get_center_of_bbox_bottom(bbox: List[float]) -> Tuple[int, int]:
-    """Hitung titik tengah bagian bawah bounding box (posisi kaki)."""
+    """Hitung titik tengah bagian bawah bounding box (posisi kaki/ground level)."""
     x1, y1, x2, y2 = bbox
     return int((x1 + x2) / 2), int(y2)
 
@@ -54,13 +58,12 @@ def segments_intersect(
 ) -> bool:
     """
     Cek apakah segmen garis P1-P2 berpotongan dengan segmen garis P3-P4.
-    Menggunakan metode Cross Product (orientasi) - lebih akurat dari formula parametrik.
+    Menggunakan metode Cross Product (orientasi).
     """
     def cross(o, a, b):
         return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
 
     def on_segment(p, q, r):
-        # Cek apakah titik q berada di antara p dan r (kasus collinear)
         return (min(p[0], r[0]) <= q[0] <= max(p[0], r[0]) and
                 min(p[1], r[1]) <= q[1] <= max(p[1], r[1]))
 
@@ -69,12 +72,10 @@ def segments_intersect(
     d3 = cross(p1, p2, p3)
     d4 = cross(p1, p2, p4)
 
-    # Kasus umum: segmen saling berpotongan
     if ((d1 > 0 and d2 < 0) or (d1 < 0 and d2 > 0)) and \
        ((d3 > 0 and d4 < 0) or (d3 < 0 and d4 > 0)):
         return True
 
-    # Handle kasus collinear (titik tepat di garis)
     if d1 == 0 and on_segment(p3, p1, p4): return True
     if d2 == 0 and on_segment(p3, p2, p4): return True
     if d3 == 0 and on_segment(p1, p3, p2): return True
@@ -88,10 +89,7 @@ def point_to_segment_distance(
     seg_a: Tuple[float, float],
     seg_b: Tuple[float, float]
 ) -> float:
-    """
-    Hitung jarak tegak lurus terpendek dari sebuah titik ke segmen garis.
-    Digunakan sebagai fallback proximity check saat trajectory tidak lengkap.
-    """
+    """Hitung jarak tegak lurus terpendek dari sebuah titik ke segmen garis."""
     px, py = point
     ax, ay = seg_a
     bx, by = seg_b
@@ -99,11 +97,9 @@ def point_to_segment_distance(
     dx, dy = bx - ax, by - ay
     len_sq = dx * dx + dy * dy
 
-    # Jika gate adalah titik (panjang = 0), return jarak ke titik itu
     if len_sq == 0:
         return measure_distance(point, seg_a)
 
-    # Hitung parameter proyeksi (t=0 di titik A, t=1 di titik B)
     t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / len_sq))
     proj_x = ax + t * dx
     proj_y = ay + t * dy
@@ -115,30 +111,57 @@ def extract_ball_trajectory(
     tracks       : Dict,
     frame_start  : int,
     frame_end    : int,
-    buffer_frames: int = 0       # <-- Default 0 untuk evaluasi akurat
+    buffer_frames: int = 0,
+    buffer_before: Optional[int] = None,
+    buffer_after : Optional[int] = None,
+    use_ground_level: bool = True
 ) -> List[Tuple[int, int]]:
     """
-    Ambil semua titik tengah bola dari frame_start hingga frame_end.
-    PENTING: buffer_frames default 0 untuk evaluasi pass agar tidak
-    terjadi kontaminasi trajectory antar pass yang berdekatan.
-    Gunakan buffer_frames > 0 hanya untuk visualisasi trajectory.
+    Ambil titik-titik posisi bola dari frame_start hingga frame_end.
+
+    PERBAIKAN v2.3:
+    1. Asymmetric buffer: buffer_before dan buffer_after independen.
+       - buffer_before=0: mencegah kontaminasi dari pass sebelumnya
+       - buffer_after=8:  capture bola yang masih menggelinding ke cone
+       - Jika buffer_before/buffer_after tidak diset, fallback ke buffer_frames
+         (backward-compatible)
+
+    2. use_ground_level=True: gunakan get_center_of_bbox_bottom untuk
+       posisi bola (titik tengah-bawah bbox). Ini lebih akurat karena
+       bola menggelinding di tanah, sehingga jarak ke cone (yang juga
+       diukur di ground level via get_center_of_bbox_bottom) menjadi
+       konsisten.
+
     Args:
-        tracks       : dict hasil tracker
-        frame_start  : frame awal event passing
-        frame_end    : frame akhir event passing
-        buffer_frames: frame tambahan sebelum/sesudah (default 0)
+        tracks          : dict hasil tracker
+        frame_start     : frame awal event passing
+        frame_end       : frame akhir event passing
+        buffer_frames   : frame tambahan simetris (backward-compatible)
+        buffer_before   : frame tambahan SEBELUM frame_start (None = pakai buffer_frames)
+        buffer_after    : frame tambahan SETELAH frame_end (None = pakai buffer_frames)
+        use_ground_level: True = bottom-center, False = center (legacy)
+
     Returns:
-        List of (x, y) koordinat titik tengah bola per frame
+        List of (x, y) koordinat posisi bola per frame
     """
+    # Resolve buffer values
+    buf_before = buffer_before if buffer_before is not None else buffer_frames
+    buf_after  = buffer_after  if buffer_after  is not None else buffer_frames
+
     trajectory   = []
     total_frames = len(tracks['ball'])
-    start = max(0, frame_start - buffer_frames)
-    end   = min(total_frames - 1, frame_end + buffer_frames)
+    start = max(0, frame_start - buf_before)
+    end   = min(total_frames - 1, frame_end + buf_after)
+
+    # Pilih fungsi posisi berdasarkan use_ground_level
+    pos_fn = get_center_of_bbox_bottom if use_ground_level else get_center_of_bbox
+
     for f in range(start, end + 1):
         ball_data = tracks['ball'][f].get(1)
         if ball_data and 'bbox' in ball_data:
-            cx, cy = get_center_of_bbox(ball_data['bbox'])
+            cx, cy = pos_fn(ball_data['bbox'])
             trajectory.append((cx, cy))
+
     return trajectory
 
 
@@ -149,15 +172,8 @@ def stabilize_cone_positions(
 ) -> Dict[int, Tuple[float, float]]:
     """
     Hitung posisi rata-rata (stabilized) semua cone dari N frame pertama.
-    Karena kamera statis, posisi cone tidak berubah - ini menghilangkan flickering.
-
-    Args:
-        tracks       : dict hasil tracker
-        cone_key     : key untuk data cone di tracks
-        sample_frames: jumlah frame awal yang diambil untuk averaging
-
-    Returns:
-        Dict {cone_id: (x_avg, y_avg)} - posisi stabil setiap cone
+    Menggunakan get_center_of_bbox_bottom (ground level) untuk konsistensi
+    dengan ball trajectory.
     """
     cone_positions_raw: Dict[int, List[Tuple[float, float]]] = {}
 
@@ -169,13 +185,11 @@ def stabilize_cone_positions(
             bbox = cone_data.get('bbox', None)
             if bbox is None:
                 continue
-            # Gunakan titik bawah tengah cone sebagai referensi posisi
             cx, cy = get_center_of_bbox_bottom(bbox)
             if cone_id not in cone_positions_raw:
                 cone_positions_raw[cone_id] = []
             cone_positions_raw[cone_id].append((cx, cy))
 
-    # Rata-ratakan posisi per cone
     stabilized: Dict[int, Tuple[float, float]] = {}
     for cone_id, positions in cone_positions_raw.items():
         xs = [p[0] for p in positions]
@@ -191,30 +205,13 @@ def identify_gate_cones(
     manual_cone_ids: Optional[Tuple[int, int]] = None,
     expected_gate_width_range: Tuple[float, float] = (60.0, 300.0)
 ) -> Optional[Tuple[Tuple[float, float], Tuple[float, float]]]:
-    """
-    Identifikasi 2 cone yang membentuk gawang dari semua cone yang terdeteksi.
-
-    STRATEGI (prioritas berurutan):
-    1. Manual cone IDs  - langsung gunakan ID yang ditentukan (PALING AKURAT)
-    2. Gate hint        - cari 2 cone terdekat ke titik perkiraan gate
-    3. Auto isolation   - cari pasangan cone paling terisolasi dalam range lebar valid
-
-    Args:
-        stabilized_cones        : output dari stabilize_cone_positions()
-        gate_hint               : perkiraan 2 titik gate ((x1,y1),(x2,y2)) atau None
-        manual_cone_ids         : tuple 2 cone ID jika sudah diketahui, atau None
-        expected_gate_width_range: (min_px, max_px) lebar gate yang valid
-
-    Returns:
-        Tuple (pos_cone_kiri, pos_cone_kanan) diurutkan kiri->kanan, atau None
-    """
+    """Identifikasi 2 cone yang membentuk gawang. (TIDAK BERUBAH)"""
     if not stabilized_cones or len(stabilized_cones) < 2:
         return None
 
     cone_ids = list(stabilized_cones.keys())
     cone_positions = list(stabilized_cones.values())
 
-    # --- STRATEGI 1: Manual ID override ---
     if manual_cone_ids is not None:
         id_a, id_b = manual_cone_ids
         if id_a in stabilized_cones and id_b in stabilized_cones:
@@ -228,7 +225,6 @@ def identify_gate_cones(
         else:
             print(f"[GATE] WARNING: Manual cone ID {id_a} atau {id_b} tidak ditemukan!")
 
-    # --- STRATEGI 2: Gate hint (titik perkiraan lokasi gate) ---
     if gate_hint is not None:
         hint_center_x = (gate_hint[0][0] + gate_hint[1][0]) / 2
         hint_center_y = (gate_hint[0][1] + gate_hint[1][1]) / 2
@@ -247,14 +243,15 @@ def identify_gate_cones(
             min_w, max_w = expected_gate_width_range
 
             if min_w <= gate_width <= max_w:
-                print(f"[GATE] Terdeteksi via hint: ID {c1_id} & {c2_id}, lebar={gate_width:.1f}px")
+                print(f"[GATE] Terdeteksi via hint: ID {c1_id} & {c2_id}, "
+                      f"lebar={gate_width:.1f}px")
                 if c1_pos[0] < c2_pos[0]:
                     return c1_pos, c2_pos
                 return c2_pos, c1_pos
             else:
-                print(f"[GATE] WARNING: 2 cone terdekat hint lebar tidak valid: {gate_width:.1f}px")
+                print(f"[GATE] WARNING: 2 cone terdekat hint lebar tidak valid: "
+                      f"{gate_width:.1f}px")
 
-    # --- STRATEGI 3: Otomatis berbasis isolasi ---
     best_pair = None
     best_isolation_score = -1
     min_w, max_w = expected_gate_width_range
@@ -287,7 +284,8 @@ def identify_gate_cones(
 
     if best_pair:
         pos_a, pos_b = best_pair
-        print(f"[GATE] Terdeteksi via isolasi otomatis, isolation_score={best_isolation_score:.1f}px")
+        print(f"[GATE] Terdeteksi via isolasi otomatis, "
+              f"isolation_score={best_isolation_score:.1f}px")
         if pos_a[0] < pos_b[0]:
             return pos_a, pos_b
         return pos_b, pos_a
@@ -303,30 +301,10 @@ def check_ball_passed_through_gate(
     proximity_threshold: float = 40.0,
     min_trajectory_points: int = 3
 ) -> Tuple[bool, str]:
-    """
-    Cek apakah trajectory bola melewati celah di antara dua cone gate.
-
-    METODE A - Intersection Check:
-        Cek setiap segmen berurutan di trajectory apakah memotong garis gate.
-        Ini adalah metode utama yang paling akurat.
-
-    METODE B - Proximity Fallback:
-        Cek apakah titik bola pernah sangat dekat dengan garis gate DAN
-        berada di zona gate (antara kedua cone). Berguna saat trajectory
-        tidak lengkap akibat missed detection.
-
-    Args:
-        ball_trajectory       : list (x,y) dari extract_ball_trajectory()
-        gate_cone_left        : posisi (x,y) cone kiri gate
-        gate_cone_right       : posisi (x,y) cone kanan gate
-        proximity_threshold   : jarak maks bola ke garis gate untuk Metode B (pixel)
-        min_trajectory_points : minimum titik trajectory agar pengecekan valid
-
-    Returns:
-        (passed: bool, reason: str)
-    """
+    """Cek apakah trajectory bola melewati celah di antara dua cone gate. (TIDAK BERUBAH)"""
     if len(ball_trajectory) < min_trajectory_points:
-        return False, f"Trajectory terlalu pendek ({len(ball_trajectory)} titik, min={min_trajectory_points})"
+        return False, (f"Trajectory terlalu pendek ({len(ball_trajectory)} titik, "
+                       f"min={min_trajectory_points})")
 
     gate_left = gate_cone_left
     gate_right = gate_cone_right
@@ -336,13 +314,11 @@ def check_ball_passed_through_gate(
     gate_min_y = min(gate_left[1], gate_right[1])
     gate_max_y = max(gate_left[1], gate_right[1])
 
-    # --- METODE A: Segment Intersection ---
     for i in range(len(ball_trajectory) - 1):
         p1 = ball_trajectory[i]
         p2 = ball_trajectory[i + 1]
 
         if segments_intersect(p1, p2, gate_left, gate_right):
-            # Verifikasi: titik perpotongan harus berada dalam batas gate
             mid_x = (p1[0] + p2[0]) / 2
             mid_y = (p1[1] + p2[1]) / 2
 
@@ -355,7 +331,6 @@ def check_ball_passed_through_gate(
             if in_x_range or in_y_range:
                 return True, f"Metode A: Intersection di segmen trajectory ke-{i}"
 
-    # --- METODE B: Proximity Fallback ---
     for i, point in enumerate(ball_trajectory):
         dist = point_to_segment_distance(point, gate_left, gate_right)
 
@@ -366,7 +341,8 @@ def check_ball_passed_through_gate(
                 (gate_min_y - 10 <= py <= gate_max_y + 10)
             )
             if in_gate_zone:
-                return True, f"Metode B: Proximity {dist:.1f}px di titik trajectory ke-{i}"
+                return True, (f"Metode B: Proximity {dist:.1f}px di titik "
+                              f"trajectory ke-{i}")
 
     return False, "Bola tidak melewati gate"
 
@@ -374,10 +350,7 @@ def check_ball_passed_through_gate(
 def interpolate_ball_positions(
     ball_positions: List[Dict[int, Dict[str, Any]]]
 ) -> List[Dict[int, Dict[str, Any]]]:
-    """
-    Interpolasi posisi bola untuk mengisi frame di mana bola tidak terdeteksi.
-    Menggunakan pandas interpolate() untuk smooth filling.
-    """
+    """Interpolasi posisi bola untuk mengisi frame tanpa deteksi. (TIDAK BERUBAH)"""
     if not ball_positions:
         return ball_positions
 
@@ -408,29 +381,16 @@ def interpolate_ball_positions(
         }})
     return out
 
+
 def identify_target_cone(
     stabilized_cones     : Dict[int, Tuple[float, float]],
     manual_target_cone_id: Optional[int] = None,
-    selection_mode       : str = "highest"  # "highest" = Y terkecil = paling atas
+    selection_mode       : str = "highest"
 ) -> Optional[Tuple[int, Tuple[float, float]]]:
-    """
-    Identifikasi satu cone target dari semua cone yang terdeteksi.
-    STRATEGI (prioritas berurutan):
-    1. Manual ID  - langsung gunakan cone ID yang ditentukan (PALING AKURAT)
-    2. Auto       - pilih cone berdasarkan selection_mode:
-                    "highest" = cone dengan Y terkecil (paling atas di layar)
-                    "lowest"  = cone dengan Y terbesar (paling bawah)
-                    "leftmost"= cone dengan X terkecil (paling kiri)
-    Args:
-        stabilized_cones     : output dari stabilize_cone_positions()
-        manual_target_cone_id: cone ID jika sudah diketahui, atau None
-        selection_mode       : metode auto-selection jika manual tidak diset
-    Returns:
-        (cone_id, (x, y)) atau None jika gagal
-    """
+    """Identifikasi satu cone target. (TIDAK BERUBAH)"""
     if not stabilized_cones:
         return None
-    # --- STRATEGI 1: Manual ID ---
+
     if manual_target_cone_id is not None:
         if manual_target_cone_id in stabilized_cones:
             pos = stabilized_cones[manual_target_cone_id]
@@ -440,47 +400,36 @@ def identify_target_cone(
         else:
             print(f"[TARGET] WARNING: Manual cone ID {manual_target_cone_id} "
                   f"tidak ditemukan!")
-    # --- STRATEGI 2: Auto berdasarkan selection_mode ---
+
     if selection_mode == "highest":
-        # Y terkecil = paling atas di layar (koordinat image)
-        best_id  = min(stabilized_cones, key=lambda k: stabilized_cones[k][1])
+        best_id = min(stabilized_cones, key=lambda k: stabilized_cones[k][1])
     elif selection_mode == "lowest":
-        best_id  = max(stabilized_cones, key=lambda k: stabilized_cones[k][1])
+        best_id = max(stabilized_cones, key=lambda k: stabilized_cones[k][1])
     elif selection_mode == "leftmost":
-        best_id  = min(stabilized_cones, key=lambda k: stabilized_cones[k][0])
+        best_id = min(stabilized_cones, key=lambda k: stabilized_cones[k][0])
     elif selection_mode == "rightmost":
-        best_id  = max(stabilized_cones, key=lambda k: stabilized_cones[k][0])
+        best_id = max(stabilized_cones, key=lambda k: stabilized_cones[k][0])
     else:
         print(f"[TARGET] WARNING: selection_mode '{selection_mode}' tidak dikenal!")
         return None
+
     pos = stabilized_cones[best_id]
     print(f"[TARGET] Auto-select cone ID {best_id} via mode='{selection_mode}'")
     print(f"[TARGET] Posisi target: ({pos[0]:.1f}, {pos[1]:.1f})")
     return best_id, pos
+
+
 def check_ball_reached_target_cone(
     ball_trajectory  : List[Tuple[int, int]],
     target_cone_pos  : Tuple[float, float],
     proximity_radius : float = 120.0,
     min_points       : int = 3
 ) -> Tuple[bool, str]:
-    """
-    Cek apakah trajectory bola mendekati cone target dalam radius tertentu.
-    Berbeda dari gate intersection, di sini kita cek apakah
-    ADA TITIK MANAPUN dalam trajectory yang jaraknya <= proximity_radius
-    dari posisi cone target.
-    Juga menghitung 'closest approach distance' untuk debugging.
-    Args:
-        ball_trajectory : list (x, y) dari extract_ball_trajectory()
-        target_cone_pos : posisi (x, y) cone target
-        proximity_radius: radius keberhasilan dalam pixel
-        min_points      : minimum titik trajectory agar valid
-    Returns:
-        (reached: bool, reason: str)
-    """
+    """Cek apakah trajectory bola mendekati cone target. (TIDAK BERUBAH)"""
     if len(ball_trajectory) < min_points:
         return False, (f"Trajectory terlalu pendek "
                        f"({len(ball_trajectory)} titik, min={min_points})")
-    # Cari jarak terdekat bola ke target cone sepanjang trajectory
+
     min_distance = float('inf')
     min_idx      = -1
     for i, point in enumerate(ball_trajectory):
@@ -488,6 +437,7 @@ def check_ball_reached_target_cone(
         if dist < min_distance:
             min_distance = dist
             min_idx      = i
+
     if min_distance <= proximity_radius:
         return True, (f"Bola mendekati target: jarak minimum "
                       f"{min_distance:.1f}px di titik ke-{min_idx} "
