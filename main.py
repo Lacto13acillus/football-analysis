@@ -62,7 +62,7 @@ CONFIG = {
 
     # --- Front cones (untuk Unknown) ---
     "front_cone_ids"         : [0, 1, 2],
-    "front_cone_radius"      : 150,
+    "front_cone_radius"      : 125,
 
     # --- Possession ---
     "max_possession_distance": 130,
@@ -442,7 +442,7 @@ def main():
     pass_detector.target_selection_mode   = CONFIG.get("target_selection_mode", "highest")
     pass_detector.target_proximity_radius = CONFIG.get("target_proximity_radius", 100.0)
     pass_detector.front_cone_ids          = CONFIG.get("front_cone_ids", [0, 1, 2])
-    pass_detector.front_cone_radius       = CONFIG.get("front_cone_radius", 150.0)
+    pass_detector.front_cone_radius       = CONFIG.get("front_cone_radius", 125.0)
 
     target_ok = pass_detector.initialize_target_cone(
         tracks, cone_key='cones', sample_frames=30, debug=True
