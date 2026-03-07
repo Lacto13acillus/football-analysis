@@ -519,3 +519,69 @@ def draw_target_cone_on_frame(
                 cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1)
 
     return output
+
+# Tambahkan di AKHIR draw_gate.py (setelah draw_target_cone_on_frame)
+
+def draw_front_cones_on_frame(
+    frame           : np.ndarray,
+    front_cones     : dict,
+    proximity_radius: float = 65.0,
+    is_active       : bool  = False,
+    color_normal    : Tuple[int, int, int] = (255, 180, 0),   # Biru-cyan
+    color_active    : Tuple[int, int, int] = (0, 255, 80),    # Hijau
+    alpha           : float = 0.18
+) -> np.ndarray:
+    """
+    Gambar visualisasi 3 front cones dan radius keberhasilan.
+
+    Args:
+        frame           : frame video BGR
+        front_cones     : dict {cone_id: (x, y)} posisi cone
+        proximity_radius: radius keberhasilan dalam pixel
+        is_active       : True jika bola sedang mendekati front cone
+        color_normal    : warna normal
+        color_active    : warna aktif
+        alpha           : transparansi
+
+    Returns:
+        Frame dengan visualisasi front cones
+    """
+    output = frame.copy()
+    color  = color_active if is_active else color_normal
+
+    for cid, pos in front_cones.items():
+        cx, cy = int(pos[0]), int(pos[1])
+        radius = int(proximity_radius)
+
+        # Lingkaran radius (semi-transparan)
+        overlay = output.copy()
+        cv2.circle(overlay, (cx, cy), radius, color, -1)
+        cv2.addWeighted(overlay, alpha, output, 1 - alpha, 0, output)
+
+        # Border
+        cv2.circle(output, (cx, cy), radius, color, 1)
+
+        # Crosshair kecil
+        line_len = 10
+        cv2.line(output, (cx - line_len, cy), (cx + line_len, cy), color, 1)
+        cv2.line(output, (cx, cy - line_len), (cx, cy + line_len), color, 1)
+
+        # Titik pusat
+        cv2.circle(output, (cx, cy), 6, color,          -1)
+        cv2.circle(output, (cx, cy), 8, (255, 255, 255),  1)
+
+        # Label cone ID
+        label = f"C{cid}"
+        (lw, lh), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
+        lx = cx - lw // 2
+        ly = cy - radius - 8
+        cv2.rectangle(output,
+                      (lx - 2, ly - lh - 2),
+                      (lx + lw + 2, ly + 2),
+                      color, -1)
+        cv2.putText(output, label,
+                    (lx, ly),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)
+
+    return output
+

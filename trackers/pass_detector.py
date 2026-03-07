@@ -1,20 +1,12 @@
 # pass_detector.py
-# Mendeteksi event passing dan mengevaluasi apakah bola mencapai cone target.
+# Mendeteksi event passing dan mengevaluasi akurasi ke cone target.
 #
-# LOGIKA SUKSES:
-#   Pass SUKSES = trajectory bola mendekati cone TARGET (cone paling atas)
-#   dalam radius yang ditentukan.
-#
-# FILTER PEMAIN:
-#   Hanya player dengan jersey #3 dan #19 yang diproses SEBAGAI PENGIRIM.
-#   Player Unknown BOLEH menjadi PENERIMA passing.
-#
-# PERUBAHAN v2.5:
-#   - FIX: _get_player_position_for_pass() fallback ke semua track ID
-#     yang di-map ke jersey yang sama (mengatasi normalisasi canonical)
-#   - smoothing_window: 5
-#   - eval_buffer_after: 15
-#   - fill_short_gaps max_gap: 20
+# PERUBAHAN v2.6:
+#   - Unknown BOLEH menjadi PENGIRIM (sebelumnya hanya penerima)
+#   - Evaluasi akurasi Unknown: bola harus mendekati SALAH SATU dari
+#     3 cone depan (cone 0, 1, 2) dengan radius lebih kecil
+#   - Evaluasi akurasi #3/#19: tetap ke cone target (cone 3) radius 100px
+#   - Unknown -> Unknown (track berbeda) = SKIP (bukan pass antar pemain)
 
 import sys
 sys.path.append('../')
@@ -35,12 +27,6 @@ from typing import Dict, List, Any, Optional, Tuple
 
 class PassDetector:
     def __init__(self, fps: int = 24):
-        """
-        Inisialisasi parameter pass detector.
-
-        Args:
-            fps: frame per second video
-        """
         self.fps = fps
 
         # --- Parameter smoothing possession ---
@@ -62,24 +48,34 @@ class PassDetector:
         self.pass_display_delay    = 3
         self.min_display_gap       = 3
 
-        # --- Filter pemain yang diproses ---
-        self.allowed_jerseys = {"#3", "#19"}
+        # --- Filter pemain ---
+        # v2.6: Tidak lagi memfilter pengirim. Semua pemain bisa jadi pengirim.
+        # Unknown -> Unknown tetap di-skip.
+        self.known_jerseys = {"#3", "#19"}
 
-        # --- Parameter buffer trajectory untuk evaluasi ---
+        # --- Parameter buffer trajectory ---
         self.eval_buffer_before = 0
         self.eval_buffer_after  = 15
 
         # ============================================================
-        # KONFIGURASI TARGET CONE
+        # KONFIGURASI TARGET CONE (untuk #3 dan #19)
         # ============================================================
-        self.manual_target_cone_id : Optional[int] = None
-        self.target_selection_mode : str = "highest"
-        self.target_proximity_radius : float = 80
+        self.manual_target_cone_id   : Optional[int] = None
+        self.target_selection_mode   : str = "highest"
+        self.target_proximity_radius : float = 100.0
+
+        # ============================================================
+        # KONFIGURASI FRONT CONES (untuk Unknown)
+        # 3 cone di depan Unknown player, radius lebih kecil
+        # ============================================================
+        self.front_cone_ids          : List[int] = [0, 1, 2]
+        self.front_cone_radius       : float = 65.0
 
         # Cache
-        self._target_cone_id  : Optional[int] = None
-        self._target_cone_pos : Optional[Tuple[float, float]] = None
-        self._stabilized_cones: Optional[Dict] = None
+        self._target_cone_id   : Optional[int] = None
+        self._target_cone_pos  : Optional[Tuple[float, float]] = None
+        self._stabilized_cones : Optional[Dict] = None
+        self._front_cone_positions : Dict[int, Tuple[float, float]] = {}
         self._player_identifier = None
 
     # ============================================================
@@ -87,30 +83,31 @@ class PassDetector:
     # ============================================================
 
     def set_jersey_map(self, player_identifier) -> None:
-        """Simpan referensi ke PlayerIdentifier."""
         self._player_identifier = player_identifier
 
     def _get_jersey(self, player_id: int) -> str:
-        """Dapatkan nomor jersey dari player ID."""
         if self._player_identifier:
             return self._player_identifier.get_jersey_number_for_player(player_id)
         return str(player_id)
 
     def get_target_cone(self) -> Optional[Tuple[int, Tuple[float, float]]]:
-        """
-        Kembalikan (cone_id, posisi) target cone yang sudah diidentifikasi.
-        Digunakan oleh main.py untuk visualisasi.
-        """
         if self._target_cone_id is None or self._target_cone_pos is None:
             return None
         return self._target_cone_id, self._target_cone_pos
 
     def get_all_cones(self) -> Optional[Dict[int, Tuple[float, float]]]:
-        """Kembalikan semua posisi cone yang sudah distabilisasi."""
         return self._stabilized_cones
 
+    def get_front_cones(self) -> Dict[int, Tuple[float, float]]:
+        """Kembalikan posisi 3 cone depan untuk visualisasi."""
+        return dict(self._front_cone_positions)
+
+    def get_front_cone_radius(self) -> float:
+        """Kembalikan radius front cone untuk visualisasi."""
+        return self.front_cone_radius
+
     # ============================================================
-    # INISIALISASI TARGET CONE
+    # INISIALISASI TARGET CONE + FRONT CONES
     # ============================================================
 
     def initialize_target_cone(
@@ -120,10 +117,6 @@ class PassDetector:
         sample_frames: int = 30,
         debug        : bool = True
     ) -> bool:
-        """
-        Inisialisasi posisi target cone dari data tracks.
-        Harus dipanggil SEBELUM detect_passes().
-        """
         if cone_key not in tracks or not tracks[cone_key]:
             print(f"[TARGET] WARNING: Key '{cone_key}' tidak ada di tracks!")
             return False
@@ -133,9 +126,7 @@ class PassDetector:
             print(f"[TARGET] Stabilisasi posisi cone dari {sample_frames} frame...")
 
         self._stabilized_cones = stabilize_cone_positions(
-            tracks,
-            cone_key      = cone_key,
-            sample_frames = sample_frames
+            tracks, cone_key=cone_key, sample_frames=sample_frames
         )
 
         if debug:
@@ -151,6 +142,7 @@ class PassDetector:
             print("[TARGET] GAGAL: Tidak ada cone terdeteksi!")
             return False
 
+        # --- Target cone (untuk #3/#19) ---
         result = identify_target_cone(
             stabilized_cones      = self._stabilized_cones,
             manual_target_cone_id = self.manual_target_cone_id,
@@ -169,12 +161,27 @@ class PassDetector:
             print(f"[TARGET]   Posisi       : ({self._target_cone_pos[0]:.1f}, "
                   f"{self._target_cone_pos[1]:.1f})")
             print(f"[TARGET]   Radius sukses: {self.target_proximity_radius:.0f} px")
+
+        # --- Front cones (untuk Unknown) ---
+        self._front_cone_positions = {}
+        for cid in self.front_cone_ids:
+            if cid in self._stabilized_cones:
+                self._front_cone_positions[cid] = self._stabilized_cones[cid]
+
+        if debug:
+            print(f"\n[TARGET] Front cones (untuk Unknown):")
+            print(f"[TARGET]   Cone IDs     : {self.front_cone_ids}")
+            print(f"[TARGET]   Radius sukses: {self.front_cone_radius:.0f} px")
+            for cid, pos in sorted(self._front_cone_positions.items()):
+                print(f"[TARGET]   Cone {cid} -> ({pos[0]:.1f}, {pos[1]:.1f})")
+            if not self._front_cone_positions:
+                print(f"[TARGET]   WARNING: Tidak ada front cone ditemukan!")
             print(f"[TARGET] ========================================\n")
 
         return True
 
     # ============================================================
-    # EVALUASI PASS KE TARGET CONE
+    # EVALUASI PASS KE TARGET CONE (#3/#19)
     # ============================================================
 
     def evaluate_pass_to_target(
@@ -183,20 +190,14 @@ class PassDetector:
         pass_event: Dict,
         debug     : bool = False
     ) -> Tuple[bool, str]:
-        """
-        Evaluasi apakah bola mendekati cone target selama pass event.
-        """
         if self._target_cone_pos is None:
             return True, "Target cone tidak diinisialisasi - semua pass = SUKSES"
 
         frame_start = pass_event['frame_start']
         frame_end   = pass_event['frame_end']
 
-        # Asymmetric buffer
         trajectory = extract_ball_trajectory(
-            tracks,
-            frame_start,
-            frame_end,
+            tracks, frame_start, frame_end,
             buffer_before=self.eval_buffer_before,
             buffer_after=self.eval_buffer_after
         )
@@ -219,13 +220,90 @@ class PassDetector:
         return reached, reason
 
     # ============================================================
+    # EVALUASI PASS KE FRONT CONES (Unknown)
+    # ============================================================
+
+    def evaluate_pass_to_front_cones(
+        self,
+        tracks    : Dict,
+        pass_event: Dict,
+        debug     : bool = False
+    ) -> Tuple[bool, str, Optional[int], float]:
+        """
+        Evaluasi apakah bola mendekati SALAH SATU dari 3 cone depan.
+
+        Returns:
+            (reached, reason, closest_cone_id, closest_dist)
+            - reached       : True jika bola mendekati minimal 1 cone
+            - reason        : penjelasan teks
+            - closest_cone_id: ID cone terdekat (untuk display)
+            - closest_dist  : jarak minimum ke cone terdekat
+        """
+        if not self._front_cone_positions:
+            return True, "Front cones tidak diinisialisasi", None, 0.0
+
+        frame_start = pass_event['frame_start']
+        frame_end   = pass_event['frame_end']
+
+        trajectory = extract_ball_trajectory(
+            tracks, frame_start, frame_end,
+            buffer_before=self.eval_buffer_before,
+            buffer_after=self.eval_buffer_after
+        )
+
+        if debug:
+            print(f"[FRONT] Evaluasi pass frame {frame_start}-{frame_end}: "
+                  f"{len(trajectory)} titik trajectory "
+                  f"(buffer: -{self.eval_buffer_before}/+{self.eval_buffer_after})")
+
+        # Cek setiap front cone — SUKSES jika bola mendekati SALAH SATU
+        overall_closest_dist = float('inf')
+        overall_closest_cone = None
+        best_reached = False
+        best_reason  = ""
+
+        for cid, cone_pos in self._front_cone_positions.items():
+            reached, reason = check_ball_reached_target_cone(
+                ball_trajectory  = trajectory,
+                target_cone_pos  = cone_pos,
+                proximity_radius = self.front_cone_radius
+            )
+
+            # Hitung closest distance ke cone ini
+            if trajectory:
+                min_dist = min(measure_distance(pt, cone_pos) for pt in trajectory)
+            else:
+                min_dist = float('inf')
+
+            if min_dist < overall_closest_dist:
+                overall_closest_dist = min_dist
+                overall_closest_cone = cid
+
+            if reached and not best_reached:
+                best_reached = True
+                best_reason  = f"Cone {cid}: {reason}"
+
+            if debug:
+                status = "SUKSES" if reached else "GAGAL"
+                print(f"[FRONT]   Cone {cid} ({cone_pos[0]:.0f},{cone_pos[1]:.0f}): "
+                      f"{status} | closest={min_dist:.1f}px | {reason}")
+
+        if not best_reached:
+            best_reason = (f"Bola tidak mencapai cone depan manapun: "
+                          f"closest={overall_closest_dist:.1f}px ke cone {overall_closest_cone} "
+                          f"(radius={self.front_cone_radius:.0f}px)")
+
+        if debug:
+            status = "SUKSES" if best_reached else "GAGAL"
+            print(f"[FRONT]   Hasil akhir: {status}")
+
+        return best_reached, best_reason, overall_closest_cone, overall_closest_dist
+
+    # ============================================================
     # SMOOTHING & PREPROCESSING POSSESSION
     # ============================================================
 
     def smooth_possessions(self, raw_possessions: List[int]) -> List[int]:
-        """
-        Haluskan possession dengan sliding window majority vote.
-        """
         smoothed    = list(raw_possessions)
         half_window = self.smoothing_window // 2
 
@@ -244,9 +322,6 @@ class PassDetector:
         possessions: List[int],
         max_gap    : int = 20
     ) -> List[int]:
-        """
-        Isi gap pendek (-1) di antara possession yang sama.
-        """
         filled     = list(possessions)
         last_valid = -1
         gap_start  = -1
@@ -270,14 +345,6 @@ class PassDetector:
         self,
         possessions: List[int]
     ) -> List[int]:
-        """
-        Normalisasi possession berdasarkan jersey number.
-        Mencegah ByteTrack ID switching menyebabkan false pass.
-
-        Skip normalisasi untuk jersey "Unknown" agar track ID tetap
-        unik — memungkinkan deteksi pass antara dua pemain Unknown
-        yang berbeda.
-        """
         if not self._player_identifier:
             return possessions
 
@@ -302,10 +369,6 @@ class PassDetector:
         self,
         smoothed_possessions: List[int]
     ) -> List[Dict]:
-        """
-        Pecah possession menjadi segmen-segmen stabil.
-        Satu segmen = satu pemain menguasai bola secara konsisten.
-        """
         segments       = []
         current_player = -1
         segment_start  = 0
@@ -344,7 +407,6 @@ class PassDetector:
         frame_start: int,
         frame_end  : int
     ) -> float:
-        """Validasi bola benar-benar bergerak selama transisi possession."""
         check_start = max(0, frame_start - self.ball_movement_check_radius)
         check_end   = min(len(tracks['ball']),
                           frame_end + self.ball_movement_check_radius)
@@ -372,7 +434,6 @@ class PassDetector:
         target_frame : int,
         search_radius: Optional[int] = None
     ) -> Tuple[Optional[Dict], int]:
-        """Cari data pemain di frame target, fallback ke frame terdekat."""
         if search_radius is None:
             search_radius = self.player_search_radius
 
@@ -403,29 +464,14 @@ class PassDetector:
         frame_target: int,
         segment     : Dict
     ) -> Optional[Tuple[int, int]]:
-        """
-        Dapatkan posisi pemain untuk pass event dengan multiple fallback.
-
-        PERBAIKAN v2.5:
-        Setelah normalisasi jersey, possession di-map ke track ID canonical
-        (misal track 2 untuk #19). Tapi di frame tertentu, yang aktif
-        mungkin track ID lain (misal track 5 yang juga #19).
-
-        Fallback chain:
-        1. Cari track_id asli di frame target ± search_radius
-        2. Cari track_id asli di seluruh segmen
-        3. (BARU) Cari SEMUA track ID yang di-map ke jersey yang sama
-           di frame target ± search_radius
-        4. (BARU) Cari SEMUA track ID jersey sama di seluruh segmen
-        """
-        # === Fallback 1: Track ID asli di frame target ± radius ===
+        # Fallback 1: Track ID asli di frame target ± radius
         player_data, found_frame = self.find_player_nearby(
             tracks, player_id, frame_target
         )
         if player_data:
             return get_center_of_bbox_bottom(player_data['bbox'])
 
-        # === Fallback 2: Track ID asli di seluruh segmen ===
+        # Fallback 2: Track ID asli di seluruh segmen
         seg_start = segment['frame_start']
         seg_end   = segment['frame_end']
         for f in range(seg_start, min(seg_end + 1, len(tracks['players']))):
@@ -433,29 +479,25 @@ class PassDetector:
             if player_data:
                 return get_center_of_bbox_bottom(player_data['bbox'])
 
-        # === Fallback 3 (BARU): Track ID lain dengan jersey sama ===
-        # Ini mengatasi kasus di mana normalisasi canonical menggunakan
-        # track ID yang sudah tidak aktif (misal track 2 untuk #19),
-        # padahal yang aktif di frame ini adalah track 5 (juga #19).
+        # Fallback 3: Track ID lain dengan jersey sama
         if self._player_identifier:
             jersey = self._get_jersey(player_id)
             if jersey != "Unknown" and not jersey.startswith("ID:"):
                 all_track_ids = self._player_identifier.get_all_track_ids_for_jersey(jersey)
 
-                # Cari di frame target ± search_radius
                 for alt_tid in all_track_ids:
                     if alt_tid == player_id:
-                        continue  # Sudah dicoba di Fallback 1
+                        continue
                     alt_data, alt_frame = self.find_player_nearby(
                         tracks, alt_tid, frame_target
                     )
                     if alt_data:
                         return get_center_of_bbox_bottom(alt_data['bbox'])
 
-                # === Fallback 4 (BARU): Track ID jersey sama di seluruh segmen ===
+                # Fallback 4: Track ID jersey sama di seluruh segmen
                 for alt_tid in all_track_ids:
                     if alt_tid == player_id:
-                        continue  # Sudah dicoba di Fallback 2
+                        continue
                     for f in range(seg_start, min(seg_end + 1, len(tracks['players']))):
                         alt_data = tracks['players'][f].get(alt_tid)
                         if alt_data:
@@ -471,11 +513,13 @@ class PassDetector:
         debug            : bool = True
     ) -> List[Dict]:
         """
-        Deteksi semua event passing dan evaluasi ke target cone.
+        Deteksi semua event passing dan evaluasi akurasi.
 
-        FILTER:
-        - Hanya from_jersey yang difilter (pengirim).
-          Unknown BOLEH menjadi penerima.
+        v2.6 PERUBAHAN:
+        - Semua pemain bisa jadi pengirim (termasuk Unknown)
+        - Unknown -> Unknown = SKIP
+        - Unknown pass: evaluasi ke 3 front cones (radius kecil)
+        - #3/#19 pass: evaluasi ke target cone (radius 100px)
         """
         if player_identifier:
             self._player_identifier = player_identifier
@@ -483,19 +527,22 @@ class PassDetector:
         if debug:
             valid_count    = sum(1 for p in ball_possessions if p != -1)
             unique_players = set(p for p in ball_possessions if p != -1)
-            print(f"\n[PASS] === PASS DETECTION PIPELINE ===")
+            print(f"\n[PASS] === PASS DETECTION PIPELINE v2.6 ===")
             print(f"[PASS] Total frames            : {len(ball_possessions)}")
             print(f"[PASS] Frame dengan possession  : {valid_count}/{len(ball_possessions)}")
             print(f"[PASS] Unique player IDs        : {unique_players}")
-            print(f"[PASS] Filter jersey aktif      : {self.allowed_jerseys}")
+            print(f"[PASS] Semua pemain bisa pengirim (termasuk Unknown)")
             print(f"[PASS] Smoothing window         : {self.smoothing_window} frames")
             print(f"[PASS] Eval buffer              : "
                   f"-{self.eval_buffer_before}/+{self.eval_buffer_after} frames")
             if self._target_cone_pos:
-                print(f"[PASS] Target cone posisi       : "
-                      f"({self._target_cone_pos[0]:.1f}, {self._target_cone_pos[1]:.1f})")
-                print(f"[PASS] Radius sukses            : "
-                      f"{self.target_proximity_radius:.0f} px")
+                print(f"[PASS] Target cone (#3/#19)     : "
+                      f"({self._target_cone_pos[0]:.1f}, {self._target_cone_pos[1]:.1f}) "
+                      f"r={self.target_proximity_radius:.0f}px")
+            if self._front_cone_positions:
+                print(f"[PASS] Front cones (Unknown)    : "
+                      f"{list(self._front_cone_positions.keys())} "
+                      f"r={self.front_cone_radius:.0f}px")
 
         if sum(1 for p in ball_possessions if p != -1) == 0:
             print("[PASS] Tidak ada possession terdeteksi!")
@@ -563,28 +610,21 @@ class PassDetector:
             to_jersey   = self._get_jersey(to_player)
 
             # =========================================================
-            # FILTER: Hanya filter PENGIRIM. Unknown BOLEH jadi PENERIMA.
+            # v2.6: Skip Unknown -> Unknown
+            # Tidak ada pass antar pemain Unknown yang sama atau berbeda
             # =========================================================
-            if from_jersey not in self.allowed_jerseys:
+            if from_jersey == "Unknown" and to_jersey == "Unknown":
                 if debug:
-                    print(f"[PASS] Skip: pengirim {from_jersey} bukan pemain target "
-                          f"(hanya {self.allowed_jerseys})")
+                    print(f"[PASS] Skip: Unknown -> Unknown "
+                          f"(track {from_player} -> {to_player})")
                 continue
 
-            # =========================================================
-            # Skip jersey sama, KECUALI keduanya "Unknown" dengan
-            # track ID berbeda (pemain berbeda)
-            # =========================================================
+            # Skip jersey sama (untuk #3->#3 atau #19->#19)
             if from_jersey == to_jersey:
-                if from_jersey == "Unknown" and from_player != to_player:
-                    if debug:
-                        print(f"[PASS] Unknown berbeda (track {from_player} -> "
-                              f"{to_player}), lanjut proses")
-                else:
-                    if debug:
-                        print(f"[PASS] Skip: jersey sama ({from_jersey}) | "
-                              f"track {from_player} -> {to_player}")
-                    continue
+                if debug:
+                    print(f"[PASS] Skip: jersey sama ({from_jersey}) | "
+                          f"track {from_player} -> {to_player}")
+                continue
 
             # Skip cooldown
             if (transition_frame_end - last_pass_frame) < self.cooldown_frames:
@@ -600,7 +640,7 @@ class PassDetector:
                           f"terlalu singkat ({from_duration} frames)")
                 continue
 
-            # Cari posisi pemain dengan multi-fallback (DIPERBAIKI v2.5)
+            # Cari posisi pemain
             from_pos = self._get_player_position_for_pass(
                 tracks, from_player, transition_frame_start, seg_from
             )
@@ -611,7 +651,7 @@ class PassDetector:
             if not from_pos or not to_pos:
                 if debug:
                     print(f"[PASS] Skip: posisi pemain {from_jersey} atau "
-                          f"{to_jersey} tidak ditemukan sama sekali")
+                          f"{to_jersey} tidak ditemukan")
                 continue
 
             distance = measure_distance(from_pos, to_pos)
@@ -629,29 +669,45 @@ class PassDetector:
                           f"({ball_movement:.1f}px)")
                 continue
 
-            # Evaluasi target cone
+            # =========================================================
+            # v2.6: EVALUASI BERBEDA BERDASARKAN PENGIRIM
+            # - #3 atau #19 mengirim → cek TARGET CONE (cone 3)
+            # - Unknown mengirim    → cek FRONT CONES (cone 0, 1, 2)
+            # =========================================================
             temp_event = {
                 'frame_start': transition_frame_start,
                 'frame_end'  : transition_frame_end,
                 'from_pos'   : from_pos,
                 'to_pos'     : to_pos,
             }
-            success, reason = self.evaluate_pass_to_target(
-                tracks, temp_event, debug=debug
-            )
 
-            # Hitung closest_dist (juga dengan buffer)
-            trajectory = extract_ball_trajectory(
-                tracks, transition_frame_start, transition_frame_end,
-                buffer_before=self.eval_buffer_before,
-                buffer_after=self.eval_buffer_after
-            )
             closest_dist = float('inf')
-            if self._target_cone_pos and trajectory:
-                closest_dist = min(
-                    measure_distance(pt, self._target_cone_pos)
-                    for pt in trajectory
+            hit_cone_id  = None
+
+            if from_jersey in self.known_jerseys:
+                # #3 atau #19 → evaluasi ke target cone
+                success, reason = self.evaluate_pass_to_target(
+                    tracks, temp_event, debug=debug
                 )
+                # Hitung closest_dist ke target cone
+                trajectory = extract_ball_trajectory(
+                    tracks, transition_frame_start, transition_frame_end,
+                    buffer_before=self.eval_buffer_before,
+                    buffer_after=self.eval_buffer_after
+                )
+                if self._target_cone_pos and trajectory:
+                    closest_dist = min(
+                        measure_distance(pt, self._target_cone_pos)
+                        for pt in trajectory
+                    )
+                    hit_cone_id = self._target_cone_id
+
+            else:
+                # Unknown → evaluasi ke front cones
+                success, reason, hit_cone_id, closest_dist = \
+                    self.evaluate_pass_to_front_cones(
+                        tracks, temp_event, debug=debug
+                    )
 
             # Frame display
             receiver_start     = seg_to['frame_start']
@@ -677,6 +733,7 @@ class PassDetector:
                 'success'      : success,
                 'target_reason': reason,
                 'closest_dist' : closest_dist,
+                'hit_cone_id'  : hit_cone_id,
                 'from_pos'     : from_pos,
                 'to_pos'       : to_pos,
             }
@@ -685,10 +742,12 @@ class PassDetector:
 
             if debug:
                 status = "SUKSES" if success else "GAGAL"
+                eval_type = "target" if from_jersey in self.known_jerseys else "front"
                 print(f"[PASS] Pass {from_jersey} -> {to_jersey}: "
                       f"jarak={distance:.0f}px | "
                       f"bola={ball_movement:.0f}px | "
                       f"closest={closest_dist:.0f}px | "
+                      f"eval={eval_type} | "
                       f"{status}")
 
         if debug:
@@ -709,7 +768,6 @@ class PassDetector:
     # ============================================================
 
     def get_pass_statistics(self, passes: List[Dict]) -> Dict:
-        """Hitung statistik keseluruhan dan per pemain."""
         total  = len(passes)
         sukses = [p for p in passes if p['success']]
         gagal  = [p for p in passes if not p['success']]

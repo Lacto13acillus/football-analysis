@@ -1,11 +1,10 @@
 # main.py
-# Pipeline utama: baca video -> deteksi -> tracking -> analisis -> render -> simpan
+# Pipeline utama v2.6
 #
-# PERUBAHAN v2.4:
-# - max_possession_distance: 80 → 130
-# - target_proximity_radius: 100 → 120
-# - PlayerBallAssigner dihubungkan ke PlayerIdentifier (jersey priority)
-# - Semua perubahan parameter pass_detector sudah di file pass_detector.py
+# PERUBAHAN v2.6:
+# - Unknown player pass dihitung (evaluasi ke 3 front cones)
+# - Front cones divisualisasikan di video
+# - Panel stats menampilkan Unknown
 
 import os
 import sys
@@ -25,7 +24,8 @@ from draw_gate import (
     draw_ball_trajectory_on_frame,
     draw_pass_arrow,
     draw_stats_panel,
-    draw_target_cone_on_frame
+    draw_target_cone_on_frame,
+    draw_front_cones_on_frame
 )
 from utils.bbox_utils import extract_ball_trajectory
 
@@ -42,13 +42,6 @@ CONFIG = {
     "use_stub"    : True,
     "fps"         : 30,
 
-    # ============================================================
-    # JERSEY MAPPING (SEED AWAL)
-    #
-    # Ini adalah SEED mapping untuk frame awal.
-    # PlayerIdentifier akan OTOMATIS re-assign jersey saat
-    # ByteTrack mereset ID berdasarkan kedekatan posisi.
-    # ============================================================
     "jersey_mapping": {
         1: "#3",
         2: "#19",
@@ -59,68 +52,40 @@ CONFIG = {
         7: "Unknown"
     },
 
-    # Parameter re-identification
     "reassign_distance_threshold": 150.0,
     "lost_timeout_frames"        : 60,
 
-    # ============================================================
-    # KONFIGURASI TARGET CONE
-    # ============================================================
+    # --- Target cone (untuk #3/#19) ---
     "manual_target_cone_id"  : 3,
     "target_selection_mode"  : "highest",
-
-    # PERBAIKAN v2.4: 100 → 120
-    # Pass dengan closest 122px dan 126px sebelumnya GAGAL hanya
-    # karena margin 22-26px. Dengan radius 120, pass-pass ini
-    # yang memang mendekati cone akan dihitung SUKSES.
     "target_proximity_radius": 100,
 
-    # ============================================================
-    # KONFIGURASI POSSESSION
-    # ============================================================
-    # PERBAIKAN v2.4: 80 → 130
-    # Possession rate sebelumnya hanya 29.7% (70% frame tanpa possession).
-    # Dengan 130px, lebih banyak frame di mana #3/#19 dianggap menguasai
-    # bola, sehingga lebih banyak segmen possession terdeteksi.
+    # --- Front cones (untuk Unknown) ---
+    "front_cone_ids"         : [0, 1, 2],
+    "front_cone_radius"      : 65,
+
+    # --- Possession ---
     "max_possession_distance": 130,
 
+    # --- Visualisasi ---
     "show_gate"              : False,
     "show_target_cone"       : True,
+    "show_front_cones"       : True,
     "debug_trajectory"       : False,
     "show_pass_arrows"       : True,
     "show_stats_panel"       : True,
 }
 
 
-# ============================================================
-# ARGPARSE
-# ============================================================
-
 def parse_args():
-    """Parse argumen command line (semua opsional, override CONFIG)."""
     parser = argparse.ArgumentParser(
-        description="Football Passing Analytics - Target Cone Detection"
+        description="Football Passing Analytics v2.6"
     )
-    parser.add_argument(
-        "--input",    type=str,
-        help="Path video input (override CONFIG['input_video'])"
-    )
-    parser.add_argument(
-        "--output",   type=str,
-        help="Path video output (override CONFIG['output_video'])"
-    )
-    parser.add_argument(
-        "--stub",     action="store_true",
-        help="Gunakan cache tracking dari stub_path"
-    )
-    parser.add_argument(
-        "--debug",    action="store_true",
-        help="Aktifkan visualisasi trajectory bola di output video"
-    )
-    parser.add_argument(
-        "--no-gate",  action="store_true",
-        help="Nonaktifkan evaluasi gate (semua pass dianggap SUKSES)"
-    )
+    parser.add_argument("--input",    type=str)
+    parser.add_argument("--output",   type=str)
+    parser.add_argument("--stub",     action="store_true")
+    parser.add_argument("--debug",    action="store_true")
+    parser.add_argument("--no-gate",  action="store_true")
     return parser.parse_args()
 
 
@@ -132,10 +97,6 @@ def compute_progressive_stats(
     detected_passes: List[Dict],
     up_to_frame    : int
 ) -> Dict:
-    """
-    Hitung statistik kumulatif hanya dari pass events yang sudah
-    ditampilkan (frame_display <= up_to_frame).
-    """
     passes_so_far = [
         p for p in detected_passes
         if p['frame_display'] <= up_to_frame
@@ -150,12 +111,8 @@ def compute_progressive_stats(
         jersey = p['from_jersey']
         if jersey not in per_player:
             per_player[jersey] = {
-                'total'       : 0,
-                'success'     : 0,
-                'failed'      : 0,
-                'accuracy_pct': 0.0,
-                'avg_closest' : 0.0,
-                '_closest_sum': 0.0
+                'total': 0, 'success': 0, 'failed': 0,
+                'accuracy_pct': 0.0, 'avg_closest': 0.0, '_closest_sum': 0.0
             }
         per_player[jersey]['total'] += 1
         per_player[jersey]['_closest_sum'] += p.get('closest_dist', 0.0)
@@ -193,12 +150,7 @@ def compute_progressive_stats(
     }
 
 
-# ============================================================
-# CETAK DETAIL PASS EVENTS KE CONSOLE
-# ============================================================
-
 def print_pass_details(passes: List[Dict], stats: Dict) -> None:
-    """Cetak ringkasan statistik dan detail setiap pass event ke console."""
     sep = "=" * 62
     print(f"\n{sep}")
     print("   STATISTIK HASIL ANALISIS PASSING")
@@ -231,7 +183,7 @@ def print_pass_details(passes: List[Dict], stats: Dict) -> None:
     print("  " + "-" * 78)
     for i, p in enumerate(passes):
         status  = "SUKSES" if p['success'] else "GAGAL"
-        reason  = p.get('target_reason', p.get('gate_reason', '-'))
+        reason  = p.get('target_reason', '-')
         closest = p.get('closest_dist', 0.0)
         print(f"  {i+1:<4} "
               f"{p['from_jersey']:<10} "
@@ -245,19 +197,13 @@ def print_pass_details(passes: List[Dict], stats: Dict) -> None:
 
 
 # ============================================================
-# RENDERING SEMUA FRAME
+# RENDERING
 # ============================================================
 
 def render_frames(
-    frames           : List[np.ndarray],
-    tracks           : Dict,
-    ball_possessions : List[int],
-    detected_passes  : List[Dict],
-    player_identifier: PlayerIdentifier,
-    pass_detector    : PassDetector,
-    config           : Dict
+    frames, tracks, ball_possessions, detected_passes,
+    player_identifier, pass_detector, config
 ) -> List[np.ndarray]:
-    """Render semua frame dengan annotasi lengkap."""
     output_frames = []
     total_frames  = len(frames)
 
@@ -276,23 +222,37 @@ def render_frames(
 
         annotated = frame.copy()
 
-        # 1. Target cone
+        # 1. Target cone (#3/#19)
         target_info = pass_detector.get_target_cone()
         if target_info and config.get("show_target_cone", True):
             _, target_pos = target_info
-            radius        = config.get("target_proximity_radius", 120.0)
+            radius = config.get("target_proximity_radius", 100.0)
             target_active = any(
                 p['frame_start'] <= frame_num <= p['frame_end'] and p['success']
+                and p['from_jersey'] in {"#3", "#19"}
                 for p in detected_passes
             )
             annotated = draw_target_cone_on_frame(
-                annotated,
-                target_pos       = target_pos,
-                proximity_radius = radius,
-                is_active        = target_active
+                annotated, target_pos=target_pos,
+                proximity_radius=radius, is_active=target_active
             )
 
-        # 2. Bounding box pemain + label jersey
+        # 2. Front cones (Unknown) — BARU v2.6
+        if config.get("show_front_cones", True):
+            front_cones  = pass_detector.get_front_cones()
+            front_radius = pass_detector.get_front_cone_radius()
+            if front_cones:
+                front_active = any(
+                    p['frame_start'] <= frame_num <= p['frame_end'] and p['success']
+                    and p['from_jersey'] == "Unknown"
+                    for p in detected_passes
+                )
+                annotated = draw_front_cones_on_frame(
+                    annotated, front_cones=front_cones,
+                    proximity_radius=front_radius, is_active=front_active
+                )
+
+        # 3. Bounding box pemain + label jersey
         for player_id, player_data in tracks["players"][frame_num].items():
             bbox = player_data.get("bbox")
             if bbox is None:
@@ -313,17 +273,11 @@ def render_frames(
             (lw, lh), _ = cv2.getTextSize(
                 label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1
             )
-            cv2.rectangle(
-                annotated,
-                (x1, y1 - lh - 8),
-                (x1 + lw + 8, y1),
-                box_color, -1
-            )
-            cv2.putText(
-                annotated, label,
-                (x1 + 4, y1 - 4),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1
-            )
+            cv2.rectangle(annotated,
+                          (x1, y1 - lh - 8), (x1 + lw + 8, y1),
+                          box_color, -1)
+            cv2.putText(annotated, label, (x1 + 4, y1 - 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
 
             if has_ball:
                 foot_x = (x1 + x2) // 2
@@ -331,7 +285,7 @@ def render_frames(
                 cv2.circle(annotated, (foot_x, foot_y), 8,  (0, 230, 255), -1)
                 cv2.circle(annotated, (foot_x, foot_y), 11, (255, 255, 255), 2)
 
-        # 3. Bola
+        # 4. Bola
         ball_data = tracks["ball"][frame_num].get(1)
         if ball_data:
             bx1, by1, bx2, by2 = map(int, ball_data["bbox"])
@@ -347,47 +301,37 @@ def render_frames(
                 if len(rolling_trajectory) > 45:
                     rolling_trajectory.pop(0)
 
-        # 4. Trajectory bola rolling (debug)
+        # 5. Trajectory bola rolling (debug)
         if config.get("debug_trajectory", False) and len(rolling_trajectory) > 1:
             annotated = draw_ball_trajectory_on_frame(
-                annotated,
-                trajectory = rolling_trajectory,
-                max_points = 30
+                annotated, trajectory=rolling_trajectory, max_points=30
             )
 
-        # 5. Panah passing
+        # 6. Panah passing
         if config.get("show_pass_arrows", True) and frame_num in pass_display_map:
             pass_event = pass_display_map[frame_num]
             annotated  = draw_pass_arrow(
                 annotated,
-                from_pos    = pass_event['from_pos'],
-                to_pos      = pass_event['to_pos'],
-                success     = pass_event['success'],
-                from_jersey = pass_event['from_jersey'],
-                to_jersey   = pass_event['to_jersey'],
-                distance    = pass_event['distance']
+                from_pos=pass_event['from_pos'], to_pos=pass_event['to_pos'],
+                success=pass_event['success'],
+                from_jersey=pass_event['from_jersey'],
+                to_jersey=pass_event['to_jersey'],
+                distance=pass_event['distance']
             )
 
-        # 6. Panel statistik realtime
+        # 7. Panel statistik realtime
         if config.get("show_stats_panel", True):
-            realtime_stats = compute_progressive_stats(
-                detected_passes, frame_num
-            )
+            realtime_stats = compute_progressive_stats(detected_passes, frame_num)
             annotated = draw_stats_panel(
-                annotated,
-                stats       = realtime_stats,
-                position    = (20, 20),
-                panel_width = 295
+                annotated, stats=realtime_stats,
+                position=(20, 20), panel_width=320
             )
 
-        # 7. Label frame
+        # 8. Label frame
         h_frame, w_frame = annotated.shape[:2]
-        cv2.putText(
-            annotated,
-            f"Frame: {frame_num}",
-            (w_frame - 140, h_frame - 10),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.42, (110, 110, 110), 1
-        )
+        cv2.putText(annotated, f"Frame: {frame_num}",
+                    (w_frame - 140, h_frame - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (110, 110, 110), 1)
 
         output_frames.append(annotated)
 
@@ -400,15 +344,6 @@ def render_frames(
 # ============================================================
 
 def main():
-    """
-    Fungsi utama yang menjalankan seluruh pipeline analitik passing.
-
-    v2.4 PERUBAHAN:
-    - TAHAP 5: PlayerBallAssigner dihubungkan ke PlayerIdentifier
-               agar jersey priority bonus aktif
-    - CONFIG: max_possession_distance 80→130, target_proximity_radius 100→120
-    """
-
     args = parse_args()
 
     if args.input:
@@ -425,8 +360,8 @@ def main():
         CONFIG["expected_gate_width_range"] = (9999.0, 99999.0)
 
     print("\n" + "=" * 62)
-    print("   FOOTBALL PASSING ANALYTICS v2.4")
-    print("   Dynamic Re-ID + Jersey Priority + Tuned Parameters")
+    print("   FOOTBALL PASSING ANALYTICS v2.6")
+    print("   All Players + Front Cones + Target Cone")
     print("=" * 62)
     print(f"  Input        : {CONFIG['input_video']}")
     print(f"  Output       : {CONFIG['output_video']}")
@@ -435,192 +370,129 @@ def main():
     print(f"  Debug traj   : {'Ya' if CONFIG['debug_trajectory'] else 'Tidak'}")
     print(f"  Possession d : {CONFIG['max_possession_distance']}px")
     print(f"  Re-ID thresh : {CONFIG['reassign_distance_threshold']}px")
-    print(f"  Target radius: {CONFIG['target_proximity_radius']}px")
+    print(f"  Target radius: {CONFIG['target_proximity_radius']}px (cone 3)")
+    print(f"  Front radius : {CONFIG['front_cone_radius']}px (cone {CONFIG['front_cone_ids']})")
     print("=" * 62)
 
-    # ==========================================================
-    # TAHAP 1: Baca Video
-    # ==========================================================
+    # TAHAP 1
     print("\n[MAIN] TAHAP 1: Membaca video input...")
-
     if not os.path.exists(CONFIG["input_video"]):
         print(f"[MAIN] ERROR: File tidak ditemukan: {CONFIG['input_video']}")
         return
 
     frames = Tracker.read_video(CONFIG["input_video"])
-
     if not frames:
-        print("[MAIN] ERROR: Video tidak bisa dibaca atau kosong!")
+        print("[MAIN] ERROR: Video kosong!")
         return
 
     cap = cv2.VideoCapture(CONFIG["input_video"])
     fps = int(cap.get(cv2.CAP_PROP_FPS))
     cap.release()
-
     if fps <= 0:
         fps = CONFIG["fps"]
-        print(f"[MAIN] WARNING: FPS tidak bisa dibaca. Fallback: {fps} fps")
-    else:
-        print(f"[MAIN] FPS video         : {fps}")
-
+    print(f"[MAIN] FPS video         : {fps}")
     print(f"[MAIN] Total frame dibaca: {len(frames)}")
     print(f"[MAIN] Durasi video      : {len(frames) / fps:.1f} detik")
 
-    # ==========================================================
-    # TAHAP 2: Deteksi & Tracking Objek
-    # ==========================================================
+    # TAHAP 2
     print("\n[MAIN] TAHAP 2: Deteksi & Tracking objek...")
-
     if not os.path.exists(CONFIG["model_path"]):
         print(f"[MAIN] ERROR: Model tidak ditemukan: {CONFIG['model_path']}")
         return
 
     tracker = Tracker(model_path=CONFIG["model_path"])
     tracks  = tracker.get_object_tracks(
-        frames,
-        read_from_stub = CONFIG["use_stub"],
-        stub_path      = CONFIG["stub_path"]
+        frames, read_from_stub=CONFIG["use_stub"], stub_path=CONFIG["stub_path"]
     )
-
     n_player_frames = len(tracks.get('players', []))
     n_ball_frames   = len(tracks.get('ball',    []))
-    n_cone_frames   = len(tracks.get('cones',   []))
-
     print(f"[MAIN] Tracks 'players': {n_player_frames} frames")
     print(f"[MAIN] Tracks 'ball'   : {n_ball_frames} frames")
-    print(f"[MAIN] Tracks 'cones'  : {n_cone_frames} frames")
+    print(f"[MAIN] Tracks 'cones'  : {len(tracks.get('cones', []))} frames")
 
     if n_player_frames == 0 or n_ball_frames == 0:
         print("[MAIN] ERROR: Tracking gagal!")
         return
 
-    # ==========================================================
-    # TAHAP 3: Identifikasi Jersey Pemain (DYNAMIC RE-ID)
-    # ==========================================================
+    # TAHAP 3
     print("\n[MAIN] TAHAP 3: Mapping jersey pemain (Dynamic Re-ID)...")
-
     player_identifier = PlayerIdentifier(
         track_id_to_jersey          = CONFIG["jersey_mapping"],
         reassign_distance_threshold = CONFIG.get("reassign_distance_threshold", 150.0),
         lost_timeout_frames         = CONFIG.get("lost_timeout_frames", 60)
     )
-
-    # Jalankan update_frame() untuk SETIAP frame
-    # agar re-identifikasi spasial berjalan otomatis.
     print("[MAIN] Menjalankan dynamic re-identification per frame...")
     for frame_num in range(n_player_frames):
         player_identifier.update_frame(
-            frame_num     = frame_num,
-            player_tracks = tracks['players'][frame_num],
-            debug         = (frame_num % 100 == 0)
+            frame_num=frame_num,
+            player_tracks=tracks['players'][frame_num],
+            debug=(frame_num % 100 == 0)
         )
-
     player_identifier.print_mappings()
-
-    # Debug: tampilkan history track ID per jersey
     for jersey in ["#3", "#19"]:
         all_tids = player_identifier.get_all_track_ids_for_jersey(jersey)
         print(f"[MAIN] Jersey {jersey} pernah di-map ke track IDs: {all_tids}")
 
-    # ==========================================================
-    # TAHAP 4: Inisialisasi Pass Detector & Target Cone
-    # ==========================================================
-    print("\n[MAIN] TAHAP 4: Inisialisasi Pass Detector & Target Cone...")
-
+    # TAHAP 4
+    print("\n[MAIN] TAHAP 4: Inisialisasi Pass Detector & Cones...")
     pass_detector = PassDetector(fps=fps)
     pass_detector.set_jersey_map(player_identifier)
 
     pass_detector.manual_target_cone_id   = CONFIG.get("manual_target_cone_id")
     pass_detector.target_selection_mode   = CONFIG.get("target_selection_mode", "highest")
-    pass_detector.target_proximity_radius = CONFIG.get("target_proximity_radius", 120.0)
+    pass_detector.target_proximity_radius = CONFIG.get("target_proximity_radius", 100.0)
+    pass_detector.front_cone_ids          = CONFIG.get("front_cone_ids", [0, 1, 2])
+    pass_detector.front_cone_radius       = CONFIG.get("front_cone_radius", 65.0)
 
     target_ok = pass_detector.initialize_target_cone(
-        tracks,
-        cone_key      = 'cones',
-        sample_frames = 30,
-        debug         = True
+        tracks, cone_key='cones', sample_frames=30, debug=True
     )
-
     if not target_ok:
-        print("[MAIN] WARNING: Target cone tidak teridentifikasi!")
-        print("[MAIN]          Semua pass akan dianggap SUKSES.")
+        print("[MAIN] WARNING: Cone tidak teridentifikasi!")
 
-    # ==========================================================
-    # TAHAP 5: Assignment Possession Bola Per Frame
-    # ==========================================================
+    # TAHAP 5
     print("\n[MAIN] TAHAP 5: Menentukan possession bola per frame...")
-
     assigner = PlayerBallAssigner(
-        max_possession_distance = CONFIG.get("max_possession_distance", 70.0)
+        max_possession_distance=CONFIG.get("max_possession_distance", 70.0)
     )
-
-    # ★★★ BARU v2.4: Hubungkan player identifier agar jersey priority aktif ★★★
     assigner.set_player_identifier(player_identifier)
-
     ball_possessions = assigner.assign_ball_to_players_bulk(tracks)
 
     possession_count: Dict[str, int] = {}
     for pid in ball_possessions:
-        if pid == -1:
-            jersey = "Tidak ada"
-        else:
-            jersey = player_identifier.get_jersey_number_for_player(pid)
+        jersey = "Tidak ada" if pid == -1 else player_identifier.get_jersey_number_for_player(pid)
         possession_count[jersey] = possession_count.get(jersey, 0) + 1
-
     print(f"\n[MAIN] Distribusi possession:")
     for jersey, count in sorted(possession_count.items(), key=lambda x: -x[1]):
         pct = count / len(ball_possessions) * 100
         print(f"[MAIN]   #{jersey:<12}: {count:>5} frames ({pct:.1f}%)")
 
-    # ==========================================================
-    # TAHAP 6: Deteksi Pass Events & Evaluasi Target Cone
-    # ==========================================================
-    print("\n[MAIN] TAHAP 6: Deteksi passing & evaluasi target cone...")
-
+    # TAHAP 6
+    print("\n[MAIN] TAHAP 6: Deteksi passing & evaluasi cone...")
     detected_passes = pass_detector.detect_passes(
-        tracks,
-        ball_possessions,
-        player_identifier = player_identifier,
-        debug             = True
+        tracks, ball_possessions,
+        player_identifier=player_identifier, debug=True
     )
 
-    # ==========================================================
-    # TAHAP 7: Hitung Statistik
-    # ==========================================================
+    # TAHAP 7
     print("\n[MAIN] TAHAP 7: Menghitung statistik...")
-
     stats = pass_detector.get_pass_statistics(detected_passes)
     print_pass_details(detected_passes, stats)
 
-    # ==========================================================
-    # TAHAP 8: Render Video Output
-    # ==========================================================
-    print("\n[MAIN] TAHAP 8: Merender video output dengan annotasi REALTIME...")
-
+    # TAHAP 8
+    print("\n[MAIN] TAHAP 8: Merender video output...")
     output_frames = render_frames(
-        frames            = frames,
-        tracks            = tracks,
-        ball_possessions  = ball_possessions,
-        detected_passes   = detected_passes,
-        player_identifier = player_identifier,
-        pass_detector     = pass_detector,
-        config            = CONFIG
+        frames, tracks, ball_possessions, detected_passes,
+        player_identifier, pass_detector, CONFIG
     )
 
-    # ==========================================================
-    # TAHAP 9: Simpan Video Output
-    # ==========================================================
+    # TAHAP 9
     print(f"\n[MAIN] TAHAP 9: Menyimpan video ke: {CONFIG['output_video']}...")
-
     output_dir = os.path.dirname(CONFIG["output_video"])
     if output_dir and not os.path.exists(output_dir):
         os.makedirs(output_dir, exist_ok=True)
-
     Tracker.save_video(output_frames, CONFIG["output_video"], fps=fps)
 
-    # ==========================================================
-    # SELESAI
-    # ==========================================================
     print("\n" + "=" * 62)
     print("   PIPELINE SELESAI!")
     print("=" * 62)
