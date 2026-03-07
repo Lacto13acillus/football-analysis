@@ -525,7 +525,7 @@ def draw_target_cone_on_frame(
 def draw_front_cones_on_frame(
     frame           : np.ndarray,
     front_cones     : dict,
-    proximity_radius: float = 75.0,
+    proximity_radius: float = 100.0,
     is_active       : bool  = False,
     color_normal    : Tuple[int, int, int] = (255, 180, 0),   # Biru-cyan
     color_active    : Tuple[int, int, int] = (0, 255, 80),    # Hijau
