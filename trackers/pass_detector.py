@@ -69,7 +69,7 @@ class PassDetector:
         # 3 cone di depan Unknown player, radius lebih kecil
         # ============================================================
         self.front_cone_ids          : List[int] = [0, 1, 2]
-        self.front_cone_radius       : float = 65.0
+        self.front_cone_radius       : float = 75.0
 
         # Cache
         self._target_cone_id   : Optional[int] = None
