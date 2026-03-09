@@ -64,13 +64,17 @@ CONFIG = {
     "front_cone_ids"         : [0, 1, 2],
     "front_cone_radius"      : 125,
 
+    # --- v3.0: Evaluasi ke kaki penerima ---
+    "receiver_proximity_radius": 100,  
+
     # --- Possession ---
     "max_possession_distance": 130,
 
     # --- Visualisasi ---
     "show_gate"              : False,
-    "show_target_cone"       : True,
-    "show_front_cones"       : True,
+    "show_target_cone"       : False,   
+    "show_front_cones"       : False,   
+    "show_receiver_radius"   : True,    # v3.0: tampilkan radius kaki penerima
     "debug_trajectory"       : False,
     "show_pass_arrows"       : True,
     "show_stats_panel"       : True,
@@ -285,6 +289,48 @@ def render_frames(
                 cv2.circle(annotated, (foot_x, foot_y), 8,  (0, 230, 255), -1)
                 cv2.circle(annotated, (foot_x, foot_y), 11, (255, 255, 255), 2)
 
+        # 2. v3.0: Visualisasi radius kaki penerima (Unknown)
+        if config.get("show_receiver_radius", True):
+            # Cari player Unknown di frame ini dan gambar radius di kakinya
+            for player_id, player_data in tracks["players"][frame_num].items():
+                jersey = player_identifier.get_jersey_number_for_player(player_id)
+                if jersey != "Unknown":
+                    continue
+                bbox = player_data.get("bbox")
+                if bbox is None:
+                    continue
+                foot_x = int((bbox[0] + bbox[2]) / 2)
+                foot_y = int(bbox[3])
+                radius = int(config.get("receiver_proximity_radius", 100))
+
+                # Cek apakah ada pass aktif ke Unknown di frame ini
+                recv_active = any(
+                    p['frame_start'] <= frame_num <= p['frame_end'] + 15
+                    and p['success'] and p['to_player'] == player_id
+                    for p in detected_passes
+                )
+
+                color = (0, 255, 80) if recv_active else (0, 200, 255)
+                alpha_r = 0.20
+
+                overlay_r = annotated.copy()
+                cv2.circle(overlay_r, (foot_x, foot_y), radius, color, -1)
+                cv2.addWeighted(overlay_r, alpha_r, annotated, 1 - alpha_r, 0, annotated)
+                cv2.circle(annotated, (foot_x, foot_y), radius, color, 1)
+
+                # Label
+                label_r = "RECV"
+                (lw_r, lh_r), _ = cv2.getTextSize(label_r, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
+                lx_r = foot_x - lw_r // 2
+                ly_r = foot_y - radius - 8
+                cv2.rectangle(annotated,
+                              (lx_r - 2, ly_r - lh_r - 2),
+                              (lx_r + lw_r + 2, ly_r + 2),
+                              color, -1)
+                cv2.putText(annotated, label_r, (lx_r, ly_r),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)
+
+
         # 4. Bola
         ball_data = tracks["ball"][frame_num].get(1)
         if ball_data:
@@ -443,6 +489,7 @@ def main():
     pass_detector.target_proximity_radius = CONFIG.get("target_proximity_radius", 100.0)
     pass_detector.front_cone_ids          = CONFIG.get("front_cone_ids", [0, 1, 2])
     pass_detector.front_cone_radius       = CONFIG.get("front_cone_radius", 125.0)
+    pass_detector.receiver_proximity_radius = CONFIG.get("receiver_proximity_radius", 100.0)
 
     target_ok = pass_detector.initialize_target_cone(
         tracks, cone_key='cones', sample_frames=30, debug=True
@@ -502,6 +549,8 @@ def main():
     print(f"  Total pass    : {stats['total_passes']}")
     print(f"  Akurasi       : {stats['accuracy_pct']}%")
     print("=" * 62 + "\n")
+    print(f"  Recv radius  : {CONFIG['receiver_proximity_radius']}px (ke kaki Unknown)")
+
 
 
 if __name__ == "__main__":
