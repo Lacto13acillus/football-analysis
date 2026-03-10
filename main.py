@@ -426,7 +426,7 @@ def main():
     print(f"  Debug traj   : {'Ya' if CONFIG['debug_trajectory'] else 'Tidak'}")
     print(f"  Possession d : {CONFIG['max_possession_distance']}px")
     print(f"  Re-ID thresh : {CONFIG['reassign_distance_threshold']}px")
-    print(f"  Recv radius  : {CONFIG['receiver_proximity_radius']}px (ke kaki Unknown)")
+    # print(f"  Recv radius  : {CONFIG['receiver_proximity_radius']}px (ke kaki Unknown)")
     print("=" * 62)
 
     # TAHAP 1
