@@ -1,10 +1,11 @@
 # main.py
-# Pipeline utama v2.6
+# Pipeline utama v3.0
 #
-# PERUBAHAN v2.6:
-# - Unknown player pass dihitung (evaluasi ke 3 front cones)
-# - Front cones divisualisasikan di video
-# - Panel stats menampilkan Unknown
+# PERUBAHAN v3.0:
+# - Hanya #3 dan #19 yang dihitung akurasi passing
+# - Sukses = bola sampai ke kaki Unknown (penerima)
+# - Unknown hanya penerima, tidak dihitung akurasi
+# - Visualisasi receiver radius di kaki Unknown (efisien)
 
 import os
 import sys
@@ -27,7 +28,7 @@ from draw_gate import (
     draw_target_cone_on_frame,
     draw_front_cones_on_frame
 )
-from utils.bbox_utils import extract_ball_trajectory
+from utils.bbox_utils import extract_ball_trajectory, get_center_of_bbox_bottom
 
 
 # ============================================================
@@ -55,26 +56,26 @@ CONFIG = {
     "reassign_distance_threshold": 150.0,
     "lost_timeout_frames"        : 60,
 
-    # --- Target cone (untuk #3/#19) ---
+    # --- Target cone (HANYA visualisasi opsional) ---
     "manual_target_cone_id"  : 3,
     "target_selection_mode"  : "highest",
     "target_proximity_radius": 100,
 
-    # --- Front cones (untuk Unknown) ---
+    # --- Front cones (HANYA visualisasi opsional) ---
     "front_cone_ids"         : [0, 1, 2],
     "front_cone_radius"      : 125,
 
     # --- v3.0: Evaluasi ke kaki penerima ---
-    "receiver_proximity_radius": 100,  
+    "receiver_proximity_radius": 100,
 
     # --- Possession ---
     "max_possession_distance": 130,
 
     # --- Visualisasi ---
     "show_gate"              : False,
-    "show_target_cone"       : False,   
-    "show_front_cones"       : False,   
-    "show_receiver_radius"   : True,    # v3.0: tampilkan radius kaki penerima
+    "show_target_cone"       : False,
+    "show_front_cones"       : False,
+    "show_receiver_radius"   : True,
     "debug_trajectory"       : False,
     "show_pass_arrows"       : True,
     "show_stats_panel"       : True,
@@ -83,7 +84,7 @@ CONFIG = {
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Football Passing Analytics v2.6"
+        description="Football Passing Analytics v3.0"
     )
     parser.add_argument("--input",    type=str)
     parser.add_argument("--output",   type=str)
@@ -160,8 +161,8 @@ def print_pass_details(passes: List[Dict], stats: Dict) -> None:
     print("   STATISTIK HASIL ANALISIS PASSING")
     print(sep)
     print(f"  Total Pass           : {stats['total_passes']}")
-    print(f"  Sukses (ke target)   : {stats['successful_passes']}")
-    print(f"  Gagal  (tidak target): {stats['failed_passes']}")
+    print(f"  Sukses (ke kaki)     : {stats['successful_passes']}")
+    print(f"  Gagal  (tidak sampai): {stats['failed_passes']}")
     print(f"  Akurasi              : {stats['accuracy_pct']}%")
     print(f"  Rata2 Jarak Semua    : {stats['avg_distance']} px")
     print(f"  Rata2 Jarak Sukses   : {stats['avg_distance_successful']} px")
@@ -201,7 +202,7 @@ def print_pass_details(passes: List[Dict], stats: Dict) -> None:
 
 
 # ============================================================
-# RENDERING
+# RENDERING — DIPERBAIKI v3.0
 # ============================================================
 
 def render_frames(
@@ -217,23 +218,27 @@ def render_frames(
 
     rolling_trajectory: List = []
 
+    # Pre-compute receiver radius config
+    show_recv   = config.get("show_receiver_radius", False)
+    recv_radius = int(config.get("receiver_proximity_radius", 100))
+
     print(f"\n[RENDER] Mulai merender {total_frames} frames...")
 
-    for frame_num, frame in enumerate(frames):
+    for frame_num in range(total_frames):
         if frame_num % 100 == 0:
             pct = frame_num / total_frames * 100
             print(f"[RENDER] Progress: {frame_num}/{total_frames} ({pct:.1f}%)...")
 
+        frame = frames[frame_num]
         annotated = frame.copy()
 
-        # 1. Target cone (#3/#19)
+        # 1. Target cone (opsional)
         target_info = pass_detector.get_target_cone()
-        if target_info and config.get("show_target_cone", True):
+        if target_info and config.get("show_target_cone", False):
             _, target_pos = target_info
             radius = config.get("target_proximity_radius", 100.0)
             target_active = any(
                 p['frame_start'] <= frame_num <= p['frame_end'] and p['success']
-                and p['from_jersey'] in {"#3", "#19"}
                 for p in detected_passes
             )
             annotated = draw_target_cone_on_frame(
@@ -241,22 +246,69 @@ def render_frames(
                 proximity_radius=radius, is_active=target_active
             )
 
-        # 2. Front cones (Unknown) — BARU v2.6
-        if config.get("show_front_cones", True):
+        # 2. Front cones (opsional)
+        if config.get("show_front_cones", False):
             front_cones  = pass_detector.get_front_cones()
             front_radius = pass_detector.get_front_cone_radius()
             if front_cones:
-                front_active = any(
-                    p['frame_start'] <= frame_num <= p['frame_end'] and p['success']
-                    and p['from_jersey'] == "Unknown"
-                    for p in detected_passes
-                )
                 annotated = draw_front_cones_on_frame(
                     annotated, front_cones=front_cones,
-                    proximity_radius=front_radius, is_active=front_active
+                    proximity_radius=front_radius, is_active=False
                 )
 
-        # 3. Bounding box pemain + label jersey
+        # 3. Receiver radius di kaki Unknown (v3.0)
+        #    PERBAIKAN: satu overlay untuk SEMUA Unknown, bukan per-player
+        if show_recv:
+            overlay_recv = annotated.copy()
+            drew_any = False
+
+            for player_id, player_data in tracks["players"][frame_num].items():
+                jersey = player_identifier.get_jersey_number_for_player(player_id)
+                if jersey != "Unknown":
+                    continue
+                bbox = player_data.get("bbox")
+                if bbox is None:
+                    continue
+
+                foot_x = int((bbox[0] + bbox[2]) / 2)
+                foot_y = int(bbox[3])
+
+                # Warna: hijau jika baru saja menerima pass sukses
+                recv_active = False
+                for p in detected_passes:
+                    if (p['success']
+                        and p['to_player'] == player_id
+                        and p['frame_end'] <= frame_num <= p['frame_end'] + 20):
+                        recv_active = True
+                        break
+
+                color = (0, 255, 80) if recv_active else (0, 200, 255)
+
+                # Gambar lingkaran radius di overlay
+                cv2.circle(overlay_recv, (foot_x, foot_y), recv_radius, color, -1)
+                drew_any = True
+
+                # Border dan label langsung di annotated (tipis, cepat)
+                cv2.circle(annotated, (foot_x, foot_y), recv_radius, color, 1)
+
+                label_r = "RECV"
+                (lw_r, lh_r), _ = cv2.getTextSize(
+                    label_r, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1
+                )
+                lx_r = foot_x - lw_r // 2
+                ly_r = foot_y - recv_radius - 8
+                cv2.rectangle(annotated,
+                              (lx_r - 2, ly_r - lh_r - 2),
+                              (lx_r + lw_r + 2, ly_r + 2),
+                              color, -1)
+                cv2.putText(annotated, label_r, (lx_r, ly_r),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)
+
+            # Blend SATU KALI untuk semua Unknown
+            if drew_any:
+                cv2.addWeighted(overlay_recv, 0.20, annotated, 0.80, 0, annotated)
+
+        # 4. Bounding box pemain + label jersey
         for player_id, player_data in tracks["players"][frame_num].items():
             bbox = player_data.get("bbox")
             if bbox is None:
@@ -289,49 +341,7 @@ def render_frames(
                 cv2.circle(annotated, (foot_x, foot_y), 8,  (0, 230, 255), -1)
                 cv2.circle(annotated, (foot_x, foot_y), 11, (255, 255, 255), 2)
 
-        # 2. v3.0: Visualisasi radius kaki penerima (Unknown)
-        if config.get("show_receiver_radius", True):
-            # Cari player Unknown di frame ini dan gambar radius di kakinya
-            for player_id, player_data in tracks["players"][frame_num].items():
-                jersey = player_identifier.get_jersey_number_for_player(player_id)
-                if jersey != "Unknown":
-                    continue
-                bbox = player_data.get("bbox")
-                if bbox is None:
-                    continue
-                foot_x = int((bbox[0] + bbox[2]) / 2)
-                foot_y = int(bbox[3])
-                radius = int(config.get("receiver_proximity_radius", 100))
-
-                # Cek apakah ada pass aktif ke Unknown di frame ini
-                recv_active = any(
-                    p['frame_start'] <= frame_num <= p['frame_end'] + 15
-                    and p['success'] and p['to_player'] == player_id
-                    for p in detected_passes
-                )
-
-                color = (0, 255, 80) if recv_active else (0, 200, 255)
-                alpha_r = 0.20
-
-                overlay_r = annotated.copy()
-                cv2.circle(overlay_r, (foot_x, foot_y), radius, color, -1)
-                cv2.addWeighted(overlay_r, alpha_r, annotated, 1 - alpha_r, 0, annotated)
-                cv2.circle(annotated, (foot_x, foot_y), radius, color, 1)
-
-                # Label
-                label_r = "RECV"
-                (lw_r, lh_r), _ = cv2.getTextSize(label_r, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
-                lx_r = foot_x - lw_r // 2
-                ly_r = foot_y - radius - 8
-                cv2.rectangle(annotated,
-                              (lx_r - 2, ly_r - lh_r - 2),
-                              (lx_r + lw_r + 2, ly_r + 2),
-                              color, -1)
-                cv2.putText(annotated, label_r, (lx_r, ly_r),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)
-
-
-        # 4. Bola
+        # 5. Bola
         ball_data = tracks["ball"][frame_num].get(1)
         if ball_data:
             bx1, by1, bx2, by2 = map(int, ball_data["bbox"])
@@ -347,13 +357,13 @@ def render_frames(
                 if len(rolling_trajectory) > 45:
                     rolling_trajectory.pop(0)
 
-        # 5. Trajectory bola rolling (debug)
+        # 6. Trajectory bola rolling (debug)
         if config.get("debug_trajectory", False) and len(rolling_trajectory) > 1:
             annotated = draw_ball_trajectory_on_frame(
                 annotated, trajectory=rolling_trajectory, max_points=30
             )
 
-        # 6. Panah passing
+        # 7. Panah passing
         if config.get("show_pass_arrows", True) and frame_num in pass_display_map:
             pass_event = pass_display_map[frame_num]
             annotated  = draw_pass_arrow(
@@ -365,7 +375,7 @@ def render_frames(
                 distance=pass_event['distance']
             )
 
-        # 7. Panel statistik realtime
+        # 8. Panel statistik realtime
         if config.get("show_stats_panel", True):
             realtime_stats = compute_progressive_stats(detected_passes, frame_num)
             annotated = draw_stats_panel(
@@ -373,7 +383,7 @@ def render_frames(
                 position=(20, 20), panel_width=320
             )
 
-        # 8. Label frame
+        # 9. Label frame
         h_frame, w_frame = annotated.shape[:2]
         cv2.putText(annotated, f"Frame: {frame_num}",
                     (w_frame - 140, h_frame - 10),
@@ -406,8 +416,8 @@ def main():
         CONFIG["expected_gate_width_range"] = (9999.0, 99999.0)
 
     print("\n" + "=" * 62)
-    print("   FOOTBALL PASSING ANALYTICS v2.6")
-    print("   All Players + Front Cones + Target Cone")
+    print("   FOOTBALL PASSING ANALYTICS v3.0")
+    print("   #3 & #19 -> Unknown (kaki penerima)")
     print("=" * 62)
     print(f"  Input        : {CONFIG['input_video']}")
     print(f"  Output       : {CONFIG['output_video']}")
@@ -416,8 +426,7 @@ def main():
     print(f"  Debug traj   : {'Ya' if CONFIG['debug_trajectory'] else 'Tidak'}")
     print(f"  Possession d : {CONFIG['max_possession_distance']}px")
     print(f"  Re-ID thresh : {CONFIG['reassign_distance_threshold']}px")
-    print(f"  Target radius: {CONFIG['target_proximity_radius']}px (cone 3)")
-    print(f"  Front radius : {CONFIG['front_cone_radius']}px (cone {CONFIG['front_cone_ids']})")
+    print(f"  Recv radius  : {CONFIG['receiver_proximity_radius']}px (ke kaki Unknown)")
     print("=" * 62)
 
     # TAHAP 1
@@ -480,22 +489,25 @@ def main():
         print(f"[MAIN] Jersey {jersey} pernah di-map ke track IDs: {all_tids}")
 
     # TAHAP 4
-    print("\n[MAIN] TAHAP 4: Inisialisasi Pass Detector & Cones...")
+    print("\n[MAIN] TAHAP 4: Inisialisasi Pass Detector...")
     pass_detector = PassDetector(fps=fps)
     pass_detector.set_jersey_map(player_identifier)
 
+    # Cone settings (opsional, untuk visualisasi)
     pass_detector.manual_target_cone_id   = CONFIG.get("manual_target_cone_id")
     pass_detector.target_selection_mode   = CONFIG.get("target_selection_mode", "highest")
     pass_detector.target_proximity_radius = CONFIG.get("target_proximity_radius", 100.0)
     pass_detector.front_cone_ids          = CONFIG.get("front_cone_ids", [0, 1, 2])
     pass_detector.front_cone_radius       = CONFIG.get("front_cone_radius", 125.0)
+
+    # v3.0: Evaluasi ke kaki penerima
     pass_detector.receiver_proximity_radius = CONFIG.get("receiver_proximity_radius", 100.0)
 
     target_ok = pass_detector.initialize_target_cone(
         tracks, cone_key='cones', sample_frames=30, debug=True
     )
     if not target_ok:
-        print("[MAIN] WARNING: Cone tidak teridentifikasi!")
+        print("[MAIN] WARNING: Cone tidak teridentifikasi (opsional untuk v3.0)")
 
     # TAHAP 5
     print("\n[MAIN] TAHAP 5: Menentukan possession bola per frame...")
@@ -515,7 +527,7 @@ def main():
         print(f"[MAIN]   #{jersey:<12}: {count:>5} frames ({pct:.1f}%)")
 
     # TAHAP 6
-    print("\n[MAIN] TAHAP 6: Deteksi passing & evaluasi cone...")
+    print("\n[MAIN] TAHAP 6: Deteksi passing & evaluasi ke kaki penerima...")
     detected_passes = pass_detector.detect_passes(
         tracks, ball_possessions,
         player_identifier=player_identifier, debug=True
@@ -549,8 +561,6 @@ def main():
     print(f"  Total pass    : {stats['total_passes']}")
     print(f"  Akurasi       : {stats['accuracy_pct']}%")
     print("=" * 62 + "\n")
-    print(f"  Recv radius  : {CONFIG['receiver_proximity_radius']}px (ke kaki Unknown)")
-
 
 
 if __name__ == "__main__":
