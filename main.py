@@ -66,7 +66,7 @@ CONFIG = {
     "front_cone_radius"      : 125,
 
     # --- v3.0: Evaluasi ke kaki penerima ---
-    "receiver_proximity_radius": 10,
+    "receiver_proximity_radius": 30,
 
     # --- Possession ---
     "max_possession_distance": 130,
@@ -220,7 +220,7 @@ def render_frames(
 
     # Pre-compute receiver radius config
     show_recv   = config.get("show_receiver_radius", False)
-    recv_radius = int(config.get("receiver_proximity_radius", 10))
+    recv_radius = int(config.get("receiver_proximity_radius", 30))
 
     print(f"\n[RENDER] Mulai merender {total_frames} frames...")
 
@@ -501,7 +501,7 @@ def main():
     pass_detector.front_cone_radius       = CONFIG.get("front_cone_radius", 125.0)
 
     # v3.0: Evaluasi ke kaki penerima
-    pass_detector.receiver_proximity_radius = CONFIG.get("receiver_proximity_radius", 10)
+    pass_detector.receiver_proximity_radius = CONFIG.get("receiver_proximity_radius", 30)
 
     target_ok = pass_detector.initialize_target_cone(
         tracks, cone_key='cones', sample_frames=30, debug=True
