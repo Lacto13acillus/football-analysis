@@ -318,7 +318,7 @@ def main():
     print(f"  Output       : {CONFIG['output_video']}")
     print(f"  Model        : {CONFIG['model_path']}")
     print(f"  Gunakan cache: {'Ya' if CONFIG['use_stub'] else 'Tidak'}")
-    print(f"  Vel threshold: {CONFIG['velocity_threshold']} px/frame")
+    # print(f"  Vel threshold: {CONFIG['velocity_threshold']} px/frame")
     print(f"  Possession d : {CONFIG['max_possession_distance']}px")
     print("=" * 62)
 
