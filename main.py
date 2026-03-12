@@ -36,7 +36,7 @@ from utils.bbox_utils import extract_ball_trajectory, get_center_of_bbox_bottom
 # ============================================================
 
 CONFIG = {
-    "input_video" : "input_videos/passing_nuumber_360p.mp4",
+    "input_video" : "input_videos/passing_number_360p.mp4",
     "output_video": "output_videos/passing_number_360p.avi",
     "model_path"  : "/home/dika/football-analysis/models/best.pt",
     "stub_path"   : "stubs/tracks_cache.pkl",
