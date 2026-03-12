@@ -16,6 +16,7 @@ from typing import List, Dict, Optional
 sys.path.append('../')
 
 from trackers                          import Tracker
+from trackers.penalty_detector import PenaltyDetector
 from team_assigner.player_identifier   import PlayerIdentifier
 from trackers.player_ball_assigner     import PlayerBallAssigner
 from trackers.penalty_detector         import PenaltyDetector
@@ -47,12 +48,13 @@ CONFIG = {
     # Possession (masih digunakan untuk visualisasi siapa pegang bola)
     "max_possession_distance": 200,
 
-    # Penalty detection (velocity-based)
-    "velocity_threshold"     : 15.0,    # px/frame — sesuaikan jika perlu
-    "pre_kick_search"        : 10,
-    "max_kicker_distance"    : 200,
+    # Penalty detection — NILAI YANG BENAR
+    "kick_velocity_threshold": 15.0,
+    "pre_kick_search"        : 50,      # WAS 10 — 50 frames = 0.8s@60fps
+    "max_kicker_distance"    : 700,     # WAS 200 — portrait video, player besar
     "goal_check_window"      : 60,
-    "cooldown_frames"        : 60,
+    "cooldown_frames"        : 120,     # WAS 60 — menghasilkan tepat 6 kicks
+    "gawang_shrink_ratio"    : 0.10,
 
     # Visualisasi
     "show_gawang"           : True,
@@ -403,18 +405,20 @@ def main():
         pct = count / len(ball_possessions) * 100
         print(f"[MAIN]   {jersey:<12}: {count:>5} frames ({pct:.1f}%)")
 
-    # TAHAP 5: Deteksi penalty kick (VELOCITY-BASED)
+    # TAHAP 5: Deteksi penalty kick
     print("\n[MAIN] TAHAP 5: Deteksi penalty kick (velocity-based)...")
     penalty_detector = PenaltyDetector(fps=fps)
     penalty_detector.set_jersey_map(player_identifier)
-    penalty_detector.velocity_threshold  = CONFIG.get("velocity_threshold", 15.0)
-    penalty_detector.pre_kick_search     = CONFIG.get("pre_kick_search", 10)
-    penalty_detector.max_kicker_distance = CONFIG.get("max_kicker_distance", 200)
-    penalty_detector.goal_check_window   = CONFIG.get("goal_check_window", 60)
-    penalty_detector.cooldown_frames     = CONFIG.get("cooldown_frames", 60)
+    penalty_detector.kick_velocity_threshold = CONFIG.get("kick_velocity_threshold", 15.0)
+    penalty_detector.pre_kick_search         = CONFIG.get("pre_kick_search", 50)
+    penalty_detector.max_kicker_distance     = CONFIG.get("max_kicker_distance", 700)
+    penalty_detector.goal_check_window       = CONFIG.get("goal_check_window", 60)
+    penalty_detector.cooldown_frames         = CONFIG.get("cooldown_frames", 120)
+    penalty_detector.gawang_shrink_ratio     = CONFIG.get("gawang_shrink_ratio", 0.10)
 
     detected_penalties = penalty_detector.detect_penalties(
         tracks, ball_possessions,
+        frames=frames,                          # BARU: kirim frames untuk re-detect warna
         player_identifier=player_identifier, debug=True
     )
 
