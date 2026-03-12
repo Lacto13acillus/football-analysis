@@ -4,6 +4,7 @@
 # - Mendeteksi tendangan penalty dari 2 pemain (Merah & Abu-Abu)
 # - Counting gol vs miss menggunakan deteksi gawang dari YOLO
 # - Identifikasi pemain berdasarkan warna baju
+# - Deteksi kick menggunakan velocity spike bola
 
 import os
 import sys
@@ -43,12 +44,15 @@ CONFIG = {
     "reassign_distance_threshold": 150.0,
     "lost_timeout_frames"        : 60,
 
-    # Possession
-    "max_possession_distance": 130,
+    # Possession (masih digunakan untuk visualisasi siapa pegang bola)
+    "max_possession_distance": 200,
 
-    # Penalty detection
-    "goal_check_window"      : 45,
-    "cooldown_frames"        : 30,
+    # Penalty detection (velocity-based)
+    "velocity_threshold"     : 15.0,    # px/frame — sesuaikan jika perlu
+    "pre_kick_search"        : 10,
+    "max_kicker_distance"    : 200,
+    "goal_check_window"      : 60,
+    "cooldown_frames"        : 60,
 
     # Visualisasi
     "show_gawang"           : True,
@@ -134,14 +138,18 @@ def print_penalty_details(penalties: List[Dict], stats: Dict) -> None:
 
     if penalties:
         print("\n  Detail Tendangan:")
-        print(f"  {'No':<4} {'Penendang':<12} {'Frame':>8} {'Gerakan Bola':>14} {'Hasil':<8}")
-        print("  " + "-" * 52)
+        print(f"  {'No':<4} {'Penendang':<12} {'Frame':>8} "
+              f"{'Velocity':>10} {'Hasil':<8} Keterangan")
+        print("  " + "-" * 68)
         for i, p in enumerate(penalties):
             status = "GOL!" if p['is_goal'] else "MISS"
+            vel = p.get('ball_velocity', 0.0)
+            reason = p.get('reason', '-')
             print(f"  {i+1:<4} {p['kicker_jersey']:<12} "
                   f"{p['frame_kick']:>8} "
-                  f"{p['ball_movement']:>13.0f}px "
-                  f"{status:<8}")
+                  f"{vel:>9.1f} "
+                  f"{status:<8} "
+                  f"{reason}")
     print()
 
 
@@ -158,10 +166,11 @@ def render_frames(
 
     # Map frame -> penalty event untuk display
     kick_display_map: Dict[int, Dict] = {}
-    kick_display_duration = 45  # tampilkan selama 45 frame
+    kick_display_duration = config.get("kick_display_duration", 50)
 
     for p in detected_penalties:
-        for f in range(p['frame_kick'], min(p['frame_kick'] + kick_display_duration, total_frames)):
+        for f in range(p['frame_kick'],
+                       min(p['frame_kick'] + kick_display_duration, total_frames)):
             kick_display_map[f] = p
 
     print(f"\n[RENDER] Mulai merender {total_frames} frames...")
@@ -307,6 +316,7 @@ def main():
     print(f"  Output       : {CONFIG['output_video']}")
     print(f"  Model        : {CONFIG['model_path']}")
     print(f"  Gunakan cache: {'Ya' if CONFIG['use_stub'] else 'Tidak'}")
+    print(f"  Vel threshold: {CONFIG['velocity_threshold']} px/frame")
     print(f"  Possession d : {CONFIG['max_possession_distance']}px")
     print("=" * 62)
 
@@ -354,20 +364,18 @@ def main():
     # TAHAP 3: Identifikasi pemain berdasarkan warna baju
     print("\n[MAIN] TAHAP 3: Identifikasi pemain berdasarkan warna baju...")
     player_identifier = PlayerIdentifier(
-        track_id_to_jersey          = None,  # Tidak perlu mapping manual
+        track_id_to_jersey          = None,
         reassign_distance_threshold = CONFIG.get("reassign_distance_threshold", 150.0),
         lost_timeout_frames         = CONFIG.get("lost_timeout_frames", 60)
     )
 
     print("[MAIN] Mengidentifikasi warna baju per frame...")
     for frame_num in range(n_player_frames):
-        # Update posisi untuk re-ID
         player_identifier.update_frame(
             frame_num=frame_num,
             player_tracks=tracks['players'][frame_num],
             debug=False
         )
-        # Identifikasi berdasarkan warna baju
         player_identifier.identify_players_by_color(
             frame=frames[frame_num],
             frame_num=frame_num,
@@ -377,29 +385,33 @@ def main():
 
     player_identifier.print_mappings()
 
-    # TAHAP 4: Tentukan possession bola
+    # TAHAP 4: Tentukan possession bola (untuk visualisasi)
     print("\n[MAIN] TAHAP 4: Menentukan possession bola per frame...")
     assigner = PlayerBallAssigner(
-        max_possession_distance=CONFIG.get("max_possession_distance", 130.0)
+        max_possession_distance=CONFIG.get("max_possession_distance", 200.0)
     )
     assigner.set_player_identifier(player_identifier)
     ball_possessions = assigner.assign_ball_to_players_bulk(tracks)
 
     possession_count: Dict[str, int] = {}
     for pid in ball_possessions:
-        jersey = "Tidak ada" if pid == -1 else player_identifier.get_jersey_number_for_player(pid)
+        jersey = ("Tidak ada" if pid == -1
+                  else player_identifier.get_jersey_number_for_player(pid))
         possession_count[jersey] = possession_count.get(jersey, 0) + 1
     print(f"\n[MAIN] Distribusi possession:")
     for jersey, count in sorted(possession_count.items(), key=lambda x: -x[1]):
         pct = count / len(ball_possessions) * 100
         print(f"[MAIN]   {jersey:<12}: {count:>5} frames ({pct:.1f}%)")
 
-    # TAHAP 5: Deteksi penalty kick
-    print("\n[MAIN] TAHAP 5: Deteksi penalty kick...")
+    # TAHAP 5: Deteksi penalty kick (VELOCITY-BASED)
+    print("\n[MAIN] TAHAP 5: Deteksi penalty kick (velocity-based)...")
     penalty_detector = PenaltyDetector(fps=fps)
     penalty_detector.set_jersey_map(player_identifier)
-    penalty_detector.goal_check_window = CONFIG.get("goal_check_window", 45)
-    penalty_detector.cooldown_frames   = CONFIG.get("cooldown_frames", 30)
+    penalty_detector.velocity_threshold  = CONFIG.get("velocity_threshold", 15.0)
+    penalty_detector.pre_kick_search     = CONFIG.get("pre_kick_search", 10)
+    penalty_detector.max_kicker_distance = CONFIG.get("max_kicker_distance", 200)
+    penalty_detector.goal_check_window   = CONFIG.get("goal_check_window", 60)
+    penalty_detector.cooldown_frames     = CONFIG.get("cooldown_frames", 60)
 
     detected_penalties = penalty_detector.detect_penalties(
         tracks, ball_possessions,
