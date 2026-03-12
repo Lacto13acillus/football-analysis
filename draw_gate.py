@@ -585,3 +585,274 @@ def draw_front_cones_on_frame(
 
     return output
 
+
+# ============================================================
+# DRAW GAWANG BBOX (BARU)
+# ============================================================
+
+def draw_gawang_on_frame(
+    frame      : np.ndarray,
+    gawang_bbox: List[float],
+    is_goal    : bool = False,
+    alpha      : float = 0.20
+) -> np.ndarray:
+    """Gambar visualisasi area gawang di frame."""
+    output = frame.copy()
+    x1, y1, x2, y2 = map(int, gawang_bbox)
+
+    color = (0, 255, 80) if is_goal else (0, 200, 255)
+
+    overlay = output.copy()
+    cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
+    cv2.addWeighted(overlay, alpha, output, 1 - alpha, 0, output)
+
+    cv2.rectangle(output, (x1, y1), (x2, y2), color, 2)
+
+    label = "GAWANG"
+    mid_x = (x1 + x2) // 2
+    (lw, lh), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+    cv2.rectangle(output,
+                  (mid_x - lw // 2 - 4, y1 - lh - 10),
+                  (mid_x + lw // 2 + 4, y1 - 2),
+                  color, -1)
+    cv2.putText(output, label,
+                (mid_x - lw // 2, y1 - 6),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+
+    return output
+
+
+# ============================================================
+# DRAW KICK RESULT INDICATOR (BARU)
+# ============================================================
+
+def draw_kick_result(
+    frame       : np.ndarray,
+    kicker_pos  : tuple,
+    is_goal     : bool,
+    kicker_jersey: str
+) -> np.ndarray:
+    """Gambar indikator hasil tendangan (GOL/MISS)."""
+    output = frame.copy()
+    color  = (0, 255, 80) if is_goal else (0, 0, 230)
+    status = "GOL!" if is_goal else "MISS"
+
+    if kicker_pos:
+        px, py = int(kicker_pos[0]), int(kicker_pos[1])
+        label = f"{kicker_jersey}: {status}"
+        (lw, lh), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
+        cv2.rectangle(output,
+                      (px - lw // 2 - 6, py - 60 - lh),
+                      (px + lw // 2 + 6, py - 50),
+                      color, -1)
+        cv2.putText(output, label,
+                    (px - lw // 2, py - 55),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+    return output
+
+
+# ============================================================
+# DRAW PENALTY STATS PANEL (BARU — menggantikan passing panel)
+# ============================================================
+
+def draw_penalty_stats_panel(
+    frame      : np.ndarray,
+    stats      : dict,
+    position   : Tuple[int, int] = (20, 20),
+    panel_width: int = 320
+) -> np.ndarray:
+    """
+    Panel statistik penalty kick dengan desain modern.
+    """
+    output = frame.copy()
+    px, py = position
+    pad = 14
+
+    BG_DARK      = (25, 25, 30)
+    BG_HEADER    = (50, 42, 35)
+    ACCENT       = (230, 200, 0)
+    GREEN        = (80, 220, 60)
+    RED          = (70, 70, 230)
+    YELLOW       = (50, 210, 255)
+    WHITE        = (255, 255, 255)
+    GRAY_LIGHT   = (200, 200, 200)
+    GRAY_MED     = (140, 140, 140)
+    GRAY_DIM     = (70, 70, 70)
+    BAR_BG       = (50, 50, 55)
+
+    per_player = stats.get('per_player', {})
+    n_players  = len(per_player)
+
+    header_h       = 44
+    summary_h      = 70
+    accuracy_h     = 42
+    divider_pad    = 12
+    player_row_h   = 50
+    player_sec_h   = (divider_pad + 22 + player_row_h * n_players) if n_players > 0 else 0
+    bottom_pad     = 12
+    total_h        = header_h + summary_h + accuracy_h + player_sec_h + bottom_pad
+
+    x1, y1 = px, py
+    x2, y2 = px + panel_width, py + total_h
+
+    overlay = output.copy()
+    draw_rounded_rect(overlay, (x1, y1), (x2, y2), BG_DARK, radius=14)
+    cv2.addWeighted(overlay, 0.88, output, 0.12, 0, output)
+    draw_rounded_rect(output, (x1, y1), (x2, y2), GRAY_DIM, radius=14, thickness=1)
+
+    # HEADER
+    overlay_h = output.copy()
+    draw_rounded_rect(overlay_h, (x1 + 1, y1 + 1), (x2 - 1, y1 + header_h), BG_HEADER, radius=13)
+    cv2.rectangle(overlay_h, (x1 + 1, y1 + header_h - 13), (x2 - 1, y1 + header_h), BG_HEADER, -1)
+    cv2.addWeighted(overlay_h, 0.95, output, 0.05, 0, output)
+    cv2.line(output, (x1 + pad, y1 + header_h), (x2 - pad, y1 + header_h), ACCENT, 2)
+
+    icon_cx = x1 + pad + 11
+    icon_cy = y1 + header_h // 2
+    cv2.circle(output, (icon_cx, icon_cy), 11, YELLOW, -1)
+    cv2.circle(output, (icon_cx, icon_cy), 11, WHITE, 1)
+    cv2.circle(output, (icon_cx, icon_cy), 4, (30, 30, 30), -1)
+
+    cv2.putText(output, "PENALTY KICK STATS",
+                (icon_cx + 18, y1 + header_h // 2 + 6),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.54, WHITE, 2)
+
+    # SUMMARY: 3 KOLOM (Total / Gol / Miss)
+    row_y = y1 + header_h + 8
+    col_w = (panel_width - 2 * pad) // 3
+
+    total_k = stats.get('total_kicks', 0)
+    total_g = stats.get('total_goals', 0)
+    total_m = stats.get('total_misses', 0)
+
+    items = [
+        (total_k, "Total",  ACCENT),
+        (total_g, "Gol",    GREEN),
+        (total_m, "Miss",   RED),
+    ]
+
+    for idx, (val, label, color) in enumerate(items):
+        col_cx = x1 + pad + idx * col_w + col_w // 2
+        val_str = str(val)
+        (vw, vh), _ = cv2.getTextSize(val_str, cv2.FONT_HERSHEY_SIMPLEX, 1.05, 2)
+        cv2.putText(output, val_str,
+                    (col_cx - vw // 2, row_y + 32),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.05, color, 2)
+        (lw, _), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.36, 1)
+        cv2.putText(output, label,
+                    (col_cx - lw // 2, row_y + 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.36, GRAY_MED, 1)
+
+    for idx in range(1, 3):
+        div_x = x1 + pad + idx * col_w
+        cv2.line(output, (div_x, row_y + 8), (div_x, row_y + 50), GRAY_DIM, 1)
+
+    # PROGRESS BAR GOL %
+    acc_y   = row_y + summary_h
+    goal_pct = stats.get('goal_pct', 0.0)
+
+    cv2.putText(output, "Konversi Gol",
+                (x1 + pad, acc_y + 2),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.42, GRAY_LIGHT, 1)
+
+    pct_color = GREEN if goal_pct >= 60 else (YELLOW if goal_pct >= 30 else RED)
+
+    pct_str = f"{goal_pct:.0f}%"
+    (pw, _), _ = cv2.getTextSize(pct_str, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 2)
+    cv2.putText(output, pct_str,
+                (x2 - pad - pw, acc_y + 3),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.52, pct_color, 2)
+
+    bar_x1 = x1 + pad
+    bar_x2 = x2 - pad
+    bar_y1 = acc_y + 12
+    bar_y2 = bar_y1 + 16
+    bar_total_w = bar_x2 - bar_x1
+
+    draw_rounded_rect(output, (bar_x1, bar_y1), (bar_x2, bar_y2), BAR_BG, radius=8)
+
+    fill_w = int(bar_total_w * min(goal_pct / 100.0, 1.0))
+    if fill_w > 6:
+        draw_rounded_rect(output, (bar_x1, bar_y1), (bar_x1 + fill_w, bar_y2), pct_color, radius=8)
+
+    # PER-PLAYER
+    if per_player:
+        sec_y = bar_y2 + divider_pad
+        cv2.line(output, (x1 + pad, sec_y), (x2 - pad, sec_y), GRAY_DIM, 1)
+        sec_y += 6
+
+        cv2.putText(output, "Per Pemain",
+                    (x1 + pad, sec_y + 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, GRAY_MED, 1)
+        sec_y += 22
+
+        for jersey, pstats in per_player.items():
+            p_total = pstats.get('total', 0)
+            p_goals = pstats.get('goals', 0)
+            p_pct   = pstats.get('goal_pct', 0.0)
+
+            # Badge jersey (warna berdasarkan nama)
+            badge_x = x1 + pad
+            badge_y = sec_y + 2
+            badge_w = 70
+            badge_h = 22
+
+            if 'Merah' in jersey:
+                badge_color = (0, 0, 180)       # Merah (BGR)
+            elif 'Abu' in jersey:
+                badge_color = (130, 130, 130)   # Abu-abu
+            else:
+                badge_color = (100, 100, 0)
+
+            overlay_b = output.copy()
+            draw_rounded_rect(overlay_b,
+                              (badge_x, badge_y),
+                              (badge_x + badge_w, badge_y + badge_h),
+                              badge_color, radius=6)
+            cv2.addWeighted(overlay_b, 0.85, output, 0.15, 0, output)
+
+            (jw, _), _ = cv2.getTextSize(jersey, cv2.FONT_HERSHEY_SIMPLEX, 0.38, 1)
+            cv2.putText(output, jersey,
+                        (badge_x + (badge_w - jw) // 2, badge_y + 16),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, WHITE, 1)
+
+            # Ratio text
+            ratio_str = f"{p_goals}/{p_total} gol"
+            cv2.putText(output, ratio_str,
+                        (badge_x + badge_w + 10, sec_y + 16),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.44, GRAY_LIGHT, 1)
+
+            # Mini progress bar
+            mini_bar_x1 = badge_x + badge_w + 80
+            mini_bar_x2 = x2 - pad - 48
+            mini_bar_y1 = sec_y + 6
+            mini_bar_y2 = mini_bar_y1 + 12
+            mini_bar_w  = mini_bar_x2 - mini_bar_x1
+
+            if mini_bar_w > 10:
+                draw_rounded_rect(output,
+                                  (mini_bar_x1, mini_bar_y1),
+                                  (mini_bar_x2, mini_bar_y2),
+                                  BAR_BG, radius=6)
+
+                mini_fill  = int(mini_bar_w * min(p_pct / 100.0, 1.0))
+                mini_color = GREEN if p_pct >= 60 else (YELLOW if p_pct >= 30 else RED)
+                if mini_fill > 4:
+                    draw_rounded_rect(output,
+                                      (mini_bar_x1, mini_bar_y1),
+                                      (mini_bar_x1 + mini_fill, mini_bar_y2),
+                                      mini_color, radius=6)
+
+            # Percentage
+            p_pct_str = f"{p_pct:.0f}%"
+            cv2.putText(output, p_pct_str,
+                        (x2 - pad - 40, sec_y + 17),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+                        GREEN if p_pct >= 60 else (YELLOW if p_pct >= 30 else RED), 1)
+
+            sec_y += player_row_h
+
+    return output
+
+
