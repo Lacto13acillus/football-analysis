@@ -1,12 +1,13 @@
 # penalty_detector.py
 # Mendeteksi event tendangan penalty dan mengevaluasi gol/tidak gol.
 #
-# Pendekatan: VELOCITY-BASED (bukan possession-based)
-#   1. Deteksi lonjakan kecepatan bola = kick event
-#   2. Cari pemain terdekat ke bola SEBELUM kick = penendang
-#   3. Setelah bola ditendang, cek apakah bola masuk gawang
-#   4. GOAL = bola masuk area bounding box gawang
-#   5. MISS = bola tidak masuk gawang
+# Pendekatan: STATIONARY-TO-MOVING detection
+#   1. Smooth posisi bola untuk hilangkan noise
+#   2. Deteksi saat bola berubah dari DIAM ke BERGERAK CEPAT = kick
+#   3. Cari pemain Merah/Abu-Abu terdekat SEBELUM kick = penendang
+#   4. Setelah kick, cek apakah bola masuk gawang dan TETAP di sana
+#   5. GOAL = bola masuk area gawang dan tidak memantul kembali
+#   6. MISS = bola tidak masuk / memantul kembali (saved)
 
 import sys
 sys.path.append('../')
@@ -24,18 +25,27 @@ class PenaltyDetector:
     def __init__(self, fps: int = 30):
         self.fps = fps
 
-        # --- Parameter deteksi kick (velocity-based) ---
-        self.velocity_window       = 3     # frame window untuk hitung velocity
-        self.velocity_threshold    = 15.0  # px/frame — lonjakan = tendangan
-        self.pre_kick_search       = 10    # frame sebelum kick untuk cari penendang
-        self.max_kicker_distance   = 200   # jarak max pemain ke bola agar dianggap penendang
+        # --- Parameter smoothing bola ---
+        self.ball_smooth_window     = 5     # rolling average window
+
+        # --- Parameter deteksi kick (stationary → moving) ---
+        self.velocity_window        = 3     # frame window untuk hitung velocity
+        self.stationary_threshold   = 5.0   # px/frame — bola dianggap diam
+        self.kick_velocity_threshold = 15.0 # px/frame — lonjakan = tendangan
+        self.stationary_min_frames  = 5     # minimal frame bola diam sebelum kick
+
+        # --- Parameter pencarian penendang ---
+        self.pre_kick_search        = 30    # frame sebelum kick untuk cari penendang
+        self.max_kicker_distance    = 500   # jarak max pemain ke bola
 
         # --- Parameter cooldown ---
-        self.cooldown_frames       = 60    # cooldown antara 2 tendangan
+        self.cooldown_frames        = 90    # cooldown antara 2 tendangan (~1.5s@60fps)
 
         # --- Parameter deteksi gol ---
-        self.goal_check_window     = 60    # frame setelah kick untuk cek gol
-        self.gawang_overlap_margin = 25    # margin pixel untuk overlap
+        self.goal_check_window      = 50    # frame setelah kick untuk cek gol
+        self.gawang_shrink_ratio    = 0.10  # shrink gawang bbox 10% dari setiap sisi
+        self.goal_min_frames_inside = 5     # minimal frame bola di dalam gawang
+        self.bounce_back_check      = 25    # frame setelah masuk gawang untuk cek bounce
 
         # --- Filter pemain (hanya penendang) ---
         self.kicker_jerseys = {"Merah", "Abu-Abu"}
@@ -62,9 +72,6 @@ class PenaltyDetector:
         tracks: Dict,
         sample_frames: int = 0
     ) -> Optional[List[float]]:
-        """
-        Hitung posisi rata-rata gawang dari semua frame.
-        """
         gawang_bboxes = []
         total = len(tracks.get('gawang', []))
         if sample_frames > 0:
@@ -91,30 +98,55 @@ class PenaltyDetector:
         return avg_bbox
 
     # ============================================================
+    # SMOOTH POSISI BOLA
+    # ============================================================
+
+    def _get_ball_positions(self, tracks: Dict) -> List[Optional[Tuple[float, float]]]:
+        """Ambil posisi pusat bola per frame."""
+        total = len(tracks['ball'])
+        positions = []
+        for f in range(total):
+            ball_data = tracks['ball'][f].get(1)
+            if ball_data and 'bbox' in ball_data:
+                pos = get_center_of_bbox(ball_data['bbox'])
+                positions.append((float(pos[0]), float(pos[1])))
+            else:
+                positions.append(None)
+        return positions
+
+    def _smooth_ball_positions(
+        self,
+        positions: List[Optional[Tuple[float, float]]]
+    ) -> List[Optional[Tuple[float, float]]]:
+        """Smooth posisi bola menggunakan rolling average."""
+        n = len(positions)
+        smoothed = list(positions)
+        half_w = self.ball_smooth_window // 2
+
+        for i in range(half_w, n - half_w):
+            window_x = []
+            window_y = []
+            for j in range(i - half_w, i + half_w + 1):
+                if positions[j] is not None:
+                    window_x.append(positions[j][0])
+                    window_y.append(positions[j][1])
+            if window_x:
+                smoothed[i] = (float(np.mean(window_x)), float(np.mean(window_y)))
+
+        return smoothed
+
+    # ============================================================
     # HITUNG KECEPATAN BOLA
     # ============================================================
 
     def compute_ball_velocities(
         self,
-        tracks: Dict
+        positions: List[Optional[Tuple[float, float]]]
     ) -> List[float]:
-        """
-        Hitung kecepatan bola (px/frame) untuk setiap frame.
-        Menggunakan sliding window untuk smoothing.
-        """
-        total_frames = len(tracks['ball'])
-        velocities = [0.0] * total_frames
+        total = len(positions)
+        velocities = [0.0] * total
 
-        positions = []
-        for f in range(total_frames):
-            ball_data = tracks['ball'][f].get(1)
-            if ball_data and 'bbox' in ball_data:
-                pos = get_center_of_bbox(ball_data['bbox'])
-                positions.append(pos)
-            else:
-                positions.append(None)
-
-        for f in range(self.velocity_window, total_frames):
+        for f in range(self.velocity_window, total):
             pos_now  = positions[f]
             pos_prev = positions[f - self.velocity_window]
 
@@ -125,65 +157,175 @@ class PenaltyDetector:
         return velocities
 
     # ============================================================
-    # CEK BOLA MASUK GAWANG
+    # DETEKSI KICK: STATIONARY → MOVING TRANSITION
+    # ============================================================
+
+    def detect_kick_frames(
+        self,
+        velocities: List[float],
+        debug: bool = True
+    ) -> List[int]:
+        """
+        Deteksi frame di mana bola berubah dari DIAM ke BERGERAK CEPAT.
+
+        Logika:
+        - Bola dianggap DIAM jika velocity < stationary_threshold
+          selama minimal stationary_min_frames frame berturut-turut
+        - Bola dianggap DITENDANG jika velocity melompat > kick_velocity_threshold
+          setelah periode diam tersebut
+        """
+        kick_frames = []
+        last_kick = -999
+        n = len(velocities)
+
+        for f in range(self.stationary_min_frames, n):
+            # Cek apakah velocity saat ini tinggi (=kick)
+            if velocities[f] < self.kick_velocity_threshold:
+                continue
+
+            # Cooldown
+            if (f - last_kick) < self.cooldown_frames:
+                continue
+
+            # Cek apakah beberapa frame SEBELUMNYA bola diam
+            stationary_count = 0
+            for prev_f in range(f - 1, max(-1, f - self.stationary_min_frames - 5), -1):
+                if velocities[prev_f] < self.stationary_threshold:
+                    stationary_count += 1
+                else:
+                    break
+
+            if stationary_count >= self.stationary_min_frames:
+                kick_frames.append(f)
+                last_kick = f
+                if debug:
+                    print(f"[PENALTY] Kick detected at frame {f}: "
+                          f"velocity={velocities[f]:.1f} px/frame, "
+                          f"stationary {stationary_count} frames before")
+
+        return kick_frames
+
+    # ============================================================
+    # CEK BOLA MASUK GAWANG (IMPROVED)
     # ============================================================
 
     def check_ball_in_gawang(
         self,
-        tracks: Dict,
-        frame_start: int,
-        frame_end: int,
-        stable_gawang_bbox: Optional[List[float]] = None
+        positions: List[Optional[Tuple[float, float]]],
+        kick_frame: int,
+        stable_gawang_bbox: List[float],
+        debug: bool = False
     ) -> Tuple[bool, int, str]:
         """
-        Cek apakah bola masuk ke area gawang antara frame_start dan frame_end.
+        Cek apakah bola masuk gawang setelah tendangan.
 
-        Returns:
-            (is_goal, goal_frame, reason)
+        Logika improved:
+        1. Shrink gawang bbox agar tidak terlalu besar
+        2. Cek apakah bola masuk area gawang yang di-shrink
+        3. Cek apakah bola TETAP di area gawang (tidak memantul kembali)
+           - Jika bola masuk lalu kembali ke bawah = SAVED (MISS)
+           - Jika bola masuk dan tetap/hilang = GOL
         """
-        total_frames = len(tracks['ball'])
-        check_end = min(frame_end, total_frames - 1)
-        margin = self.gawang_overlap_margin
+        gx1, gy1, gx2, gy2 = stable_gawang_bbox
+        gw = gx2 - gx1
+        gh = gy2 - gy1
 
-        for f in range(frame_start, check_end + 1):
-            ball_data = tracks['ball'][f].get(1)
-            if not ball_data or 'bbox' not in ball_data:
+        # Shrink gawang bbox
+        shrink_x = gw * self.gawang_shrink_ratio
+        shrink_y = gh * self.gawang_shrink_ratio
+        inner_gx1 = gx1 + shrink_x
+        inner_gy1 = gy1 + shrink_y
+        inner_gx2 = gx2 - shrink_x
+        inner_gy2 = gy2 - shrink_y
+
+        total = len(positions)
+        check_start = kick_frame
+        check_end = min(kick_frame + self.goal_check_window, total - 1)
+
+        # Track kapan bola masuk gawang
+        entered_gawang = False
+        enter_frame = -1
+        frames_inside = 0
+
+        # Posisi bola saat kick (sebagai referensi arah)
+        kick_pos = positions[kick_frame] if kick_frame < total else None
+
+        for f in range(check_start, check_end + 1):
+            pos = positions[f]
+            if pos is None:
                 continue
 
-            ball_bbox = ball_data['bbox']
-            ball_cx, ball_cy = get_center_of_bbox(ball_bbox)
+            bx, by = pos
 
-            # Gunakan gawang stabil atau per-frame
-            if stable_gawang_bbox:
-                gx1, gy1, gx2, gy2 = stable_gawang_bbox
-            else:
-                gawang_data = tracks['gawang'][f].get(1)
-                if not gawang_data or 'bbox' not in gawang_data:
-                    continue
-                gx1, gy1, gx2, gy2 = gawang_data['bbox']
+            inside = (inner_gx1 <= bx <= inner_gx2 and
+                      inner_gy1 <= by <= inner_gy2)
 
-            # Cek apakah pusat bola berada di dalam area gawang (+ margin)
-            if (gx1 - margin <= ball_cx <= gx2 + margin and
-                gy1 - margin <= ball_cy <= gy2 + margin):
-                return True, f, f"Bola masuk gawang di frame {f}"
+            if inside:
+                frames_inside += 1
+                if not entered_gawang:
+                    entered_gawang = True
+                    enter_frame = f
+                    if debug:
+                        print(f"[PENALTY]   Bola masuk gawang di frame {f} "
+                              f"({bx:.0f}, {by:.0f})")
 
-        return False, -1, "Bola tidak masuk gawang"
+        if not entered_gawang or frames_inside < self.goal_min_frames_inside:
+            return False, -1, (f"Bola tidak masuk gawang "
+                               f"(inside={frames_inside} frames, "
+                               f"min={self.goal_min_frames_inside})")
+
+        # Cek apakah bola BOUNCE BACK setelah masuk gawang
+        # Jika bola kembali ke posisi Y yang lebih rendah (lebih dekat penendang)
+        # = keeper menangkap/memantulkan = MISS
+        bounce_check_start = enter_frame
+        bounce_check_end = min(enter_frame + self.bounce_back_check, total - 1)
+
+        # Posisi Y saat masuk gawang
+        enter_pos = positions[enter_frame]
+        if enter_pos is None:
+            return True, enter_frame, f"Bola masuk gawang di frame {enter_frame}"
+
+        enter_y = enter_pos[1]
+        gawang_center_y = (gy1 + gy2) / 2
+
+        # Hitung berapa banyak frame bola di BAWAH gawang setelah masuk
+        # (= bounce back ke arah penendang)
+        frames_below_gawang = 0
+        for f in range(bounce_check_start + 5, bounce_check_end + 1):
+            pos = positions[f]
+            if pos is None:
+                continue
+            bx, by = pos
+            # Jika bola kembali ke bawah gawang (y > gy2 = di bawah gawang)
+            if by > inner_gy2 + 30:
+                frames_below_gawang += 1
+
+        if frames_below_gawang >= 5:
+            return False, enter_frame, (f"Bola masuk gawang frame {enter_frame} "
+                                        f"tapi memantul kembali "
+                                        f"({frames_below_gawang} frames di bawah)")
+
+        return True, enter_frame, f"Bola masuk gawang di frame {enter_frame}"
 
     # ============================================================
-    # CARI PENENDANG TERDEKAT
+    # CARI PENENDANG TERDEKAT (IMPROVED)
     # ============================================================
 
     def find_kicker(
         self,
         tracks: Dict,
-        kick_frame: int
+        positions: List[Optional[Tuple[float, float]]],
+        kick_frame: int,
+        debug: bool = False
     ) -> Tuple[Optional[int], Optional[str], Optional[Tuple[int, int]]]:
         """
         Cari pemain (Merah/Abu-Abu) yang paling dekat ke bola
-        pada beberapa frame SEBELUM kick.
+        pada frame-frame SEBELUM kick (saat bola masih diam).
 
-        Returns:
-            (kicker_track_id, kicker_jersey, kicker_position) atau (None, None, None)
+        Improved:
+        - Cari di range yang lebih luas (pre_kick_search = 30 frames)
+        - Prioritaskan frame di mana bola masih diam (pemain sedang ancang-ancang)
+        - Max distance diperbesar (500px)
         """
         total_frames = len(tracks['players'])
         search_start = max(0, kick_frame - self.pre_kick_search)
@@ -193,12 +335,12 @@ class PenaltyDetector:
         best_jersey    = None
         best_distance  = float('inf')
         best_position  = None
+        best_frame     = -1
 
         for f in range(search_start, search_end):
-            ball_data = tracks['ball'][f].get(1)
-            if not ball_data or 'bbox' not in ball_data:
+            ball_pos = positions[f] if f < len(positions) else None
+            if ball_pos is None:
                 continue
-            ball_pos = get_center_of_bbox(ball_data['bbox'])
 
             for player_id, player_data in tracks['players'][f].items():
                 bbox = player_data.get('bbox')
@@ -215,49 +357,56 @@ class PenaltyDetector:
                 foot_pos = get_center_of_bbox_bottom(bbox)
                 dist = measure_distance(foot_pos, ball_pos)
 
+                # Juga cek center bbox (kadang foot position kurang akurat)
+                center_pos = get_center_of_bbox(bbox)
+                dist_center = measure_distance(center_pos, ball_pos)
+                dist = min(dist, dist_center)
+
                 if dist < best_distance:
                     best_distance  = dist
                     best_player_id = player_id
                     best_jersey    = jersey
                     best_position  = foot_pos
+                    best_frame     = f
 
         if best_distance <= self.max_kicker_distance and best_player_id is not None:
+            if debug:
+                print(f"[PENALTY]   Kicker found: {best_jersey} (track {best_player_id}) "
+                      f"at frame {best_frame}, distance={best_distance:.0f}px")
             return best_player_id, best_jersey, best_position
+        else:
+            if debug:
+                print(f"[PENALTY]   No kicker found within {self.max_kicker_distance}px "
+                      f"(best={best_distance:.0f}px, jersey={best_jersey})")
         return None, None, None
 
     # ============================================================
-    # DETEKSI PENALTY UTAMA — VELOCITY-BASED
+    # DETEKSI PENALTY UTAMA
     # ============================================================
 
     def detect_penalties(
         self,
         tracks           : Dict,
-        ball_possessions : List[int],  # Tetap ada untuk kompatibilitas
+        ball_possessions : List[int],
         player_identifier = None,
         debug            : bool = True
     ) -> List[Dict]:
-        """
-        Deteksi semua event tendangan penalty menggunakan velocity spike.
-
-        Logika:
-        1. Hitung kecepatan bola per frame
-        2. Deteksi frame di mana velocity melonjak = kick event
-        3. Cari pemain Merah/Abu-Abu terdekat ke bola sebelum kick
-        4. Setelah kick, cek apakah bola masuk gawang
-        """
         if player_identifier:
             self._player_identifier = player_identifier
 
         total_frames = len(tracks['ball'])
 
         if debug:
-            print(f"\n[PENALTY] === PENALTY DETECTION (VELOCITY-BASED) ===")
-            print(f"[PENALTY] Total frames         : {total_frames}")
-            print(f"[PENALTY] Velocity threshold    : {self.velocity_threshold} px/frame")
-            print(f"[PENALTY] Pre-kick search       : {self.pre_kick_search} frames")
-            print(f"[PENALTY] Max kicker distance   : {self.max_kicker_distance}px")
-            print(f"[PENALTY] Goal check window     : {self.goal_check_window} frames")
-            print(f"[PENALTY] Cooldown              : {self.cooldown_frames} frames")
+            print(f"\n[PENALTY] === PENALTY DETECTION (STATIONARY→MOVING) ===")
+            print(f"[PENALTY] Total frames              : {total_frames}")
+            print(f"[PENALTY] Stationary threshold       : {self.stationary_threshold} px/frame")
+            print(f"[PENALTY] Kick velocity threshold    : {self.kick_velocity_threshold} px/frame")
+            print(f"[PENALTY] Stationary min frames      : {self.stationary_min_frames}")
+            print(f"[PENALTY] Pre-kick search            : {self.pre_kick_search} frames")
+            print(f"[PENALTY] Max kicker distance         : {self.max_kicker_distance}px")
+            print(f"[PENALTY] Goal check window           : {self.goal_check_window} frames")
+            print(f"[PENALTY] Gawang shrink ratio         : {self.gawang_shrink_ratio}")
+            print(f"[PENALTY] Cooldown                    : {self.cooldown_frames} frames")
 
         # Stabilisasi gawang
         stable_gawang = self.get_stable_gawang_bbox(tracks)
@@ -265,79 +414,69 @@ class PenaltyDetector:
             print("[PENALTY] WARNING: Gawang tidak terdeteksi!")
             return []
 
-        # Hitung velocity bola
-        velocities = self.compute_ball_velocities(tracks)
+        # Ambil dan smooth posisi bola
+        raw_positions = self._get_ball_positions(tracks)
+        positions = self._smooth_ball_positions(raw_positions)
+
+        # Hitung velocity pada posisi yang sudah di-smooth
+        velocities = self.compute_ball_velocities(positions)
 
         if debug:
             max_vel = max(velocities) if velocities else 0
             avg_vel = np.mean(velocities) if velocities else 0
-            print(f"[PENALTY] Max velocity          : {max_vel:.1f} px/frame")
-            print(f"[PENALTY] Avg velocity          : {avg_vel:.1f} px/frame")
+            print(f"[PENALTY] Max velocity (smoothed)     : {max_vel:.1f} px/frame")
+            print(f"[PENALTY] Avg velocity (smoothed)     : {avg_vel:.1f} px/frame")
 
-        # Deteksi kick events (velocity spike)
+        # Deteksi kick frames (stationary → moving)
+        kick_frames = self.detect_kick_frames(velocities, debug=debug)
+
+        if debug:
+            print(f"[PENALTY] Total kick frames detected  : {len(kick_frames)}")
+
+        # Untuk setiap kick, cari penendang dan cek gol
         penalties = []
-        last_kick_frame = -999
 
-        for f in range(total_frames):
-            velocity = velocities[f]
-
-            # Cek apakah ini velocity spike
-            if velocity < self.velocity_threshold:
-                continue
-
-            # Cek cooldown
-            if (f - last_kick_frame) < self.cooldown_frames:
-                continue
-
-            # Pastikan ini AWAL dari spike (frame sebelumnya velocity rendah)
-            if f > 0 and velocities[f - 1] >= self.velocity_threshold * 0.7:
-                continue
-
+        for kick_frame in kick_frames:
             if debug:
-                print(f"[PENALTY] Velocity spike di frame {f}: {velocity:.1f} px/frame")
+                print(f"\n[PENALTY] --- Processing kick at frame {kick_frame} ---")
 
             # Cari penendang
-            kicker_id, kicker_jersey, kicker_pos = self.find_kicker(tracks, f)
+            kicker_id, kicker_jersey, kicker_pos = self.find_kicker(
+                tracks, positions, kick_frame, debug=debug
+            )
 
             if kicker_id is None:
                 if debug:
-                    print(f"[PENALTY]   -> Skip: tidak ada penendang Merah/Abu-Abu terdekat")
+                    print(f"[PENALTY]   -> Skip: tidak ada penendang terdekat")
                 continue
 
-            if debug:
-                print(f"[PENALTY]   -> Penendang: {kicker_jersey} (track {kicker_id})")
-
             # Cek gol
-            check_end = min(f + self.goal_check_window, total_frames - 1)
             is_goal, goal_frame, reason = self.check_ball_in_gawang(
-                tracks, f, check_end, stable_gawang_bbox=stable_gawang
+                positions, kick_frame, stable_gawang, debug=debug
             )
 
             # Posisi bola saat kick
-            ball_pos_kick = None
-            ball_data = tracks['ball'][f].get(1)
-            if ball_data:
-                ball_pos_kick = get_center_of_bbox(ball_data['bbox'])
+            ball_pos_kick = positions[kick_frame]
 
             penalty_event = {
-                'frame_kick'     : f,
+                'frame_kick'     : kick_frame,
                 'frame_goal'     : goal_frame if is_goal else -1,
-                'frame_display'  : f + 5,
+                'frame_display'  : kick_frame + 5,
                 'kicker_id'      : kicker_id,
                 'kicker_jersey'  : kicker_jersey,
                 'is_goal'        : is_goal,
                 'reason'         : reason,
-                'ball_velocity'  : velocity,
+                'ball_velocity'  : velocities[kick_frame],
                 'kicker_pos'     : kicker_pos,
                 'ball_pos_kick'  : ball_pos_kick,
                 'gawang_bbox'    : stable_gawang,
             }
             penalties.append(penalty_event)
-            last_kick_frame = f
 
             if debug:
                 status = "GOL!" if is_goal else "MISS"
-                print(f"[PENALTY]   -> {status} | velocity={velocity:.1f} | {reason}")
+                print(f"[PENALTY]   -> {kicker_jersey}: {status} "
+                      f"| velocity={velocities[kick_frame]:.1f} | {reason}")
 
         if debug:
             gol  = sum(1 for p in penalties if p['is_goal'])
