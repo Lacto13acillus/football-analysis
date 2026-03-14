@@ -1,9 +1,12 @@
 # penalty_detector.py
-# Mendeteksi event tendangan penalty dan mengevaluasi SHOOT ON TARGET / OFF TARGET
+# Mendeteksi event tendangan penalty:
+#   1. SHOOT ON TARGET / OFF TARGET
+#   2. GOL / SAVED BY KEEPER
 #
-# PERUBAHAN:
-#   - Tambah manual_kick_mapping: override warna penendang per kick frame
-#   - Handle ID switching (track ID shared oleh 2 pemain)
+# Logic:
+#   - ON TARGET + bola TIDAK dekat keeper → GOL
+#   - ON TARGET + bola dekat keeper → SAVED (tidak gol)
+#   - OFF TARGET → tidak gol (melebar/melambung)
 
 import sys
 sys.path.append('../')
@@ -38,12 +41,17 @@ class PenaltyDetector:
         self.gawang_shrink_ratio     = 0.05
         self.on_target_min_frames    = 1
 
+        # --- Parameter deteksi KEEPER SAVE ---
+        self.keeper_save_check_window = 45    # frame setelah kick untuk cek keeper
+        self.keeper_ball_distance_thr = 150   # jarak bola ke keeper bbox = dianggap save
+        self.keeper_ball_inside_thr   = 0.3   # ratio overlap bola masuk keeper bbox
+        self.keeper_velocity_drop_thr = 3.0   # velocity bola turun drastis = tertangkap
+        self.keeper_save_min_frames   = 2     # minimal frame bola dekat keeper
+
         # --- Display ---
         self.kick_display_duration   = 50
 
         # --- Manual kick mapping ---
-        # Format: {kick_frame: "Merah" atau "Abu-Abu"}
-        # Override warna penendang di kick frame tertentu
         self._manual_kick_mapping: Dict[int, str] = {}
 
         self._player_identifier = None
@@ -52,10 +60,6 @@ class PenaltyDetector:
         self._player_identifier = player_identifier
 
     def set_manual_kick_mapping(self, mapping: Dict[int, str]) -> None:
-        """
-        Set manual override untuk warna penendang per kick frame.
-        Format: {86: "Merah", 266: "Abu-Abu", ...}
-        """
         self._manual_kick_mapping = mapping
         print(f"[PENALTY] Manual kick mapping diset: {self._manual_kick_mapping}")
 
@@ -65,7 +69,7 @@ class PenaltyDetector:
         return str(player_id)
 
     # ============================================================
-    # DETEKSI WARNA BAJU (langsung dari frame)
+    # DETEKSI WARNA BAJU
     # ============================================================
 
     @staticmethod
@@ -73,7 +77,6 @@ class PenaltyDetector:
         frame: np.ndarray,
         bbox: List[float]
     ) -> str:
-        """Deteksi warna baju dari bbox pemain di frame tertentu."""
         x1, y1, x2, y2 = map(int, bbox)
         h_box = y2 - y1
         shirt_y1 = y1 + int(h_box * 0.10)
@@ -157,7 +160,7 @@ class PenaltyDetector:
         return velocities
 
     # ============================================================
-    # DETEKSI KICK FRAMES (velocity spike + cooldown)
+    # DETEKSI KICK FRAMES
     # ============================================================
 
     def detect_kick_frames(
@@ -200,11 +203,6 @@ class PenaltyDetector:
         stable_gawang_bbox: List[float],
         debug: bool = False
     ) -> Tuple[bool, int, str]:
-        """
-        Cek apakah bola MENGENAI area bounding box gawang setelah tendangan.
-        - ON TARGET: Bola masuk ke area bbox gawang
-        - OFF TARGET: Bola TIDAK pernah masuk area bbox gawang
-        """
         gx1, gy1, gx2, gy2 = stable_gawang_bbox
         gw = gx2 - gx1
         gh = gy2 - gy1
@@ -247,7 +245,119 @@ class PenaltyDetector:
             )
 
     # ============================================================
-    # CARI PENENDANG — DENGAN MANUAL OVERRIDE
+    # CEK KEEPER SAVE — BOLA DITANGKAP/DIBLOK KIPER
+    # ============================================================
+
+    def check_keeper_save(
+        self,
+        tracks: Dict,
+        velocities: List[float],
+        kick_frame: int,
+        debug: bool = False
+    ) -> Tuple[bool, int, str]:
+        """
+        Cek apakah bola ditangkap/diblok oleh keeper setelah tendangan.
+
+        Logic deteksi save:
+        1. Bola mendekati bbox keeper (jarak center bola ke center keeper < threshold)
+        2. ATAU bola masuk ke dalam bbox keeper (overlap)
+        3. DAN velocity bola turun drastis setelah dekat keeper (tertangkap/diblok)
+
+        Returns:
+            (is_saved, save_frame, reason)
+        """
+        total = len(tracks['ball'])
+        check_end = min(kick_frame + self.keeper_save_check_window, total - 1)
+
+        frames_near_keeper = 0
+        first_near_frame = -1
+        min_distance = float('inf')
+        velocity_dropped = False
+
+        for f in range(kick_frame, check_end + 1):
+            # Data bola
+            ball_data = tracks['ball'][f].get(1)
+            if not ball_data or 'bbox' not in ball_data:
+                continue
+            ball_bbox = ball_data['bbox']
+            ball_cx, ball_cy = get_center_of_bbox(ball_bbox)
+
+            # Data keeper
+            keeper_data = tracks['keeper'][f].get(1)
+            if not keeper_data or 'bbox' not in keeper_data:
+                continue
+            keeper_bbox = keeper_data['bbox']
+            kx1, ky1, kx2, ky2 = keeper_bbox
+            keeper_cx, keeper_cy = get_center_of_bbox(keeper_bbox)
+
+            # --- Metode 1: Jarak center bola ke center keeper ---
+            dist = measure_distance(
+                (ball_cx, ball_cy), (keeper_cx, keeper_cy)
+            )
+            if dist < min_distance:
+                min_distance = dist
+
+            # --- Metode 2: Bola masuk ke dalam expanded keeper bbox ---
+            # Expand keeper bbox sedikit untuk toleransi
+            expand_x = (kx2 - kx1) * 0.2
+            expand_y = (ky2 - ky1) * 0.2
+            exp_kx1 = kx1 - expand_x
+            exp_ky1 = ky1 - expand_y
+            exp_kx2 = kx2 + expand_x
+            exp_ky2 = ky2 + expand_y
+
+            ball_near = (dist < self.keeper_ball_distance_thr)
+            ball_inside = (exp_kx1 <= ball_cx <= exp_kx2 and
+                           exp_ky1 <= ball_cy <= exp_ky2)
+
+            if ball_near or ball_inside:
+                frames_near_keeper += 1
+                if first_near_frame == -1:
+                    first_near_frame = f
+
+                # --- Metode 3: Cek velocity drop setelah dekat keeper ---
+                # Bola yang ditangkap → velocity turun drastis
+                if f + 5 < total:
+                    vel_now = velocities[f] if f < len(velocities) else 0
+                    # Cek velocity di beberapa frame ke depan
+                    future_vels = []
+                    for ff in range(f + 2, min(f + 10, len(velocities))):
+                        future_vels.append(velocities[ff])
+                    if future_vels:
+                        avg_future_vel = np.mean(future_vels)
+                        if avg_future_vel < self.keeper_velocity_drop_thr:
+                            velocity_dropped = True
+
+        # --- Keputusan save ---
+        if frames_near_keeper >= self.keeper_save_min_frames:
+            if velocity_dropped:
+                reason = (f"SAVED - Bola ditangkap keeper di frame {first_near_frame} "
+                          f"({frames_near_keeper} frames dekat keeper, "
+                          f"velocity drop terdeteksi)")
+            else:
+                reason = (f"SAVED - Bola diblok keeper di frame {first_near_frame} "
+                          f"({frames_near_keeper} frames dekat keeper, "
+                          f"jarak min={min_distance:.0f}px)")
+
+            if debug:
+                print(f"[PENALTY]   Keeper: {reason}")
+
+            return True, first_near_frame, reason
+
+        # Tidak di-save
+        if debug:
+            print(f"[PENALTY]   Keeper: Tidak menangkap "
+                  f"(dekat={frames_near_keeper} frames, "
+                  f"jarak min={min_distance:.0f}px)")
+
+        return False, -1, (
+            f"Keeper tidak menangkap "
+            f"(dekat={frames_near_keeper} frames, "
+            f"jarak min={min_distance:.0f}px)"
+        )
+
+    # ============================================================
+    # CARI PENENDANG
     # ============================================================
 
     def find_kicker(
@@ -257,11 +367,6 @@ class PenaltyDetector:
         kick_frame: int,
         debug: bool = False
     ) -> Tuple[Optional[int], Optional[str], Optional[Tuple[int, int]]]:
-        """
-        Cari player terdekat ke bola sebelum kick.
-        Jika ada manual_kick_mapping untuk kick_frame ini, gunakan itu
-        sebagai override warna penendang.
-        """
         total_frames = len(tracks['players'])
         search_start = max(0, kick_frame - self.pre_kick_search)
         search_end   = min(kick_frame + 1, total_frames)
@@ -304,19 +409,15 @@ class PenaltyDetector:
                       f"(best={best_distance:.0f}px)")
             return None, None, None
 
-        # ===== PENENTUAN JERSEY =====
-
-        # 1. Cek manual kick mapping DULU (highest priority)
+        # Penentuan jersey
         if kick_frame in self._manual_kick_mapping:
             jersey = self._manual_kick_mapping[kick_frame]
             if debug:
                 print(f"[PENALTY]   Jersey dari MANUAL KICK MAPPING: "
                       f"frame {kick_frame} -> {jersey}")
         else:
-            # 2. Coba dari PlayerIdentifier
             jersey = self._get_jersey(best_player_id)
 
-            # 3. Jika masih Unknown, re-detect dari frame
             if jersey == "Unknown" or jersey.startswith("ID:"):
                 if best_frame < len(frames) and best_bbox is not None:
                     jersey = self.detect_shirt_color_from_frame(
@@ -326,7 +427,6 @@ class PenaltyDetector:
                         print(f"[PENALTY]   Re-detected color for track "
                               f"{best_player_id}: {jersey}")
 
-            # 4. Jika masih Unknown, coba beberapa frame di sekitar
             if jersey == "Unknown" or jersey.startswith("ID:"):
                 for f in range(max(0, best_frame - 10),
                                min(len(frames), best_frame + 5)):
@@ -348,7 +448,7 @@ class PenaltyDetector:
         return best_player_id, jersey, best_position
 
     # ============================================================
-    # DETEKSI PENALTY UTAMA
+    # DETEKSI PENALTY UTAMA — ON TARGET + GOL/SAVED
     # ============================================================
 
     def detect_penalties(
@@ -365,7 +465,7 @@ class PenaltyDetector:
         total_frames = len(tracks['ball'])
 
         if debug:
-            print(f"\n[PENALTY] === SHOOT ON TARGET DETECTION (VELOCITY SPIKE) ===")
+            print(f"\n[PENALTY] === PENALTY DETECTION (ON TARGET + GOL/SAVED) ===")
             print(f"[PENALTY] Total frames              : {total_frames}")
             print(f"[PENALTY] Kick velocity threshold    : "
                   f"{self.kick_velocity_threshold} px/frame")
@@ -377,8 +477,12 @@ class PenaltyDetector:
                   f"{self.on_target_check_window} frames")
             print(f"[PENALTY] Gawang shrink ratio        : "
                   f"{self.gawang_shrink_ratio}")
-            print(f"[PENALTY] On-target min frames       : "
-                  f"{self.on_target_min_frames}")
+            print(f"[PENALTY] Keeper save check window   : "
+                  f"{self.keeper_save_check_window} frames")
+            print(f"[PENALTY] Keeper ball distance thr   : "
+                  f"{self.keeper_ball_distance_thr}px")
+            print(f"[PENALTY] Keeper velocity drop thr   : "
+                  f"{self.keeper_velocity_drop_thr} px/frame")
             print(f"[PENALTY] Cooldown                   : "
                   f"{self.cooldown_frames} frames")
             if self._manual_kick_mapping:
@@ -405,7 +509,7 @@ class PenaltyDetector:
                 print(f"\n[PENALTY] --- Kick at frame {kick_frame} "
                       f"(vel={velocities[kick_frame]:.1f}) ---")
 
-            # Cari penendang (dengan manual override jika ada)
+            # Cari penendang
             kicker_id, kicker_jersey, kicker_pos = self.find_kicker(
                 tracks, frames if frames else [], kick_frame, debug=debug
             )
@@ -415,10 +519,33 @@ class PenaltyDetector:
                     print(f"[PENALTY]   -> Skip: tidak ada player terdekat")
                 continue
 
-            # Cek SHOOT ON TARGET
-            is_on_target, hit_frame, reason = self.check_shoot_on_target(
+            # 1. Cek SHOOT ON TARGET
+            is_on_target, hit_frame, on_target_reason = self.check_shoot_on_target(
                 tracks, kick_frame, stable_gawang, debug=debug
             )
+
+            # 2. Cek KEEPER SAVE (hanya jika on target)
+            is_saved = False
+            save_frame = -1
+            save_reason = ""
+
+            if is_on_target:
+                is_saved, save_frame, save_reason = self.check_keeper_save(
+                    tracks, velocities, kick_frame, debug=debug
+                )
+
+            # 3. Tentukan GOL
+            # GOL = on target DAN TIDAK di-save keeper
+            # TIDAK GOL = off target ATAU di-save keeper
+            is_goal = is_on_target and not is_saved
+
+            # Buat reason gabungan
+            if is_goal:
+                result_reason = f"GOL! {on_target_reason}"
+            elif is_on_target and is_saved:
+                result_reason = f"SAVED! {save_reason}"
+            else:
+                result_reason = f"MISS! {on_target_reason}"
 
             ball_pos_kick = None
             ball_data = tracks['ball'][kick_frame].get(1)
@@ -426,43 +553,61 @@ class PenaltyDetector:
                 ball_pos_kick = get_center_of_bbox(ball_data['bbox'])
 
             penalty_event = {
-                'frame_kick'     : kick_frame,
-                'frame_hit'      : hit_frame,
-                'frame_display'  : kick_frame + 5,
-                'kicker_id'      : kicker_id,
-                'kicker_jersey'  : kicker_jersey,
-                'is_on_target'   : is_on_target,
-                'reason'         : reason,
-                'ball_velocity'  : velocities[kick_frame],
-                'kicker_pos'     : kicker_pos,
-                'ball_pos_kick'  : ball_pos_kick,
-                'gawang_bbox'    : stable_gawang,
+                'frame_kick'      : kick_frame,
+                'frame_hit'       : hit_frame,
+                'frame_save'      : save_frame,
+                'frame_display'   : kick_frame + 5,
+                'kicker_id'       : kicker_id,
+                'kicker_jersey'   : kicker_jersey,
+                'is_on_target'    : is_on_target,
+                'is_saved'        : is_saved,
+                'is_goal'         : is_goal,
+                'on_target_reason': on_target_reason,
+                'save_reason'     : save_reason,
+                'result_reason'   : result_reason,
+                'ball_velocity'   : velocities[kick_frame],
+                'kicker_pos'      : kicker_pos,
+                'ball_pos_kick'   : ball_pos_kick,
+                'gawang_bbox'     : stable_gawang,
             }
             penalties.append(penalty_event)
 
             if debug:
-                status = "ON TARGET" if is_on_target else "OFF TARGET"
-                print(f"[PENALTY]   -> {kicker_jersey}: {status} | {reason}")
+                target_str = "ON TARGET" if is_on_target else "OFF TARGET"
+                if is_goal:
+                    result_str = "GOL!"
+                elif is_saved:
+                    result_str = "SAVED"
+                else:
+                    result_str = "MISS"
+                print(f"[PENALTY]   -> {kicker_jersey}: {target_str} | "
+                      f"{result_str} | {result_reason}")
 
         if debug:
-            on  = sum(1 for p in penalties if p['is_on_target'])
-            off = sum(1 for p in penalties if not p['is_on_target'])
+            on   = sum(1 for p in penalties if p['is_on_target'])
+            off  = sum(1 for p in penalties if not p['is_on_target'])
+            gol  = sum(1 for p in penalties if p['is_goal'])
+            save = sum(1 for p in penalties if p['is_saved'])
             print(f"\n[PENALTY] === HASIL AKHIR ===")
             print(f"[PENALTY] Total tendangan : {len(penalties)}")
             print(f"[PENALTY] ON TARGET       : {on}")
             print(f"[PENALTY] OFF TARGET      : {off}")
+            print(f"[PENALTY] GOL             : {gol}")
+            print(f"[PENALTY] SAVED           : {save}")
             print(f"[PENALTY] =========================\n")
 
         return penalties
 
     # ============================================================
-    # STATISTIK
+    # STATISTIK — ON TARGET + GOL/SAVED
     # ============================================================
 
     def get_penalty_statistics(self, penalties: List[Dict]) -> Dict:
-        total    = len(penalties)
-        on_list  = [p for p in penalties if p['is_on_target']]
-        off_list = [p for p in penalties if not p['is_on_target']]
+        total      = len(penalties)
+        on_list    = [p for p in penalties if p['is_on_target']]
+        off_list   = [p for p in penalties if not p['is_on_target']]
+        goal_list  = [p for p in penalties if p['is_goal']]
+        saved_list = [p for p in penalties if p['is_saved']]
 
         per_player: Dict[str, Dict] = {}
         for p in penalties:
@@ -472,25 +617,41 @@ class PenaltyDetector:
                     'total': 0,
                     'on_target': 0,
                     'off_target': 0,
+                    'goals': 0,
+                    'saved': 0,
                     'on_target_pct': 0.0,
+                    'goal_pct': 0.0,
                 }
             per_player[jersey]['total'] += 1
             if p['is_on_target']:
                 per_player[jersey]['on_target'] += 1
             else:
                 per_player[jersey]['off_target'] += 1
+            if p['is_goal']:
+                per_player[jersey]['goals'] += 1
+            if p['is_saved']:
+                per_player[jersey]['saved'] += 1
 
         for jersey, stat in per_player.items():
+            t = stat['total']
             stat['on_target_pct'] = round(
-                stat['on_target'] / stat['total'] * 100, 1
-            ) if stat['total'] > 0 else 0.0
+                stat['on_target'] / t * 100, 1
+            ) if t > 0 else 0.0
+            stat['goal_pct'] = round(
+                stat['goals'] / t * 100, 1
+            ) if t > 0 else 0.0
 
         return {
             'total_kicks'     : total,
             'total_on_target' : len(on_list),
             'total_off_target': len(off_list),
+            'total_goals'     : len(goal_list),
+            'total_saved'     : len(saved_list),
             'on_target_pct'   : round(
                 len(on_list) / total * 100, 1
+            ) if total > 0 else 0.0,
+            'goal_pct'        : round(
+                len(goal_list) / total * 100, 1
             ) if total > 0 else 0.0,
             'per_player'      : per_player
         }
