@@ -1,11 +1,9 @@
 # main.py
 # Pipeline Shoot on Target Detection
 #
-# - Mendeteksi tendangan penalty dari 2 pemain (Merah & Abu-Abu)
-# - Counting SHOOT ON TARGET vs OFF TARGET
-# - On Target = bola mengenai bounding box gawang
-# - Off Target = bola tidak mengenai bounding box gawang
-# - Identifikasi pemain berdasarkan warna baju, di-lock per track ID
+# PERUBAHAN:
+#   - Tambah manual_kick_mapping untuk override warna penendang per kick frame
+#   - Handle ID switching (track 6 & 9 shared oleh 2 pemain)
 
 import os
 import sys
@@ -38,7 +36,7 @@ CONFIG = {
     "output_video": "output_videos/penalty_shoot_on_target.avi",
     "model_path"  : "/home/dika/football-analysis/models/best.pt",
     "stub_path"   : "stubs/tracks_cache.pkl",
-    "use_stub"    : False,
+    "use_stub"    : True,    # Pakai cache karena sudah ada
     "fps"         : 30,
 
     # Player Identifier
@@ -46,6 +44,38 @@ CONFIG = {
     "lost_timeout_frames"        : 60,
     "color_vote_window"          : 15,
     "lock_after_votes"           : 8,
+
+    # ============================================================
+    # MANUAL JERSEY MAPPING (per track ID)
+    # Track ID yang TIDAK switch → mapping tetap
+    # Track ID yang switch (6, 9) → JANGAN dimasukkan di sini,
+    #   biarkan manual_kick_mapping yang handle
+    # ============================================================
+    "manual_jersey_mapping": {
+        4:  "Merah",
+        5:  "Merah",
+        10: "Merah",
+        14: "Merah",
+        16: "Merah",
+        17: "Merah",
+        18: "Abu-Abu",
+        # Track 6 dan 9 TIDAK di-mapping di sini karena ID switching
+        # (kadang Merah, kadang Abu-Abu)
+    },
+
+    # ============================================================
+    # MANUAL KICK MAPPING (per kick frame)
+    # Override warna penendang di kick frame tertentu
+    # Ini menangani kasus ID switching track 6 dan 9
+    # ============================================================
+    "manual_kick_mapping": {
+        86:   "Merah",      # Kick 1: track 5 = Merah
+        266:  "Abu-Abu",    # Kick 2: track 6 = Abu-Abu (ID switch!)
+        476:  "Merah",      # Kick 3: track 9 = Merah
+        668:  "Abu-Abu",    # Kick 4: track 9 = Abu-Abu (ID switch!)
+        894:  "Merah",      # Kick 5: track 14 = Merah
+        1030: "Abu-Abu",    # Kick 6: track 18 = Abu-Abu
+    },
 
     # Possession
     "max_possession_distance": 200,
@@ -56,8 +86,8 @@ CONFIG = {
     "max_kicker_distance"    : 700,
     "on_target_check_window" : 60,
     "cooldown_frames"        : 120,
-    "gawang_shrink_ratio"    : 0.05,   # Shrink lebih kecil (5%) untuk on-target
-    "on_target_min_frames"   : 1,      # Minimal 1 frame = on target
+    "gawang_shrink_ratio"    : 0.05,
+    "on_target_min_frames"   : 1,
 
     # Visualisasi
     "show_gawang"           : True,
@@ -80,14 +110,13 @@ def parse_args():
 
 
 # ============================================================
-# PROGRESSIVE STATS — ON TARGET
+# PROGRESSIVE STATS
 # ============================================================
 
 def compute_progressive_stats(
     detected_penalties: List[Dict],
     up_to_frame       : int
 ) -> Dict:
-    """Hitung statistik on-target secara progresif sampai frame tertentu."""
     kicks_so_far = [
         p for p in detected_penalties
         if p['frame_kick'] <= up_to_frame
@@ -169,6 +198,35 @@ def print_shoot_details(penalties: List[Dict], stats: Dict) -> None:
 # RENDERING
 # ============================================================
 
+def get_jersey_for_render(
+    player_id: int,
+    frame_num: int,
+    player_identifier,
+    manual_kick_mapping: Dict[int, str],
+    detected_penalties: List[Dict]
+) -> str:
+    """
+    Tentukan jersey untuk rendering.
+    Untuk track ID yang switch (misal 6 & 9), gunakan info dari
+    kick terdekat jika ada.
+    """
+    jersey = player_identifier.get_jersey_number_for_player(player_id)
+
+    # Jika jersey sudah pasti (dari manual mapping atau locked), gunakan itu
+    if jersey in ("Merah", "Abu-Abu"):
+        # Tapi cek apakah track ini punya multiple identities (ID switch)
+        # Cari apakah ada kick event yang melibatkan track ini
+        # dengan jersey berbeda
+        for p in detected_penalties:
+            if p['kicker_id'] == player_id:
+                # Cek apakah frame_num dekat dengan kick ini
+                kick_f = p['frame_kick']
+                if abs(frame_num - kick_f) < 80:  # dalam range 80 frame dari kick
+                    return p['kicker_jersey']
+
+    return jersey
+
+
 def render_frames(
     frames, tracks, ball_possessions, detected_penalties,
     player_identifier, config
@@ -176,7 +234,8 @@ def render_frames(
     output_frames = []
     total_frames  = len(frames)
 
-    # Map frame -> penalty event untuk display
+    manual_kick_mapping = config.get("manual_kick_mapping", {})
+
     kick_display_map: Dict[int, Dict] = {}
     kick_display_duration = config.get("kick_display_duration", 50)
 
@@ -225,7 +284,7 @@ def render_frames(
                 cv2.putText(annotated, label, (kx1 + 4, ky1 - 4),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
-        # 3. Bounding box pemain + label warna baju + track ID
+        # 3. Bounding box pemain + label warna baju
         for player_id, player_data in tracks["players"][frame_num].items():
             bbox = player_data.get("bbox")
             if bbox is None:
@@ -238,10 +297,13 @@ def render_frames(
                 ball_possessions[frame_num] == player_id
             )
 
-            jersey = player_identifier.get_jersey_number_for_player(player_id)
-            is_locked = player_identifier.is_locked(player_id)
+            # Tentukan jersey dengan awareness terhadap ID switching
+            jersey = get_jersey_for_render(
+                player_id, frame_num, player_identifier,
+                manual_kick_mapping, detected_penalties
+            )
 
-            # Warna bounding box berdasarkan identitas pemain
+            # Warna bounding box
             if jersey == "Merah":
                 box_color = (0, 0, 220) if not has_ball else (0, 255, 0)
             elif jersey == "Abu-Abu":
@@ -252,7 +314,6 @@ def render_frames(
             cv2.rectangle(annotated, (x1, y1), (x2, y2), box_color, 2)
 
             # Label: warna baju + track ID
-            lock_icon = "●" if is_locked else "○"
             label = f"{jersey} [{player_id}]"
             (lw, lh), _ = cv2.getTextSize(
                 label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1
@@ -334,7 +395,7 @@ def main():
     print(f"  Model        : {CONFIG['model_path']}")
     print(f"  Gunakan cache: {'Ya' if CONFIG['use_stub'] else 'Tidak'}")
     print(f"  Possession d : {CONFIG['max_possession_distance']}px")
-    print(f"  Lock after   : {CONFIG['lock_after_votes']} votes")
+    print(f"  Manual kick  : {len(CONFIG.get('manual_kick_mapping', {}))} entries")
     print("=" * 62)
 
     # TAHAP 1: Baca video
@@ -380,17 +441,20 @@ def main():
         print("[MAIN] ERROR: Tracking gagal!")
         return
 
-    # TAHAP 3: Identifikasi pemain berdasarkan warna baju (LOCK per track ID)
-    print("\n[MAIN] TAHAP 3: Identifikasi pemain berdasarkan warna baju...")
+    # TAHAP 3: Identifikasi pemain — MANUAL MAPPING + COLOR DETECTION
+    print("\n[MAIN] TAHAP 3: Identifikasi pemain...")
+    manual_map = CONFIG.get("manual_jersey_mapping", None)
+
     player_identifier = PlayerIdentifier(
-        track_id_to_jersey          = None,
+        track_id_to_jersey          = manual_map,
         reassign_distance_threshold = CONFIG.get("reassign_distance_threshold", 150.0),
         lost_timeout_frames         = CONFIG.get("lost_timeout_frames", 60),
         color_vote_window           = CONFIG.get("color_vote_window", 15),
         lock_after_votes            = CONFIG.get("lock_after_votes", 8),
     )
 
-    print("[MAIN] Mengidentifikasi warna baju per frame (locked mapping)...")
+    # Tetap jalankan color detection untuk track yang belum di-mapping manual
+    print("[MAIN] Mengidentifikasi warna baju per frame...")
     for frame_num in range(n_player_frames):
         player_identifier.update_frame(
             frame_num=frame_num,
@@ -406,7 +470,7 @@ def main():
 
     player_identifier.print_mappings()
 
-    # TAHAP 4: Tentukan possession bola (untuk visualisasi)
+    # TAHAP 4: Tentukan possession bola
     print("\n[MAIN] TAHAP 4: Menentukan possession bola per frame...")
     assigner = PlayerBallAssigner(
         max_possession_distance=CONFIG.get("max_possession_distance", 200.0)
@@ -424,10 +488,12 @@ def main():
         pct = count / len(ball_possessions) * 100
         print(f"[MAIN]   {jersey:<12}: {count:>5} frames ({pct:.1f}%)")
 
-    # TAHAP 5: Deteksi SHOOT ON TARGET
+    # TAHAP 5: Deteksi SHOOT ON TARGET — DENGAN MANUAL KICK MAPPING
     print("\n[MAIN] TAHAP 5: Deteksi Shoot on Target (velocity-based)...")
     penalty_detector = PenaltyDetector(fps=fps)
     penalty_detector.set_jersey_map(player_identifier)
+
+    # Set parameter
     penalty_detector.kick_velocity_threshold = CONFIG.get(
         "kick_velocity_threshold", 15.0)
     penalty_detector.pre_kick_search         = CONFIG.get(
@@ -442,6 +508,11 @@ def main():
         "gawang_shrink_ratio", 0.05)
     penalty_detector.on_target_min_frames    = CONFIG.get(
         "on_target_min_frames", 1)
+
+    # SET MANUAL KICK MAPPING — ini yang fix masalah ID switching
+    manual_kick_map = CONFIG.get("manual_kick_mapping", {})
+    if manual_kick_map:
+        penalty_detector.set_manual_kick_mapping(manual_kick_map)
 
     detected_penalties = penalty_detector.detect_penalties(
         tracks, ball_possessions,
