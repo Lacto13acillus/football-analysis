@@ -3,10 +3,11 @@
 #   1. SHOOT ON TARGET / OFF TARGET
 #   2. GOL / SAVED BY KEEPER
 #
-# Logic:
-#   - ON TARGET + bola TIDAK dekat keeper → GOL
-#   - ON TARGET + bola dekat keeper → SAVED (tidak gol)
-#   - OFF TARGET → tidak gol (melebar/melambung)
+# Logic GOL vs SAVED:
+#   - Setelah bola masuk area gawang, cek apakah bola MEMANTUL KEMBALI
+#     keluar area gawang (= SAVED) atau TETAP di dalam / hilang (= GOL)
+#   - Juga cek jarak bola ke keeper dan perubahan arah bola
+#   - Manual override via manual_goal_mapping
 
 import sys
 sys.path.append('../')
@@ -41,18 +42,18 @@ class PenaltyDetector:
         self.gawang_shrink_ratio     = 0.05
         self.on_target_min_frames    = 1
 
-        # --- Parameter deteksi KEEPER SAVE ---
-        self.keeper_save_check_window = 45    # frame setelah kick untuk cek keeper
-        self.keeper_ball_distance_thr = 150   # jarak bola ke keeper bbox = dianggap save
-        self.keeper_ball_inside_thr   = 0.3   # ratio overlap bola masuk keeper bbox
-        self.keeper_velocity_drop_thr = 3.0   # velocity bola turun drastis = tertangkap
-        self.keeper_save_min_frames   = 2     # minimal frame bola dekat keeper
+        # --- Parameter deteksi KEEPER SAVE (bounce-back) ---
+        self.save_check_window       = 60    # frame setelah kick untuk analisis
+        self.bounce_back_frames_thr  = 5     # minimal N frame bola di luar gawang setelah masuk
+        self.bounce_back_margin      = 30    # pixel margin di bawah gawang bottom = "keluar"
+        self.ball_direction_window   = 5     # frame window untuk hitung arah bola
 
         # --- Display ---
         self.kick_display_duration   = 50
 
-        # --- Manual kick mapping ---
+        # --- Manual mappings ---
         self._manual_kick_mapping: Dict[int, str] = {}
+        self._manual_goal_mapping: Dict[int, bool] = {}  # {kick_frame: True/False}
 
         self._player_identifier = None
 
@@ -62,6 +63,14 @@ class PenaltyDetector:
     def set_manual_kick_mapping(self, mapping: Dict[int, str]) -> None:
         self._manual_kick_mapping = mapping
         print(f"[PENALTY] Manual kick mapping diset: {self._manual_kick_mapping}")
+
+    def set_manual_goal_mapping(self, mapping: Dict[int, bool]) -> None:
+        """
+        Set manual override untuk hasil gol/tidak per kick frame.
+        Format: {86: True, 266: False, ...}  (True = gol, False = tidak gol)
+        """
+        self._manual_goal_mapping = mapping
+        print(f"[PENALTY] Manual goal mapping diset: {self._manual_goal_mapping}")
 
     def _get_jersey(self, player_id: int) -> str:
         if self._player_identifier:
@@ -245,7 +254,7 @@ class PenaltyDetector:
             )
 
     # ============================================================
-    # CEK KEEPER SAVE — BOLA DITANGKAP/DIBLOK KIPER
+    # CEK KEEPER SAVE — BOUNCE-BACK DETECTION
     # ============================================================
 
     def check_keeper_save(
@@ -253,108 +262,202 @@ class PenaltyDetector:
         tracks: Dict,
         velocities: List[float],
         kick_frame: int,
+        stable_gawang_bbox: List[float],
         debug: bool = False
     ) -> Tuple[bool, int, str]:
         """
-        Cek apakah bola ditangkap/diblok oleh keeper setelah tendangan.
+        Deteksi apakah bola di-save keeper menggunakan BOUNCE-BACK logic.
 
-        Logic deteksi save:
-        1. Bola mendekati bbox keeper (jarak center bola ke center keeper < threshold)
-        2. ATAU bola masuk ke dalam bbox keeper (overlap)
-        3. DAN velocity bola turun drastis setelah dekat keeper (tertangkap/diblok)
+        Konsep:
+        - Bola ditendang ke arah gawang (Y menurun menuju gawang)
+        - Jika GOL: bola masuk gawang dan TETAP di dalam / menghilang
+        - Jika SAVED: bola MEMANTUL KEMBALI keluar area gawang
+          (Y kembali meningkat melewati batas bawah gawang)
+
+        Metode deteksi:
+        1. Track posisi Y bola setelah kick
+        2. Deteksi apakah bola pernah masuk area gawang
+        3. Setelah masuk, cek apakah bola KELUAR KEMBALI (bounce back)
+        4. Juga cek: apakah bola berhenti/melambat dekat keeper (ditangkap)
 
         Returns:
             (is_saved, save_frame, reason)
         """
+        gx1, gy1, gx2, gy2 = stable_gawang_bbox
+        gawang_bottom = gy2  # Batas bawah gawang
+
         total = len(tracks['ball'])
-        check_end = min(kick_frame + self.keeper_save_check_window, total - 1)
+        check_end = min(kick_frame + self.save_check_window, total - 1)
 
-        frames_near_keeper = 0
-        first_near_frame = -1
-        min_distance = float('inf')
-        velocity_dropped = False
-
+        # --- Kumpulkan posisi bola setelah kick ---
+        ball_positions = []  # list of (frame, x, y) atau None
         for f in range(kick_frame, check_end + 1):
-            # Data bola
             ball_data = tracks['ball'][f].get(1)
-            if not ball_data or 'bbox' not in ball_data:
-                continue
-            ball_bbox = ball_data['bbox']
-            ball_cx, ball_cy = get_center_of_bbox(ball_bbox)
+            if ball_data and 'bbox' in ball_data:
+                bx, by = get_center_of_bbox(ball_data['bbox'])
+                ball_positions.append((f, bx, by))
+            else:
+                ball_positions.append(None)
 
-            # Data keeper
-            keeper_data = tracks['keeper'][f].get(1)
+        if not ball_positions:
+            return False, -1, "Tidak ada data bola"
+
+        # --- Fase 1: Cari frame dimana bola MASUK area gawang ---
+        entered_gawang = False
+        enter_frame = -1
+        enter_idx = -1
+
+        for idx, pos in enumerate(ball_positions):
+            if pos is None:
+                continue
+            f, bx, by = pos
+            # Cek bola di dalam gawang (dengan sedikit margin)
+            if (gx1 <= bx <= gx2 and gy1 <= by <= gy2):
+                entered_gawang = True
+                enter_frame = f
+                enter_idx = idx
+                break
+
+        if not entered_gawang:
+            if debug:
+                print(f"[PENALTY]   Keeper: Bola tidak masuk area gawang")
+            return False, -1, "Bola tidak masuk area gawang"
+
+        # --- Fase 2: Setelah masuk gawang, cek BOUNCE BACK ---
+        # Bola memantul = Y bergerak kembali ke bawah (keluar gawang)
+        frames_outside_after_enter = 0
+        first_exit_frame = -1
+        ball_came_back = False
+
+        for idx in range(enter_idx + 1, len(ball_positions)):
+            pos = ball_positions[idx]
+            if pos is None:
+                continue
+            f, bx, by = pos
+
+            # Bola keluar area gawang ke bawah (bounce back)
+            if by > gawang_bottom + self.bounce_back_margin:
+                frames_outside_after_enter += 1
+                if first_exit_frame == -1:
+                    first_exit_frame = f
+
+            # Bola keluar area gawang ke samping (melebar setelah saved)
+            if bx < gx1 - 50 or bx > gx2 + 50:
+                if by > gy1:  # Masih di bawah (bukan gol tinggi)
+                    frames_outside_after_enter += 1
+                    if first_exit_frame == -1:
+                        first_exit_frame = f
+
+        if frames_outside_after_enter >= self.bounce_back_frames_thr:
+            ball_came_back = True
+
+        # --- Fase 3: Cek arah bola (velocity Y) setelah dekat keeper ---
+        # Jika bola berubah arah Y (dari naik ke turun) = dipantulkan keeper
+        direction_reversed = False
+
+        if enter_idx >= 0:
+            # Ambil posisi sebelum dan sesudah masuk gawang
+            y_before_enter = []
+            y_after_enter = []
+
+            for idx in range(max(0, enter_idx - self.ball_direction_window), enter_idx):
+                pos = ball_positions[idx]
+                if pos:
+                    y_before_enter.append(pos[2])  # Y
+
+            for idx in range(enter_idx + 3, min(enter_idx + 3 + self.ball_direction_window,
+                                                 len(ball_positions))):
+                pos = ball_positions[idx]
+                if pos:
+                    y_after_enter.append(pos[2])  # Y
+
+            if len(y_before_enter) >= 2 and len(y_after_enter) >= 2:
+                # Arah sebelum: Y menurun = bola naik ke gawang
+                dy_before = y_before_enter[-1] - y_before_enter[0]
+                # Arah sesudah: Y meningkat = bola turun/memantul
+                dy_after = y_after_enter[-1] - y_after_enter[0]
+
+                # Bola berubah arah (sebelum: naik/Y turun, sesudah: turun/Y naik)
+                if dy_before < -5 and dy_after > 10:
+                    direction_reversed = True
+                    if debug:
+                        print(f"[PENALTY]   Keeper: Arah bola berubah "
+                              f"(dy_before={dy_before:.0f}, dy_after={dy_after:.0f})")
+
+        # --- Fase 4: Cek bola berhenti/sangat lambat di dekat keeper (ditangkap) ---
+        ball_stopped_near_keeper = False
+
+        for idx in range(enter_idx, min(enter_idx + 20, len(ball_positions))):
+            pos = ball_positions[idx]
+            if pos is None:
+                continue
+            f, bx, by = pos
+
+            # Cek keeper ada di frame ini
+            keeper_data = tracks['keeper'][f].get(1) if f < len(tracks['keeper']) else None
             if not keeper_data or 'bbox' not in keeper_data:
                 continue
+
             keeper_bbox = keeper_data['bbox']
-            kx1, ky1, kx2, ky2 = keeper_bbox
             keeper_cx, keeper_cy = get_center_of_bbox(keeper_bbox)
 
-            # --- Metode 1: Jarak center bola ke center keeper ---
-            dist = measure_distance(
-                (ball_cx, ball_cy), (keeper_cx, keeper_cy)
-            )
-            if dist < min_distance:
-                min_distance = dist
+            dist = measure_distance((bx, by), (keeper_cx, keeper_cy))
 
-            # --- Metode 2: Bola masuk ke dalam expanded keeper bbox ---
-            # Expand keeper bbox sedikit untuk toleransi
-            expand_x = (kx2 - kx1) * 0.2
-            expand_y = (ky2 - ky1) * 0.2
-            exp_kx1 = kx1 - expand_x
-            exp_ky1 = ky1 - expand_y
-            exp_kx2 = kx2 + expand_x
-            exp_ky2 = ky2 + expand_y
+            # Bola sangat dekat keeper DAN velocity sangat rendah
+            if dist < 80 and f < len(velocities):
+                # Cek velocity di beberapa frame ke depan
+                future_vels = []
+                for ff in range(f + 1, min(f + 8, len(velocities))):
+                    future_vels.append(velocities[ff])
+                if future_vels and np.mean(future_vels) < 2.0:
+                    ball_stopped_near_keeper = True
+                    if debug:
+                        print(f"[PENALTY]   Keeper: Bola berhenti dekat keeper "
+                              f"di frame {f} (dist={dist:.0f}px, "
+                              f"avg_vel={np.mean(future_vels):.1f})")
+                    break
 
-            ball_near = (dist < self.keeper_ball_distance_thr)
-            ball_inside = (exp_kx1 <= ball_cx <= exp_kx2 and
-                           exp_ky1 <= ball_cy <= exp_ky2)
+        # --- KEPUTUSAN SAVE ---
+        is_saved = False
+        save_frame = -1
+        reason = ""
 
-            if ball_near or ball_inside:
-                frames_near_keeper += 1
-                if first_near_frame == -1:
-                    first_near_frame = f
+        if ball_came_back and (direction_reversed or ball_stopped_near_keeper):
+            # Sangat yakin saved: bola memantul DAN (arah berubah ATAU bola berhenti)
+            is_saved = True
+            save_frame = first_exit_frame if first_exit_frame != -1 else enter_frame
+            reason = (f"SAVED - Bola memantul kembali di frame {first_exit_frame} "
+                      f"({frames_outside_after_enter} frames di luar gawang setelah masuk"
+                      f"{', arah berubah' if direction_reversed else ''}"
+                      f"{', bola berhenti' if ball_stopped_near_keeper else ''})")
 
-                # --- Metode 3: Cek velocity drop setelah dekat keeper ---
-                # Bola yang ditangkap → velocity turun drastis
-                if f + 5 < total:
-                    vel_now = velocities[f] if f < len(velocities) else 0
-                    # Cek velocity di beberapa frame ke depan
-                    future_vels = []
-                    for ff in range(f + 2, min(f + 10, len(velocities))):
-                        future_vels.append(velocities[ff])
-                    if future_vels:
-                        avg_future_vel = np.mean(future_vels)
-                        if avg_future_vel < self.keeper_velocity_drop_thr:
-                            velocity_dropped = True
+        elif ball_stopped_near_keeper and not ball_came_back:
+            # Bola berhenti di tangan keeper (ditangkap, tidak memantul jauh)
+            is_saved = True
+            save_frame = enter_frame
+            reason = (f"SAVED - Bola ditangkap keeper "
+                      f"(bola berhenti dekat keeper, tidak memantul jauh)")
 
-        # --- Keputusan save ---
-        if frames_near_keeper >= self.keeper_save_min_frames:
-            if velocity_dropped:
-                reason = (f"SAVED - Bola ditangkap keeper di frame {first_near_frame} "
-                          f"({frames_near_keeper} frames dekat keeper, "
-                          f"velocity drop terdeteksi)")
-            else:
-                reason = (f"SAVED - Bola diblok keeper di frame {first_near_frame} "
-                          f"({frames_near_keeper} frames dekat keeper, "
-                          f"jarak min={min_distance:.0f}px)")
+        elif ball_came_back and frames_outside_after_enter >= self.bounce_back_frames_thr * 2:
+            # Bola memantul sangat jelas (banyak frame di luar)
+            is_saved = True
+            save_frame = first_exit_frame
+            reason = (f"SAVED - Bola memantul kuat "
+                      f"({frames_outside_after_enter} frames di luar gawang)")
 
-            if debug:
-                print(f"[PENALTY]   Keeper: {reason}")
+        else:
+            reason = (f"Tidak di-save "
+                      f"(bounce={frames_outside_after_enter} frames, "
+                      f"reversed={direction_reversed}, "
+                      f"stopped={ball_stopped_near_keeper})")
 
-            return True, first_near_frame, reason
-
-        # Tidak di-save
         if debug:
-            print(f"[PENALTY]   Keeper: Tidak menangkap "
-                  f"(dekat={frames_near_keeper} frames, "
-                  f"jarak min={min_distance:.0f}px)")
+            print(f"[PENALTY]   Keeper: bounce_back={frames_outside_after_enter} frames, "
+                  f"direction_reversed={direction_reversed}, "
+                  f"ball_stopped={ball_stopped_near_keeper} "
+                  f"-> {'SAVED' if is_saved else 'NOT SAVED'}")
 
-        return False, -1, (
-            f"Keeper tidak menangkap "
-            f"(dekat={frames_near_keeper} frames, "
-            f"jarak min={min_distance:.0f}px)"
-        )
+        return is_saved, save_frame, reason
 
     # ============================================================
     # CARI PENENDANG
@@ -423,9 +526,6 @@ class PenaltyDetector:
                     jersey = self.detect_shirt_color_from_frame(
                         frames[best_frame], best_bbox
                     )
-                    if debug:
-                        print(f"[PENALTY]   Re-detected color for track "
-                              f"{best_player_id}: {jersey}")
 
             if jersey == "Unknown" or jersey.startswith("ID:"):
                 for f in range(max(0, best_frame - 10),
@@ -448,7 +548,7 @@ class PenaltyDetector:
         return best_player_id, jersey, best_position
 
     # ============================================================
-    # DETEKSI PENALTY UTAMA — ON TARGET + GOL/SAVED
+    # DETEKSI PENALTY UTAMA
     # ============================================================
 
     def detect_penalties(
@@ -477,17 +577,20 @@ class PenaltyDetector:
                   f"{self.on_target_check_window} frames")
             print(f"[PENALTY] Gawang shrink ratio        : "
                   f"{self.gawang_shrink_ratio}")
-            print(f"[PENALTY] Keeper save check window   : "
-                  f"{self.keeper_save_check_window} frames")
-            print(f"[PENALTY] Keeper ball distance thr   : "
-                  f"{self.keeper_ball_distance_thr}px")
-            print(f"[PENALTY] Keeper velocity drop thr   : "
-                  f"{self.keeper_velocity_drop_thr} px/frame")
+            print(f"[PENALTY] Save check window          : "
+                  f"{self.save_check_window} frames")
+            print(f"[PENALTY] Bounce-back frames thr     : "
+                  f"{self.bounce_back_frames_thr}")
+            print(f"[PENALTY] Bounce-back margin         : "
+                  f"{self.bounce_back_margin}px")
             print(f"[PENALTY] Cooldown                   : "
                   f"{self.cooldown_frames} frames")
             if self._manual_kick_mapping:
                 print(f"[PENALTY] Manual kick mapping        : "
                       f"{self._manual_kick_mapping}")
+            if self._manual_goal_mapping:
+                print(f"[PENALTY] Manual goal mapping        : "
+                      f"{self._manual_goal_mapping}")
 
         stable_gawang = self.get_stable_gawang_bbox(tracks)
         if not stable_gawang:
@@ -524,20 +627,34 @@ class PenaltyDetector:
                 tracks, kick_frame, stable_gawang, debug=debug
             )
 
-            # 2. Cek KEEPER SAVE (hanya jika on target)
+            # 2. Tentukan GOL / SAVED
             is_saved = False
+            is_goal = False
             save_frame = -1
             save_reason = ""
 
-            if is_on_target:
+            # Cek manual goal mapping DULU (highest priority)
+            if kick_frame in self._manual_goal_mapping:
+                manual_goal = self._manual_goal_mapping[kick_frame]
+                is_goal = manual_goal
+                is_saved = is_on_target and not manual_goal
+                save_reason = ("MANUAL: " +
+                               ("GOL (override)" if manual_goal
+                                else "SAVED (override)"))
+                if debug:
+                    print(f"[PENALTY]   Goal dari MANUAL GOAL MAPPING: "
+                          f"frame {kick_frame} -> "
+                          f"{'GOL' if manual_goal else 'SAVED'}")
+            elif is_on_target:
+                # Deteksi otomatis: bounce-back
                 is_saved, save_frame, save_reason = self.check_keeper_save(
-                    tracks, velocities, kick_frame, debug=debug
+                    tracks, velocities, kick_frame, stable_gawang, debug=debug
                 )
-
-            # 3. Tentukan GOL
-            # GOL = on target DAN TIDAK di-save keeper
-            # TIDAK GOL = off target ATAU di-save keeper
-            is_goal = is_on_target and not is_saved
+                is_goal = not is_saved
+            else:
+                # Off target = tidak gol
+                is_goal = False
+                is_saved = False
 
             # Buat reason gabungan
             if is_goal:
@@ -580,8 +697,9 @@ class PenaltyDetector:
                     result_str = "SAVED"
                 else:
                     result_str = "MISS"
+                manual_tag = " [MANUAL]" if kick_frame in self._manual_goal_mapping else ""
                 print(f"[PENALTY]   -> {kicker_jersey}: {target_str} | "
-                      f"{result_str} | {result_reason}")
+                      f"{result_str}{manual_tag} | {result_reason}")
 
         if debug:
             on   = sum(1 for p in penalties if p['is_on_target'])
@@ -599,7 +717,7 @@ class PenaltyDetector:
         return penalties
 
     # ============================================================
-    # STATISTIK — ON TARGET + GOL/SAVED
+    # STATISTIK
     # ============================================================
 
     def get_penalty_statistics(self, penalties: List[Dict]) -> Dict:

@@ -62,6 +62,18 @@ CONFIG = {
         1030: "Abu-Abu",
     },
 
+    # Manual goal mapping (True = gol, False = tidak gol/saved)
+    # Gunakan ini sebagai override jika deteksi otomatis salah
+    # Kosongkan dict jika ingin full otomatis
+    "manual_goal_mapping": {
+        86:   True,     # Kick 1: Merah  → GOL
+        266:  False,    # Kick 2: Abu-Abu → SAVED
+        476:  True,     # Kick 3: Merah  → GOL
+        668:  True,     # Kick 4: Abu-Abu → GOL
+        894:  True,     # Kick 5: Merah  → GOL
+        1030: True,     # Kick 6: Abu-Abu → GOL
+    },
+
     # Possession
     "max_possession_distance": 200,
 
@@ -74,11 +86,10 @@ CONFIG = {
     "gawang_shrink_ratio"      : 0.05,
     "on_target_min_frames"     : 1,
 
-    # Keeper save detection
-    "keeper_save_check_window" : 45,
-    "keeper_ball_distance_thr" : 150,
-    "keeper_velocity_drop_thr" : 3.0,
-    "keeper_save_min_frames"   : 2,
+    # Keeper save detection (bounce-back)
+    "save_check_window"        : 60,
+    "bounce_back_frames_thr"   : 5,
+    "bounce_back_margin"       : 30,
 
     # Visualisasi
     "show_gawang"           : True,
@@ -96,7 +107,6 @@ def parse_args():
     parser.add_argument("--input",  type=str)
     parser.add_argument("--output", type=str)
     parser.add_argument("--stub",   action="store_true")
-    parser.add_argument("--debug",  action="store_true")
     return parser.parse_args()
 
 
@@ -272,20 +282,16 @@ def render_frames(
             if keeper_data and 'bbox' in keeper_data:
                 kx1, ky1, kx2, ky2 = map(int, keeper_data['bbox'])
 
-                # Warna keeper: oranye normal, hijau jika sedang save
                 keeper_color = (0, 165, 255)
+                label = "KEEPER"
                 if frame_num in kick_display_map:
                     event = kick_display_map[frame_num]
                     if event['is_saved']:
-                        keeper_color = (0, 255, 150)  # Hijau = save!
+                        keeper_color = (0, 255, 150)
+                        label = "KEEPER SAVE!"
 
                 cv2.rectangle(annotated, (kx1, ky1), (kx2, ky2),
                               keeper_color, 2)
-                label = "KEEPER"
-                if (frame_num in kick_display_map and
-                        kick_display_map[frame_num]['is_saved']):
-                    label = "KEEPER SAVE!"
-
                 (lw, lh), _ = cv2.getTextSize(
                     label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1
                 )
@@ -348,7 +354,7 @@ def render_frames(
             cv2.circle(annotated, (bcx, bcy), brad,     (0, 230, 255), 2)
             cv2.circle(annotated, (bcx, bcy), brad - 2, (0, 170, 200), 1)
 
-        # 5. Hasil tendangan (GOL / SAVED / OFF TARGET)
+        # 5. Hasil tendangan
         if config.get("show_kick_result", True) and frame_num in kick_display_map:
             event = kick_display_map[frame_num]
             annotated = draw_kick_result(
@@ -405,6 +411,7 @@ def main():
     print(f"  Model        : {CONFIG['model_path']}")
     print(f"  Gunakan cache: {'Ya' if CONFIG['use_stub'] else 'Tidak'}")
     print(f"  Manual kick  : {len(CONFIG.get('manual_kick_mapping', {}))} entries")
+    print(f"  Manual goal  : {len(CONFIG.get('manual_goal_mapping', {}))} entries")
     print("=" * 62)
 
     # TAHAP 1: Baca video
@@ -496,28 +503,31 @@ def main():
         pct = count / len(ball_possessions) * 100
         print(f"[MAIN]   {jersey:<12}: {count:>5} frames ({pct:.1f}%)")
 
-    # TAHAP 5: Deteksi Penalty — ON TARGET + GOL/SAVED
+    # TAHAP 5: Deteksi Penalty
     print("\n[MAIN] TAHAP 5: Deteksi Penalty (On Target + Gol/Saved)...")
     penalty_detector = PenaltyDetector(fps=fps)
     penalty_detector.set_jersey_map(player_identifier)
 
     # Set parameters
-    penalty_detector.kick_velocity_threshold  = CONFIG.get("kick_velocity_threshold", 15.0)
-    penalty_detector.pre_kick_search          = CONFIG.get("pre_kick_search", 50)
-    penalty_detector.max_kicker_distance      = CONFIG.get("max_kicker_distance", 700)
-    penalty_detector.on_target_check_window   = CONFIG.get("on_target_check_window", 60)
-    penalty_detector.cooldown_frames          = CONFIG.get("cooldown_frames", 120)
-    penalty_detector.gawang_shrink_ratio      = CONFIG.get("gawang_shrink_ratio", 0.05)
-    penalty_detector.on_target_min_frames     = CONFIG.get("on_target_min_frames", 1)
-    penalty_detector.keeper_save_check_window = CONFIG.get("keeper_save_check_window", 45)
-    penalty_detector.keeper_ball_distance_thr = CONFIG.get("keeper_ball_distance_thr", 150)
-    penalty_detector.keeper_velocity_drop_thr = CONFIG.get("keeper_velocity_drop_thr", 3.0)
-    penalty_detector.keeper_save_min_frames   = CONFIG.get("keeper_save_min_frames", 2)
+    penalty_detector.kick_velocity_threshold = CONFIG.get("kick_velocity_threshold", 15.0)
+    penalty_detector.pre_kick_search         = CONFIG.get("pre_kick_search", 50)
+    penalty_detector.max_kicker_distance     = CONFIG.get("max_kicker_distance", 700)
+    penalty_detector.on_target_check_window  = CONFIG.get("on_target_check_window", 60)
+    penalty_detector.cooldown_frames         = CONFIG.get("cooldown_frames", 120)
+    penalty_detector.gawang_shrink_ratio     = CONFIG.get("gawang_shrink_ratio", 0.05)
+    penalty_detector.on_target_min_frames    = CONFIG.get("on_target_min_frames", 1)
+    penalty_detector.save_check_window       = CONFIG.get("save_check_window", 60)
+    penalty_detector.bounce_back_frames_thr  = CONFIG.get("bounce_back_frames_thr", 5)
+    penalty_detector.bounce_back_margin      = CONFIG.get("bounce_back_margin", 30)
 
-    # Manual kick mapping
+    # Manual mappings
     manual_kick_map = CONFIG.get("manual_kick_mapping", {})
     if manual_kick_map:
         penalty_detector.set_manual_kick_mapping(manual_kick_map)
+
+    manual_goal_map = CONFIG.get("manual_goal_mapping", {})
+    if manual_goal_map:
+        penalty_detector.set_manual_goal_mapping(manual_goal_map)
 
     detected_penalties = penalty_detector.detect_penalties(
         tracks, ball_possessions,
