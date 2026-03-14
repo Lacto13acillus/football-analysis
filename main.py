@@ -29,7 +29,7 @@ from utils.bbox_utils import get_center_of_bbox_bottom
 
 CONFIG = {
     "input_video" : "input_videos/penalty_kick.mp4",
-    "output_video": "output_videos/penalty_shoot_on_target.avi",
+    "output_video": "output_videos/penalty_kick.avi",
     "model_path"  : "/home/dika/football-analysis/models/best.pt",
     "stub_path"   : "stubs/tracks_cache.pkl",
     "use_stub"    : True,
