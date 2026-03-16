@@ -4,6 +4,7 @@
 # PERUBAHAN:
 #   - Tambah manual_kick_mapping untuk override warna penendang per kick frame
 #   - Handle ID switching (track 6 & 9 shared oleh 2 pemain)
+#   - Modifikasi rendering menjadi streaming untuk hindari OOM (Out-of-Memory)
 
 import os
 import sys
@@ -11,6 +12,7 @@ import cv2
 import argparse
 import numpy as np
 from typing import List, Dict, Optional
+import gc  # Tambahan untuk garbage collection manual
 
 sys.path.append('../')
 
@@ -229,10 +231,24 @@ def get_jersey_for_render(
 
 def render_frames(
     frames, tracks, ball_possessions, detected_penalties,
-    player_identifier, config
-) -> List[np.ndarray]:
-    output_frames = []
-    total_frames  = len(frames)
+    player_identifier, config, output_path, fps
+) -> None:
+    """
+    Render frames secara streaming: Proses dan tulis langsung ke video output
+    untuk hindari OOM. Tidak return list, langsung save.
+    """
+    total_frames = len(frames)
+    if total_frames == 0:
+        print("[RENDER] ERROR: Tidak ada frames untuk dirender.")
+        return
+
+    # Inisialisasi VideoWriter
+    h, w = frames[0].shape[:2]
+    fourcc = cv2.VideoWriter_fourcc(*'MJPG')  # MJPG untuk kompresi lebih baik; ganti ke 'XVID' jika perlu
+    out = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
+    if not out.isOpened():
+        print("[RENDER] ERROR: Gagal inisialisasi VideoWriter.")
+        return
 
     manual_kick_mapping = config.get("manual_kick_mapping", {})
 
@@ -244,15 +260,17 @@ def render_frames(
                        min(p['frame_kick'] + kick_display_duration, total_frames)):
             kick_display_map[f] = p
 
-    print(f"\n[RENDER] Mulai merender {total_frames} frames...")
+    print(f"\n[RENDER] Mulai merender {total_frames} frames secara streaming ke {output_path}...")
 
     for frame_num in range(total_frames):
         if frame_num % 100 == 0:
             pct = frame_num / total_frames * 100
             print(f"[RENDER] Progress: {frame_num}/{total_frames} ({pct:.1f}%)...")
+            gc.collect()  # Force GC untuk release memori temporary setiap 100 frames
 
         frame = frames[frame_num]
-        annotated = frame.copy()
+        annotated = frame.copy()  # Copy untuk annotate; release segera setelah write
+        # Opsional: Untuk hemat lebih, gunakan annotated = frame jika tidak perlu preserve original
 
         # 1. Gambar gawang
         if config.get("show_gawang", True):
@@ -366,10 +384,12 @@ def render_frames(
                     (w_frame - 140, h_frame - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.42, (110, 110, 110), 1)
 
-        output_frames.append(annotated)
+        # Tulis frame langsung ke video
+        out.write(annotated)
+        del annotated  # Release memori segera
 
-    print(f"[RENDER] Selesai: {len(output_frames)}/{total_frames} frames dirender.")
-    return output_frames
+    out.release()
+    print(f"[RENDER] Selesai: {total_frames} frames dirender dan disimpan.")
 
 
 # ============================================================
@@ -526,26 +546,25 @@ def main():
     stats = penalty_detector.get_penalty_statistics(detected_penalties)
     print_shoot_details(detected_penalties, stats)
 
-    # TAHAP 7: Render video
-    print("\n[MAIN] TAHAP 7: Merender video output...")
-    output_frames = render_frames(
-        frames, tracks, ball_possessions, detected_penalties,
-        player_identifier, CONFIG
-    )
-
-    # TAHAP 8: Simpan video
-    print(f"\n[MAIN] TAHAP 8: Menyimpan video ke: {CONFIG['output_video']}...")
+    # TAHAP 7: Render video secara streaming
+    print("\n[MAIN] TAHAP 7: Merender video output secara streaming...")
     output_dir = os.path.dirname(CONFIG["output_video"])
     if output_dir and not os.path.exists(output_dir):
         os.makedirs(output_dir, exist_ok=True)
-    Tracker.save_video(output_frames, CONFIG["output_video"], fps=fps)
+
+    render_frames(
+        frames, tracks, ball_possessions, detected_penalties,
+        player_identifier, CONFIG, CONFIG["output_video"], fps
+    )
+
+    # TAHAP 8: Tidak perlu lagi, karena sudah disimpan di render_frames
 
     print("\n" + "=" * 62)
     print("   PIPELINE SELESAI!")
     print("=" * 62)
     print(f"  Video output      : {CONFIG['output_video']}")
-    print(f"  Total frames      : {len(output_frames)}")
-    print(f"  Durasi output     : {len(output_frames) / fps:.1f} detik")
+    print(f"  Total frames      : {len(frames)}")
+    print(f"  Durasi output     : {len(frames) / fps:.1f} detik")
     print(f"  Total tendangan   : {stats['total_kicks']}")
     print(f"  ON TARGET         : {stats['total_on_target']}")
     print(f"  OFF TARGET        : {stats['total_off_target']}")
