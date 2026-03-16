@@ -627,56 +627,33 @@ def draw_gawang_on_frame(
 # ============================================================
 
 def draw_kick_result(
-    frame        : np.ndarray,
-    kicker_pos   : tuple,
-    is_on_target : bool,
-    is_goal      : bool,
-    is_saved     : bool,
+    frame       : np.ndarray,
+    kicker_pos  : tuple,
+    is_on_target: bool,
     kicker_jersey: str
 ) -> np.ndarray:
-    """Gambar indikator hasil tendangan (GOL / SAVED / OFF TARGET)."""
+    """Gambar indikator hasil tendangan (ON TARGET / OFF TARGET)."""
     output = frame.copy()
-
-    if is_goal:
-        color  = (0, 255, 80)      # Hijau
-        status = "GOL!"
-    elif is_saved:
-        color  = (0, 200, 255)     # Kuning/oranye
-        status = "SAVED!"
-    else:
-        color  = (0, 0, 230)       # Merah
-        status = "OFF TARGET"
+    color  = (0, 255, 80) if is_on_target else (0, 0, 230)
+    status = "ON TARGET!" if is_on_target else "OFF TARGET"
 
     if kicker_pos:
         px, py = int(kicker_pos[0]), int(kicker_pos[1])
         label = f"{kicker_jersey}: {status}"
         (lw, lh), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
-
-        # Background box
         cv2.rectangle(output,
                       (px - lw // 2 - 6, py - 60 - lh),
                       (px + lw // 2 + 6, py - 50),
                       color, -1)
-        # Text
         cv2.putText(output, label,
                     (px - lw // 2, py - 55),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-
-        # Sub-label "ON TARGET" jika saved
-        if is_saved:
-            sub_label = "ON TARGET"
-            (sw, sh), _ = cv2.getTextSize(
-                sub_label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1
-            )
-            cv2.putText(output, sub_label,
-                        (px - sw // 2, py - 38),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 220, 255), 1)
 
     return output
 
 
 # ============================================================
-# DRAW PENALTY STATS PANEL — ON TARGET + GOL/SAVED
+# DRAW PENALTY STATS PANEL — SHOOT ON TARGET COUNTING
 # ============================================================
 
 def draw_penalty_stats_panel(
@@ -686,7 +663,8 @@ def draw_penalty_stats_panel(
     panel_width: int = 340
 ) -> np.ndarray:
     """
-    Panel statistik penalty: On Target, Gol, Saved, Off Target per pemain.
+    Panel statistik shoot on target dengan desain modern.
+    Menampilkan: Total / On Target / Off Target per pemain.
     """
     output = frame.copy()
     px, py = position
@@ -698,7 +676,6 @@ def draw_penalty_stats_panel(
     GREEN        = (80, 220, 60)
     RED          = (70, 70, 230)
     YELLOW       = (50, 210, 255)
-    ORANGE       = (0, 165, 255)
     WHITE        = (255, 255, 255)
     GRAY_LIGHT   = (200, 200, 200)
     GRAY_MED     = (140, 140, 140)
@@ -709,10 +686,10 @@ def draw_penalty_stats_panel(
     n_players  = len(per_player)
 
     header_h       = 44
-    summary_h      = 78       # Lebih tinggi: 4 kolom
-    accuracy_h     = 50       # 2 baris progress bar
+    summary_h      = 70
+    accuracy_h     = 42
     divider_pad    = 12
-    player_row_h   = 62
+    player_row_h   = 56
     player_sec_h   = (divider_pad + 22 + player_row_h * n_players) if n_players > 0 else 0
     bottom_pad     = 12
     total_h        = header_h + summary_h + accuracy_h + player_sec_h + bottom_pad
@@ -742,94 +719,72 @@ def draw_penalty_stats_panel(
     cv2.circle(output, (icon_cx, icon_cy), 11, WHITE, 1)
     cv2.circle(output, (icon_cx, icon_cy), 4, (30, 30, 30), -1)
 
-    cv2.putText(output, "PENALTY KICK STATS",
+    cv2.putText(output, "SHOOT ON TARGET",
                 (icon_cx + 18, y1 + header_h // 2 + 6),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.54, WHITE, 2)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.56, WHITE, 2)
 
-    # SUMMARY: 4 KOLOM (Total / Gol / Saved / Off Target)
+    # SUMMARY: 3 KOLOM (Total / On Target / Off Target)
     row_y = y1 + header_h + 8
-    col_w = (panel_width - 2 * pad) // 4
+    col_w = (panel_width - 2 * pad) // 3
 
     total_k   = stats.get('total_kicks', 0)
-    total_g   = stats.get('total_goals', 0)
-    total_s   = stats.get('total_saved', 0)
+    total_on  = stats.get('total_on_target', 0)
     total_off = stats.get('total_off_target', 0)
 
     items = [
         (total_k,   "Total",      ACCENT),
-        (total_g,   "Gol",        GREEN),
-        (total_s,   "Saved",      ORANGE),
+        (total_on,  "On Target",  GREEN),
         (total_off, "Off Target", RED),
     ]
 
     for idx, (val, label, color) in enumerate(items):
         col_cx = x1 + pad + idx * col_w + col_w // 2
         val_str = str(val)
-        (vw, vh), _ = cv2.getTextSize(val_str, cv2.FONT_HERSHEY_SIMPLEX, 0.95, 2)
+        (vw, vh), _ = cv2.getTextSize(val_str, cv2.FONT_HERSHEY_SIMPLEX, 1.05, 2)
         cv2.putText(output, val_str,
                     (col_cx - vw // 2, row_y + 32),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.95, color, 2)
-        (lw, _), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.28, 1)
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.05, color, 2)
+        (lw, _), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.32, 1)
         cv2.putText(output, label,
                     (col_cx - lw // 2, row_y + 50),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.28, GRAY_MED, 1)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.32, GRAY_MED, 1)
 
-    for idx in range(1, 4):
+    for idx in range(1, 3):
         div_x = x1 + pad + idx * col_w
         cv2.line(output, (div_x, row_y + 8), (div_x, row_y + 50), GRAY_DIM, 1)
 
-    # PROGRESS BARS: On Target % dan Gol %
+    # PROGRESS BAR ON TARGET %
     acc_y = row_y + summary_h
-
-    # Bar 1: On Target
     on_pct = stats.get('on_target_pct', 0.0)
-    cv2.putText(output, "On Target",
-                (x1 + pad, acc_y + 2),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.38, GRAY_LIGHT, 1)
 
-    on_color = GREEN if on_pct >= 60 else (YELLOW if on_pct >= 30 else RED)
+    cv2.putText(output, "Akurasi On Target",
+                (x1 + pad, acc_y + 2),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.42, GRAY_LIGHT, 1)
+
+    pct_color = GREEN if on_pct >= 60 else (YELLOW if on_pct >= 30 else RED)
+
     pct_str = f"{on_pct:.0f}%"
-    (pw, _), _ = cv2.getTextSize(pct_str, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)
+    (pw, _), _ = cv2.getTextSize(pct_str, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 2)
     cv2.putText(output, pct_str,
-                (x2 - pad - pw, acc_y + 2),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.42, on_color, 1)
+                (x2 - pad - pw, acc_y + 3),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.52, pct_color, 2)
 
     bar_x1 = x1 + pad
     bar_x2 = x2 - pad
-    bar_y1 = acc_y + 10
-    bar_y2 = bar_y1 + 12
+    bar_y1 = acc_y + 12
+    bar_y2 = bar_y1 + 16
     bar_total_w = bar_x2 - bar_x1
-    draw_rounded_rect(output, (bar_x1, bar_y1), (bar_x2, bar_y2), BAR_BG, radius=6)
+
+    draw_rounded_rect(output, (bar_x1, bar_y1), (bar_x2, bar_y2), BAR_BG, radius=8)
+
     fill_w = int(bar_total_w * min(on_pct / 100.0, 1.0))
-    if fill_w > 4:
+    if fill_w > 6:
         draw_rounded_rect(output, (bar_x1, bar_y1), (bar_x1 + fill_w, bar_y2),
-                          on_color, radius=6)
-
-    # Bar 2: Gol %
-    goal_pct = stats.get('goal_pct', 0.0)
-    bar2_y = acc_y + 28
-    cv2.putText(output, "Gol",
-                (x1 + pad, bar2_y + 2),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.38, GRAY_LIGHT, 1)
-
-    g_color = GREEN if goal_pct >= 50 else (YELLOW if goal_pct >= 25 else RED)
-    g_pct_str = f"{goal_pct:.0f}%"
-    (gpw, _), _ = cv2.getTextSize(g_pct_str, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)
-    cv2.putText(output, g_pct_str,
-                (x2 - pad - gpw, bar2_y + 2),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.42, g_color, 1)
-
-    bar2_y1 = bar2_y + 10
-    bar2_y2 = bar2_y1 + 12
-    draw_rounded_rect(output, (bar_x1, bar2_y1), (bar_x2, bar2_y2), BAR_BG, radius=6)
-    fill_w2 = int(bar_total_w * min(goal_pct / 100.0, 1.0))
-    if fill_w2 > 4:
-        draw_rounded_rect(output, (bar_x1, bar2_y1), (bar_x1 + fill_w2, bar2_y2),
-                          g_color, radius=6)
+                          pct_color, radius=8)
 
     # PER-PLAYER
     if per_player:
-        sec_y = bar2_y2 + divider_pad
+        sec_y = bar_y2 + divider_pad
         cv2.line(output, (x1 + pad, sec_y), (x2 - pad, sec_y), GRAY_DIM, 1)
         sec_y += 6
 
@@ -841,12 +796,10 @@ def draw_penalty_stats_panel(
         for jersey, pstats in per_player.items():
             p_total  = pstats.get('total', 0)
             p_on     = pstats.get('on_target', 0)
-            p_goals  = pstats.get('goals', 0)
-            p_saved  = pstats.get('saved', 0)
             p_off    = pstats.get('off_target', 0)
-            p_gpct   = pstats.get('goal_pct', 0.0)
+            p_pct    = pstats.get('on_target_pct', 0.0)
 
-            # Badge jersey
+            # Badge jersey (warna berdasarkan nama)
             badge_x = x1 + pad
             badge_y = sec_y + 2
             badge_w = 70
@@ -871,16 +824,15 @@ def draw_penalty_stats_panel(
                         (badge_x + (badge_w - jw) // 2, badge_y + 16),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.38, WHITE, 1)
 
-            # Stats text: "1 gol / 1 saved / 1 off"
-            info_x = badge_x + badge_w + 8
-            info_str = f"{p_goals}gol  {p_saved}svd  {p_off}off"
-            cv2.putText(output, info_str,
-                        (info_x, sec_y + 16),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.36, GRAY_LIGHT, 1)
+            # Ratio text: "2/3 on target"
+            ratio_str = f"{p_on}/{p_total} on target"
+            cv2.putText(output, ratio_str,
+                        (badge_x + badge_w + 10, sec_y + 16),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.40, GRAY_LIGHT, 1)
 
-            # Mini progress bar (gol %)
-            mini_bar_x1 = info_x
-            mini_bar_x2 = x2 - pad - 42
+            # Mini progress bar
+            mini_bar_x1 = badge_x + badge_w + 10
+            mini_bar_x2 = x2 - pad - 48
             mini_bar_y1 = sec_y + 24
             mini_bar_y2 = mini_bar_y1 + 10
             mini_bar_w  = mini_bar_x2 - mini_bar_x1
@@ -891,30 +843,29 @@ def draw_penalty_stats_panel(
                                   (mini_bar_x2, mini_bar_y2),
                                   BAR_BG, radius=5)
 
-                mini_fill  = int(mini_bar_w * min(p_gpct / 100.0, 1.0))
-                mini_color = GREEN if p_gpct >= 50 else (YELLOW if p_gpct >= 25 else RED)
+                mini_fill  = int(mini_bar_w * min(p_pct / 100.0, 1.0))
+                mini_color = GREEN if p_pct >= 60 else (YELLOW if p_pct >= 30 else RED)
                 if mini_fill > 4:
                     draw_rounded_rect(output,
                                       (mini_bar_x1, mini_bar_y1),
                                       (mini_bar_x1 + mini_fill, mini_bar_y2),
                                       mini_color, radius=5)
 
-            # Gol percentage
-            p_pct_str = f"{p_gpct:.0f}%"
+            # Percentage
+            p_pct_str = f"{p_pct:.0f}%"
             cv2.putText(output, p_pct_str,
-                        (x2 - pad - 36, sec_y + 17),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.40,
-                        GREEN if p_gpct >= 50 else (YELLOW if p_gpct >= 25 else RED),
+                        (x2 - pad - 40, sec_y + 17),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+                        GREEN if p_pct >= 60 else (YELLOW if p_pct >= 30 else RED),
                         1)
 
-            # Sublabel: on target count
-            on_str = f"on target: {p_on}/{p_total}"
-            cv2.putText(output, on_str,
-                        (info_x, sec_y + 46),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.30, GRAY_DIM, 1)
+            # Sublabel: off target count
+            off_str = f"off target: {p_off}"
+            cv2.putText(output, off_str,
+                        (badge_x + badge_w + 10, sec_y + 44),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.32, GRAY_DIM, 1)
 
             sec_y += player_row_h
 
     return output
-
 
