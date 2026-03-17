@@ -1,6 +1,6 @@
 # main.py
 # Pipeline Penalty Kick: On Target + Gol/Saved Detection
-# v4 — Penetration Depth + Multi-Signal Save Detection
+# v6 — Keeper-Centric + Reaction Window Save Detection
 
 import os
 import sys
@@ -75,8 +75,9 @@ CONFIG = {
     "gawang_shrink_ratio"      : 0.05,
     "on_target_min_frames"     : 1,
 
-    # Penalty detection — save (v5: keeper-centric)
+    # Penalty detection — save (v6: keeper-centric + reaction window)
     "save_check_window"            : 60,
+    "save_reaction_time"           : 0.25,   # detik — window setelah bola masuk gawang
     "penetration_goal_threshold"   : 0.35,
     "save_score_threshold"         : 3,
     "save_keeper_max_dist"         : 120,
@@ -86,7 +87,6 @@ CONFIG = {
     "bounce_back_frames_thr"       : 8,
     "bounce_back_margin"           : 30,
     "bounce_keeper_max_dist"       : 200,
-
 
     # Visualisasi
     "show_gawang"           : True,
@@ -99,7 +99,7 @@ CONFIG = {
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Penalty Kick: On Target + Gol/Saved Detection v4"
+        description="Penalty Kick: On Target + Gol/Saved Detection v6"
     )
     parser.add_argument("--input",  type=str)
     parser.add_argument("--output", type=str)
@@ -400,7 +400,7 @@ def main():
         CONFIG["use_stub"] = True
 
     print("\n" + "=" * 62)
-    print("   PENALTY KICK: ON TARGET + GOL/SAVED DETECTION v4")
+    print("   PENALTY KICK: ON TARGET + GOL/SAVED DETECTION v6")
     print("   Player Merah vs Player Abu-Abu")
     print("=" * 62)
     print(f"  Input        : {CONFIG['input_video']}")
@@ -409,8 +409,9 @@ def main():
     print(f"  Gunakan cache: {'Ya' if CONFIG['use_stub'] else 'Tidak'}")
     print(f"  Manual kick  : {len(CONFIG.get('manual_kick_mapping', {}))} entries")
     print(f"  Manual goal  : {len(CONFIG.get('manual_goal_mapping', {}))} entries")
-    print(f"  Save method  : PENETRATION DEPTH "
-          f"(threshold={CONFIG.get('penetration_goal_threshold', 0.35)})")
+    print(f"  Save method  : KEEPER-CENTRIC + REACTION WINDOW "
+          f"(reaction={CONFIG.get('save_reaction_time', 0.25)}s, "
+          f"score_thr={CONFIG.get('save_score_threshold', 3)})")
     print("=" * 62)
 
     # TAHAP 1: Baca video
@@ -505,10 +506,7 @@ def main():
     # TAHAP 5: Deteksi Penalty
     print("\n[MAIN] TAHAP 5: Deteksi Penalty (On Target + Gol/Saved)...")
     penalty_detector = PenaltyDetector(fps=fps)
-    penalty_detector.set_jersey_map(player_identifier),
-    penalty_detector.save_score_threshold    = CONFIG.get("save_score_threshold", 3)
-    penalty_detector.bounce_keeper_max_dist  = CONFIG.get("bounce_keeper_max_dist", 200)
-
+    penalty_detector.set_jersey_map(player_identifier)
 
     # --- Set kick detection parameters ---
     penalty_detector.kick_velocity_threshold = CONFIG.get("kick_velocity_threshold", 15.0)
@@ -519,15 +517,18 @@ def main():
     penalty_detector.gawang_shrink_ratio     = CONFIG.get("gawang_shrink_ratio", 0.05)
     penalty_detector.on_target_min_frames    = CONFIG.get("on_target_min_frames", 1)
 
-    # --- Set save detection parameters (v4) ---
+    # --- Set save detection parameters (v6) ---
     penalty_detector.save_check_window          = CONFIG.get("save_check_window", 60)
+    penalty_detector.save_reaction_time         = CONFIG.get("save_reaction_time", 0.25)
     penalty_detector.penetration_goal_threshold = CONFIG.get("penetration_goal_threshold", 0.35)
-    penalty_detector.save_keeper_max_dist       = CONFIG.get("save_keeper_max_dist", 100)
+    penalty_detector.save_score_threshold       = CONFIG.get("save_score_threshold", 3)
+    penalty_detector.save_keeper_max_dist       = CONFIG.get("save_keeper_max_dist", 120)
     penalty_detector.save_ball_max_vel          = CONFIG.get("save_ball_max_vel", 5.0)
-    penalty_detector.overlap_min_frames         = CONFIG.get("overlap_min_frames", 3)
-    penalty_detector.overlap_bbox_expand        = CONFIG.get("overlap_bbox_expand", 15)
+    penalty_detector.overlap_min_frames         = CONFIG.get("overlap_min_frames", 2)
+    penalty_detector.overlap_bbox_expand        = CONFIG.get("overlap_bbox_expand", 20)
     penalty_detector.bounce_back_frames_thr     = CONFIG.get("bounce_back_frames_thr", 8)
     penalty_detector.bounce_back_margin         = CONFIG.get("bounce_back_margin", 30)
+    penalty_detector.bounce_keeper_max_dist     = CONFIG.get("bounce_keeper_max_dist", 200)
 
     # --- Manual mappings ---
     manual_kick_map = CONFIG.get("manual_kick_mapping", {})

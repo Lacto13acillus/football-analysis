@@ -3,19 +3,20 @@
 #   1. SHOOT ON TARGET / OFF TARGET
 #   2. GOL / SAVED BY KEEPER
 #
-# === v5: KEEPER-CENTRIC SAVE DETECTION ===
+# === v6: KEEPER-CENTRIC + REACTION WINDOW ===
 #
 # Prinsip:
 #   - ON TARGET = default GOL, kecuali ada bukti kuat KETERLIBATAN KEEPER
-#   - SEMUA sinyal save HARUS melibatkan keeper (proximity/overlap)
+#   - SEMUA sinyal save HARUS melibatkan keeper
+#   - CRITICAL: Sinyal save hanya valid dalam REACTION WINDOW
+#     (waktu singkat setelah bola masuk gawang, ~0.25 detik)
+#   - Setelah reaction window, keeper proximity = pengambilan bola dari jaring
 #   - Bounce-back tanpa keeper = bounce dari jaring = tetap GOL
-#   - Penetration depth digunakan sebagai modifier, BUKAN early-return
 #
-# Perbaikan dari v4:
-#   - Tidak ada early return berdasarkan depth saja
-#   - Bounce-back hanya dihitung jika keeper dekat bola saat bounce
-#   - Weighted scoring system: sinyal kuat vs lemah
-#   - Lebih robust untuk berbagai skenario save
+# Perbaikan dari v5:
+#   - Semua sinyal keeper dicek HANYA dalam reaction window
+#   - FPS-adaptive reaction window (0.25 detik)
+#   - Keeper proximity setelah reaction window = diabaikan (bukan save)
 
 import sys
 sys.path.append('../')
@@ -50,10 +51,16 @@ class PenaltyDetector:
         self.gawang_shrink_ratio     = 0.05
         self.on_target_min_frames    = 1
 
-        # --- Parameter deteksi KEEPER SAVE (v5) ---
+        # --- Parameter deteksi KEEPER SAVE (v6) ---
         self.save_check_window       = 60
 
-        # Penetration depth — sebagai MODIFIER, bukan sole discriminator
+        # REACTION WINDOW — KUNCI UTAMA v6
+        # Save hanya bisa terjadi dalam waktu singkat setelah bola masuk gawang.
+        # Setelah itu, keeper dekat bola = mengambil bola dari jaring.
+        # Nilainya dalam DETIK, akan dikonversi ke frame berdasarkan FPS.
+        self.save_reaction_time      = 0.25  # detik (0.25s = cukup untuk tangkap)
+
+        # Penetration depth — sebagai MODIFIER
         self.penetration_goal_threshold = 0.35
 
         # Keeper proximity
@@ -64,13 +71,13 @@ class PenaltyDetector:
         self.overlap_bbox_expand     = 20
         self.overlap_min_frames      = 2
 
-        # Bounce-back (sekarang HARUS dengan keeper proximity)
+        # Bounce-back (HARUS dengan keeper proximity dalam reaction window)
         self.bounce_back_frames_thr  = 8
         self.bounce_back_margin      = 30
-        self.bounce_keeper_max_dist  = 200  # BARU: keeper harus dekat untuk bounce count
+        self.bounce_keeper_max_dist  = 200
 
         # Scoring threshold untuk keputusan SAVED
-        self.save_score_threshold    = 3  # minimal score untuk SAVED
+        self.save_score_threshold    = 3
 
         # --- Display ---
         self.kick_display_duration   = 50
@@ -80,6 +87,11 @@ class PenaltyDetector:
         self._manual_goal_mapping: Dict[int, bool] = {}
 
         self._player_identifier = None
+
+    @property
+    def save_reaction_frames(self) -> int:
+        """Reaction window dalam jumlah frame, berdasarkan FPS."""
+        return max(8, int(self.fps * self.save_reaction_time))
 
     def set_jersey_map(self, player_identifier) -> None:
         self._player_identifier = player_identifier
@@ -332,7 +344,7 @@ class PenaltyDetector:
         return dist < max_dist, dist
 
     # ============================================================
-    # CEK KEEPER SAVE — v5: KEEPER-CENTRIC + WEIGHTED SCORING
+    # CEK KEEPER SAVE — v6: KEEPER-CENTRIC + REACTION WINDOW
     # ============================================================
 
     def check_keeper_save(
@@ -344,24 +356,32 @@ class PenaltyDetector:
         debug: bool = False
     ) -> Tuple[bool, int, str]:
         """
-        Deteksi GOL vs SAVED — v5: KEEPER-CENTRIC
+        Deteksi GOL vs SAVED — v6: KEEPER-CENTRIC + REACTION WINDOW
 
         Prinsip utama:
         1. SAVED memerlukan bukti KETERLIBATAN KEEPER
-        2. Tanpa keterlibatan keeper → GOL (termasuk bounce dari jaring)
-        3. Penetration depth digunakan sebagai modifier score, BUKAN early return
-        4. Semua sinyal SELALU dicek, tidak ada yang di-skip
+        2. Keterlibatan keeper hanya valid dalam REACTION WINDOW
+           (waktu singkat setelah bola masuk area gawang)
+        3. Setelah reaction window, keeper proximity = mengambil bola
+           dari jaring, BUKAN save
+        4. Penetration depth sebagai modifier, bukan sole discriminator
+        5. Bounce-back tanpa keeper dalam reaction window = jaring bounce = GOL
 
-        Sinyal dan score:
+        Reaction window: ~0.25 detik setelah bola masuk area gawang
+        - Di 59fps = 15 frame
+        - Di 30fps = 8 frame
+
+        Sinyal dan score (hanya dalam reaction window):
         - KEEPER_CATCH: overlap + velocity drop → +4
-        - KEEPER_BLOCK: proximity + sharp velocity drop → +3
+        - KEEPER_BLOCK: proximity + velocity drop → +3
+        - KEEPER_OVERLAP: bola di bbox keeper → +2
         - KEEPER_DEFLECT: direction reversal dekat keeper → +2
         - KEEPER_BOUNCE: bounce-back + keeper dekat → +2
-        - NET_BOUNCE: bounce-back tanpa keeper → +0 (bukan save)
+        - NET_BOUNCE: bounce-back tanpa keeper → +0
 
         Depth modifier:
-        - Penetrasi dangkal (<threshold): score +1 (bonus)
-        - Penetrasi dalam (>threshold): score -1 (penalty, tapi bisa di-override)
+        - Dangkal: +1
+        - Dalam: -1
 
         Keputusan:
         - total_score >= save_score_threshold → SAVED
@@ -377,6 +397,9 @@ class PenaltyDetector:
 
         total = len(tracks['ball'])
         check_end = min(kick_frame + self.save_check_window, total - 1)
+
+        # Reaction window dalam frame
+        reaction_frames = self.save_reaction_frames
 
         # --- Kumpulkan data bola setelah kick ---
         ball_positions = []
@@ -404,6 +427,15 @@ class PenaltyDetector:
             if debug:
                 print(f"[PENALTY]   Bola tidak masuk area gawang -> NOT SAVED")
             return False, -1, "Bola tidak masuk area gawang"
+
+        # Batas akhir reaction window
+        reaction_end_frame = enter_frame + reaction_frames
+
+        if debug:
+            print(f"[PENALTY]   [REACTION] Bola masuk gawang di frame {enter_frame}, "
+                  f"reaction window = {reaction_frames} frame "
+                  f"({self.save_reaction_time:.2f}s @ {self.fps}fps), "
+                  f"batas = frame {reaction_end_frame}")
 
         # ====================================================
         # ANALISIS 1: PENETRATION DEPTH (sebagai MODIFIER)
@@ -433,7 +465,7 @@ class PenaltyDetector:
                   f"(max depth), avg_penetration={avg_penetration:.2f}")
 
         # ====================================================
-        # ANALISIS 2: SINYAL KEEPER-CENTRIC (SELALU dicek)
+        # ANALISIS 2: SINYAL KEEPER (DALAM REACTION WINDOW SAJA)
         # ====================================================
         save_score = 0
         save_signals = []
@@ -441,16 +473,21 @@ class PenaltyDetector:
 
         # --- Signal A: KEEPER_CATCH ---
         # Bola overlap dengan keeper bbox DAN velocity turun drastis
+        # HANYA dalam reaction window
         catch_detected = False
         for idx in range(enter_idx, len(ball_positions)):
             f, bx, by = ball_positions[idx]
+
+            # REACTION WINDOW CHECK
+            if f > reaction_end_frame:
+                break
+
             if f >= len(velocities):
                 continue
 
             if self._ball_inside_keeper_bbox(tracks, f, expand=self.overlap_bbox_expand):
                 vel = velocities[f]
                 if vel < self.save_ball_max_vel:
-                    # Cek sustained: velocity tetap rendah
                     sustained = 0
                     for ff in range(f, min(f + 10, len(velocities))):
                         if velocities[ff] < self.save_ball_max_vel:
@@ -462,21 +499,29 @@ class PenaltyDetector:
                         save_score += 4
                         save_signals.append(
                             f"KEEPER_CATCH: Bola di dalam bbox keeper + velocity drop "
-                            f"(vel={vel:.1f}, sustained={sustained}f)"
+                            f"(frame={f}, vel={vel:.1f}, sustained={sustained}f) "
+                            f"[{f - enter_frame}f setelah masuk]"
                         )
                         if save_frame == -1:
                             save_frame = f
                         catch_detected = True
                         if debug:
-                            print(f"[PENALTY]   [SIGNAL-A] KEEPER_CATCH: frame={f}, "
+                            print(f"[PENALTY]   [SIGNAL-A] KEEPER_CATCH: frame={f} "
+                                  f"({f - enter_frame}f setelah masuk), "
                                   f"vel={vel:.1f}, sustained={sustained} → +4")
                         break
 
         # --- Signal B: KEEPER_BLOCK ---
-        # Bola dekat keeper DAN velocity turun tajam (tapi tidak overlap)
+        # Bola dekat keeper DAN velocity turun tajam
+        # HANYA dalam reaction window
         if not catch_detected:
             for idx in range(enter_idx, len(ball_positions)):
                 f, bx, by = ball_positions[idx]
+
+                # REACTION WINDOW CHECK
+                if f > reaction_end_frame:
+                    break
+
                 if f >= len(velocities):
                     continue
 
@@ -499,23 +544,31 @@ class PenaltyDetector:
                         save_score += 3
                         save_signals.append(
                             f"KEEPER_BLOCK: Bola dekat keeper + velocity drop "
-                            f"(dist={dist:.0f}px, vel={vel:.1f}, sustained={sustained}f)"
+                            f"(frame={f}, dist={dist:.0f}px, vel={vel:.1f}, "
+                            f"sustained={sustained}f) "
+                            f"[{f - enter_frame}f setelah masuk]"
                         )
                         if save_frame == -1:
                             save_frame = f
                         if debug:
-                            print(f"[PENALTY]   [SIGNAL-B] KEEPER_BLOCK: frame={f}, "
+                            print(f"[PENALTY]   [SIGNAL-B] KEEPER_BLOCK: frame={f} "
+                                  f"({f - enter_frame}f setelah masuk), "
                                   f"dist={dist:.0f}px, vel={vel:.1f}, "
                                   f"sustained={sustained} → +3")
                         break
 
         # --- Signal C: KEEPER_OVERLAP (tanpa velocity drop) ---
-        # Bola overlap dengan keeper bbox untuk beberapa frame
+        # HANYA hitung overlap dalam reaction window
         overlap_count = 0
         first_overlap_frame = -1
 
         for idx in range(enter_idx, len(ball_positions)):
             f, bx, by = ball_positions[idx]
+
+            # REACTION WINDOW CHECK
+            if f > reaction_end_frame:
+                break
+
             if self._ball_inside_keeper_bbox(tracks, f, expand=self.overlap_bbox_expand):
                 overlap_count += 1
                 if first_overlap_frame == -1:
@@ -525,15 +578,33 @@ class PenaltyDetector:
             save_score += 2
             save_signals.append(
                 f"KEEPER_OVERLAP: Bola di dalam bbox keeper "
-                f"selama {overlap_count} frame"
+                f"selama {overlap_count} frame (dalam reaction window)"
             )
             if save_frame == -1:
                 save_frame = first_overlap_frame
             if debug:
-                print(f"[PENALTY]   [SIGNAL-C] KEEPER_OVERLAP: {overlap_count} frame → +2")
+                print(f"[PENALTY]   [SIGNAL-C] KEEPER_OVERLAP: {overlap_count} frame "
+                      f"dalam reaction window → +2")
+        elif overlap_count > 0 and debug:
+            print(f"[PENALTY]   [SIGNAL-C] KEEPER_OVERLAP: hanya {overlap_count} frame "
+                  f"dalam reaction window (min={self.overlap_min_frames}) → +0")
+
+        # --- Cek juga overlap SETELAH reaction window (untuk log) ---
+        if debug:
+            late_overlap = 0
+            for idx in range(enter_idx, len(ball_positions)):
+                f, bx, by = ball_positions[idx]
+                if f <= reaction_end_frame:
+                    continue
+                if self._ball_inside_keeper_bbox(tracks, f, expand=self.overlap_bbox_expand):
+                    late_overlap += 1
+            if late_overlap > 0:
+                print(f"[PENALTY]   [INFO] {late_overlap} frame overlap SETELAH "
+                      f"reaction window (diabaikan — kemungkinan pengambilan bola)")
 
         # --- Signal D: KEEPER_DEFLECT ---
-        # Bola berubah arah (direction reversal) DAN keeper dekat saat reversal
+        # Direction reversal DAN keeper dekat saat reversal
+        # Reversal biasanya terjadi di sekitar enter_frame
         if enter_idx >= 0 and enter_idx + 8 < len(ball_positions):
             y_before = []
             y_after = []
@@ -552,32 +623,40 @@ class PenaltyDetector:
                     rev_frame = ball_positions[
                         min(enter_idx + 3, len(ball_positions) - 1)
                     ][0]
-                    rev_ball = self._get_ball_pos(tracks, rev_frame)
-                    rev_keeper = self._get_keeper_center(tracks, rev_frame)
 
-                    if rev_ball and rev_keeper:
-                        rev_dist = measure_distance(rev_ball, rev_keeper)
-                        if rev_dist < 150:
-                            save_score += 2
-                            save_signals.append(
-                                f"KEEPER_DEFLECT: Bola berubah arah dekat keeper "
-                                f"(dy_before={dy_before:.0f}, dy_after={dy_after:.0f}, "
-                                f"dist={rev_dist:.0f}px)"
-                            )
-                            if save_frame == -1:
-                                save_frame = rev_frame
-                            if debug:
-                                print(f"[PENALTY]   [SIGNAL-D] KEEPER_DEFLECT: "
-                                      f"dy_before={dy_before:.0f}, "
-                                      f"dy_after={dy_after:.0f}, "
-                                      f"dist={rev_dist:.0f}px → +2")
+                    # REACTION WINDOW CHECK
+                    if rev_frame <= reaction_end_frame:
+                        rev_ball = self._get_ball_pos(tracks, rev_frame)
+                        rev_keeper = self._get_keeper_center(tracks, rev_frame)
+
+                        if rev_ball and rev_keeper:
+                            rev_dist = measure_distance(rev_ball, rev_keeper)
+                            if rev_dist < 150:
+                                save_score += 2
+                                save_signals.append(
+                                    f"KEEPER_DEFLECT: Bola berubah arah dekat keeper "
+                                    f"(frame={rev_frame}, dy_before={dy_before:.0f}, "
+                                    f"dy_after={dy_after:.0f}, "
+                                    f"dist={rev_dist:.0f}px) "
+                                    f"[{rev_frame - enter_frame}f setelah masuk]"
+                                )
+                                if save_frame == -1:
+                                    save_frame = rev_frame
+                                if debug:
+                                    print(f"[PENALTY]   [SIGNAL-D] KEEPER_DEFLECT: "
+                                          f"frame={rev_frame} "
+                                          f"({rev_frame - enter_frame}f setelah masuk), "
+                                          f"dy_before={dy_before:.0f}, "
+                                          f"dy_after={dy_after:.0f}, "
+                                          f"dist={rev_dist:.0f}px → +2")
+                    elif debug:
+                        print(f"[PENALTY]   [SIGNAL-D] Direction reversal di frame "
+                              f"{rev_frame} tapi DI LUAR reaction window → +0")
 
         # --- Signal E: BOUNCE-BACK (DENGAN validasi keeper) ---
-        # Bola keluar gawang setelah masuk — tapi HANYA jika keeper dekat
+        # Bola keluar gawang — tapi cek keeper proximity DALAM reaction window
         frames_outside = 0
         first_exit_frame = -1
-        keeper_near_during_bounce = False
-        min_keeper_dist_bounce = float('inf')
 
         for idx in range(enter_idx + 1, len(ball_positions)):
             f, bx, by = ball_positions[idx]
@@ -594,49 +673,43 @@ class PenaltyDetector:
                     first_exit_frame = f
 
         if frames_outside >= self.bounce_back_frames_thr:
-            # Cek apakah keeper dekat bola di sekitar saat bola keluar
-            # Periksa window: dari saat bola masuk sampai saat bola keluar
-            bounce_check_start = enter_frame
-            bounce_check_end = min(
-                first_exit_frame + 10 if first_exit_frame >= 0 else check_end,
-                total - 1
-            )
-            for f in range(bounce_check_start, bounce_check_end + 1):
+            # Cek keeper proximity DALAM REACTION WINDOW
+            keeper_near_in_reaction = False
+            min_keeper_dist_reaction = float('inf')
+
+            for f in range(enter_frame, min(reaction_end_frame + 1, total)):
                 is_near, dist = self._keeper_near_ball(
                     tracks, f, max_dist=self.bounce_keeper_max_dist
                 )
-                if dist < min_keeper_dist_bounce:
-                    min_keeper_dist_bounce = dist
+                if dist < min_keeper_dist_reaction:
+                    min_keeper_dist_reaction = dist
                 if is_near:
-                    keeper_near_during_bounce = True
+                    keeper_near_in_reaction = True
 
-            if keeper_near_during_bounce:
+            if keeper_near_in_reaction:
                 save_score += 2
                 save_signals.append(
-                    f"KEEPER_BOUNCE: Bola memantul keluar + keeper dekat "
-                    f"({frames_outside}f di luar, "
-                    f"min_keeper_dist={min_keeper_dist_bounce:.0f}px)"
+                    f"KEEPER_BOUNCE: Bola memantul keluar + keeper dekat dalam "
+                    f"reaction window ({frames_outside}f di luar, "
+                    f"min_keeper_dist={min_keeper_dist_reaction:.0f}px)"
                 )
                 if save_frame == -1:
                     save_frame = first_exit_frame
                 if debug:
                     print(f"[PENALTY]   [SIGNAL-E] KEEPER_BOUNCE: "
                           f"{frames_outside}f di luar, "
-                          f"keeper_dist={min_keeper_dist_bounce:.0f}px → +2")
+                          f"keeper_dist_in_reaction={min_keeper_dist_reaction:.0f}px → +2")
             else:
-                # Bounce tanpa keeper = jaring bounce = bukan save
                 if debug:
                     print(f"[PENALTY]   [SIGNAL-E] NET_BOUNCE: "
                           f"{frames_outside}f di luar, "
-                          f"keeper terlalu jauh "
-                          f"(min_dist={min_keeper_dist_bounce:.0f}px "
-                          f"> {self.bounce_keeper_max_dist}px) → +0 (GOL)")
+                          f"keeper tidak dekat dalam reaction window "
+                          f"(min_dist={min_keeper_dist_reaction:.0f}px "
+                          f"> {self.bounce_keeper_max_dist}px) → +0 (jaring)")
 
         # ====================================================
         # DEPTH MODIFIER
         # ====================================================
-        # Penetrasi dangkal sedikit menambah score (lebih mungkin SAVED)
-        # Penetrasi dalam sedikit mengurangi score (lebih mungkin GOL)
         if penetration_ratio < self.penetration_goal_threshold:
             depth_modifier = 1
             if debug:
@@ -676,7 +749,8 @@ class PenaltyDetector:
                           f"(score={total_score} < {self.save_score_threshold}, "
                           f"depth={penetration_ratio:.2f}) - {all_reasons}")
             else:
-                reason = (f"GOL - Tidak ada sinyal keeper involvement "
+                reason = (f"GOL - Tidak ada sinyal keeper involvement dalam "
+                          f"reaction window "
                           f"(score={total_score}, depth={penetration_ratio:.2f})")
             if debug:
                 print(f"[PENALTY]   >>> GOL (score={total_score} "
@@ -789,7 +863,7 @@ class PenaltyDetector:
         total_frames = len(tracks['ball'])
 
         if debug:
-            print(f"\n[PENALTY] === PENALTY DETECTION v5 (KEEPER-CENTRIC) ===")
+            print(f"\n[PENALTY] === PENALTY DETECTION v6 (KEEPER-CENTRIC + REACTION WINDOW) ===")
             print(f"[PENALTY] Total frames              : {total_frames}")
             print(f"[PENALTY] Kick velocity threshold    : "
                   f"{self.kick_velocity_threshold} px/frame")
@@ -805,7 +879,10 @@ class PenaltyDetector:
                   f"{self.save_check_window} frames")
             print(f"[PENALTY] Cooldown                   : "
                   f"{self.cooldown_frames} frames")
-            print(f"[PENALTY] --- Save Detection (v5: Keeper-Centric) ---")
+            print(f"[PENALTY] --- Save Detection (v6: Reaction Window) ---")
+            print(f"[PENALTY]   Reaction time            : "
+                  f"{self.save_reaction_time}s "
+                  f"({self.save_reaction_frames} frames @ {self.fps}fps)")
             print(f"[PENALTY]   Depth threshold (modifier): "
                   f"{self.penetration_goal_threshold}")
             print(f"[PENALTY]   Save score threshold     : "
@@ -883,7 +960,7 @@ class PenaltyDetector:
                           f"frame {kick_frame} -> "
                           f"{'GOL' if manual_goal else 'SAVED'}")
             elif is_on_target:
-                # Deteksi otomatis v5: keeper-centric
+                # Deteksi otomatis v6: keeper-centric + reaction window
                 is_saved, save_frame, save_reason = self.check_keeper_save(
                     tracks, velocities, kick_frame, stable_gawang, debug=debug
                 )
