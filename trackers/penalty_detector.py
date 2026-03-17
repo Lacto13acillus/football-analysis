@@ -3,15 +3,19 @@
 #   1. SHOOT ON TARGET / OFF TARGET
 #   2. GOL / SAVED BY KEEPER
 #
-# === v4: PENETRATION DEPTH + MULTI-SIGNAL ===
+# === v5: KEEPER-CENTRIC SAVE DETECTION ===
 #
-# Filosofi baru:
-#   - ON TARGET = default GOL, kecuali ada bukti kuat SAVED
-#   - Primary discriminator: KEDALAMAN PENETRASI bola ke dalam gawang
-#     * GOL  = bola menembus DALAM ke jaring (Y rendah, jauh dari goal line)
-#     * SAVED = bola berhenti di DEPAN gawang (Y tinggi, dekat goal line)
-#   - Secondary: overlap keeper + ball velocity pattern
-#   - VDROP sendirian TIDAK cukup (karena semua bola di jaring melambat)
+# Prinsip:
+#   - ON TARGET = default GOL, kecuali ada bukti kuat KETERLIBATAN KEEPER
+#   - SEMUA sinyal save HARUS melibatkan keeper (proximity/overlap)
+#   - Bounce-back tanpa keeper = bounce dari jaring = tetap GOL
+#   - Penetration depth digunakan sebagai modifier, BUKAN early-return
+#
+# Perbaikan dari v4:
+#   - Tidak ada early return berdasarkan depth saja
+#   - Bounce-back hanya dihitung jika keeper dekat bola saat bounce
+#   - Weighted scoring system: sinyal kuat vs lemah
+#   - Lebih robust untuk berbagai skenario save
 
 import sys
 sys.path.append('../')
@@ -46,28 +50,27 @@ class PenaltyDetector:
         self.gawang_shrink_ratio     = 0.05
         self.on_target_min_frames    = 1
 
-        # --- Parameter deteksi KEEPER SAVE (v4) ---
+        # --- Parameter deteksi KEEPER SAVE (v5) ---
         self.save_check_window       = 60
 
-        # Penetration depth — PRIMARY discriminator
-        # Bola yang GOL menembus DALAM ke gawang (Y kecil = atas frame = dalam net)
-        # Bola yang SAVED berhenti di DEPAN gawang (Y besar = bawah frame = goal line)
-        # penetration_ratio = (gawang_bottom - min_ball_Y) / gawang_height
-        #   ratio > threshold → bola masuk dalam → GOL
-        #   ratio < threshold → bola berhenti di depan → mungkin SAVED
-        self.penetration_goal_threshold = 0.35  # >35% depth = GOL
+        # Penetration depth — sebagai MODIFIER, bukan sole discriminator
+        self.penetration_goal_threshold = 0.35
 
-        # Keeper proximity — untuk konfirmasi SAVED saat penetrasi dangkal
-        self.save_keeper_max_dist    = 100   # ball harus dekat keeper untuk SAVED
-        self.save_ball_max_vel       = 5.0   # velocity bola harus rendah untuk SAVED
+        # Keeper proximity
+        self.save_keeper_max_dist    = 120
+        self.save_ball_max_vel       = 5.0
 
         # Overlap — bola di dalam bbox keeper
-        self.overlap_bbox_expand     = 15
-        self.overlap_min_frames      = 3
+        self.overlap_bbox_expand     = 20
+        self.overlap_min_frames      = 2
 
-        # Bounce-back
+        # Bounce-back (sekarang HARUS dengan keeper proximity)
         self.bounce_back_frames_thr  = 8
         self.bounce_back_margin      = 30
+        self.bounce_keeper_max_dist  = 200  # BARU: keeper harus dekat untuk bounce count
+
+        # Scoring threshold untuk keputusan SAVED
+        self.save_score_threshold    = 3  # minimal score untuk SAVED
 
         # --- Display ---
         self.kick_display_duration   = 50
@@ -282,6 +285,14 @@ class PenaltyDetector:
             return get_center_of_bbox(ball_data['bbox'])
         return None
 
+    def _get_ball_bbox(self, tracks: Dict, frame: int) -> Optional[List[float]]:
+        if frame < 0 or frame >= len(tracks['ball']):
+            return None
+        ball_data = tracks['ball'][frame].get(1)
+        if ball_data and 'bbox' in ball_data:
+            return ball_data['bbox']
+        return None
+
     def _get_keeper_bbox(self, tracks: Dict, frame: int) -> Optional[List[float]]:
         if frame < 0 or frame >= len(tracks['keeper']):
             return None
@@ -296,8 +307,32 @@ class PenaltyDetector:
             return get_center_of_bbox(bbox)
         return None
 
+    def _ball_inside_keeper_bbox(
+        self, tracks: Dict, frame: int, expand: int = 15
+    ) -> bool:
+        """Cek apakah bola berada di dalam bounding box keeper (dengan expand)."""
+        ball_pos = self._get_ball_pos(tracks, frame)
+        keeper_bbox = self._get_keeper_bbox(tracks, frame)
+        if ball_pos is None or keeper_bbox is None:
+            return False
+        bx, by = ball_pos
+        kx1, ky1, kx2, ky2 = keeper_bbox
+        return (kx1 - expand <= bx <= kx2 + expand and
+                ky1 - expand <= by <= ky2 + expand)
+
+    def _keeper_near_ball(
+        self, tracks: Dict, frame: int, max_dist: float = 120
+    ) -> Tuple[bool, float]:
+        """Cek apakah keeper dekat dengan bola. Return (is_near, distance)."""
+        ball_pos = self._get_ball_pos(tracks, frame)
+        keeper_center = self._get_keeper_center(tracks, frame)
+        if ball_pos is None or keeper_center is None:
+            return False, float('inf')
+        dist = measure_distance(ball_pos, keeper_center)
+        return dist < max_dist, dist
+
     # ============================================================
-    # CEK KEEPER SAVE — v4: PENETRATION DEPTH + MULTI-SIGNAL
+    # CEK KEEPER SAVE — v5: KEEPER-CENTRIC + WEIGHTED SCORING
     # ============================================================
 
     def check_keeper_save(
@@ -309,26 +344,33 @@ class PenaltyDetector:
         debug: bool = False
     ) -> Tuple[bool, int, str]:
         """
-        Deteksi GOL vs SAVED menggunakan PENETRATION DEPTH sebagai
-        pembeda utama.
+        Deteksi GOL vs SAVED — v5: KEEPER-CENTRIC
 
-        Konsep kunci (kamera dari belakang penendang):
-        - Gawang di ATAS frame. Y kecil = dalam gawang. Y besar = depan gawang.
-        - GOL: bola menembus DALAM ke jaring → min_ball_Y mendekati gawang_top
-        - SAVED: bola berhenti di DEPAN gawang → min_ball_Y mendekati gawang_bottom
+        Prinsip utama:
+        1. SAVED memerlukan bukti KETERLIBATAN KEEPER
+        2. Tanpa keterlibatan keeper → GOL (termasuk bounce dari jaring)
+        3. Penetration depth digunakan sebagai modifier score, BUKAN early return
+        4. Semua sinyal SELALU dicek, tidak ada yang di-skip
 
-        penetration_ratio = (gawang_bottom - min_ball_Y) / gawang_height
-          > threshold → GOL (bola masuk dalam)
-          < threshold → cek sinyal SAVED tambahan
+        Sinyal dan score:
+        - KEEPER_CATCH: overlap + velocity drop → +4
+        - KEEPER_BLOCK: proximity + sharp velocity drop → +3
+        - KEEPER_DEFLECT: direction reversal dekat keeper → +2
+        - KEEPER_BOUNCE: bounce-back + keeper dekat → +2
+        - NET_BOUNCE: bounce-back tanpa keeper → +0 (bukan save)
 
-        Returns:
-            (is_saved, save_frame, reason)
+        Depth modifier:
+        - Penetrasi dangkal (<threshold): score +1 (bonus)
+        - Penetrasi dalam (>threshold): score -1 (penalty, tapi bisa di-override)
+
+        Keputusan:
+        - total_score >= save_score_threshold → SAVED
+        - total_score < save_score_threshold → GOL
         """
         gx1, gy1, gx2, gy2 = stable_gawang_bbox
-        gawang_top = gy1       # dalam gawang (back of net)
-        gawang_bottom = gy2    # depan gawang (goal line)
+        gawang_top = gy1
+        gawang_bottom = gy2
         gawang_height = gy2 - gy1
-        gawang_width = gx2 - gx1
 
         if gawang_height <= 0:
             return False, -1, "Gawang height invalid"
@@ -336,10 +378,8 @@ class PenaltyDetector:
         total = len(tracks['ball'])
         check_end = min(kick_frame + self.save_check_window, total - 1)
 
-        kick_velocity = velocities[kick_frame] if kick_frame < len(velocities) else 0.0
-
         # --- Kumpulkan data bola setelah kick ---
-        ball_positions = []  # (frame, x, y)
+        ball_positions = []
         for f in range(kick_frame, check_end + 1):
             ball_pos = self._get_ball_pos(tracks, f)
             if ball_pos:
@@ -366,29 +406,21 @@ class PenaltyDetector:
             return False, -1, "Bola tidak masuk area gawang"
 
         # ====================================================
-        # ANALISIS 1: PENETRATION DEPTH (PRIMARY)
+        # ANALISIS 1: PENETRATION DEPTH (sebagai MODIFIER)
         # ====================================================
-        # Kumpulkan semua posisi Y bola SETELAH masuk gawang
         ball_y_in_gawang = []
-        ball_positions_in_gawang = []
         for idx in range(enter_idx, len(ball_positions)):
             f, bx, by = ball_positions[idx]
-            # Hanya yang masih di area gawang horizontal
             if gx1 - 30 <= bx <= gx2 + 30:
                 ball_y_in_gawang.append(by)
-                ball_positions_in_gawang.append((f, bx, by))
 
         if not ball_y_in_gawang:
             if debug:
                 print(f"[PENALTY]   Tidak ada data Y bola di gawang -> GOL (default)")
             return False, -1, "Tidak ada data bola di gawang"
 
-        # min_ball_y = posisi Y paling kecil = paling DALAM ke gawang
         min_ball_y = min(ball_y_in_gawang)
         avg_ball_y = np.mean(ball_y_in_gawang)
-
-        # penetration: seberapa dalam bola masuk
-        # 0.0 = bola di goal line (depan), 1.0 = bola di back net (dalam)
         penetration_ratio = (gawang_bottom - min_ball_y) / gawang_height
         avg_penetration = (gawang_bottom - avg_ball_y) / gawang_height
 
@@ -399,124 +431,109 @@ class PenaltyDetector:
                   f"avg_Y={avg_ball_y:.0f}")
             print(f"[PENALTY]   [DEPTH] penetration_ratio={penetration_ratio:.2f} "
                   f"(max depth), avg_penetration={avg_penetration:.2f}")
-            print(f"[PENALTY]   [DEPTH] threshold={self.penetration_goal_threshold} "
-                  f"-> {'DEEP (GOL)' if penetration_ratio > self.penetration_goal_threshold else 'SHALLOW (cek SAVED)'}")
-
-        # Jika bola menembus DALAM → pasti GOL, override semua sinyal lain
-        if penetration_ratio > self.penetration_goal_threshold:
-            reason = (f"GOL - Bola masuk dalam gawang "
-                      f"(depth={penetration_ratio:.2f}, "
-                      f"min_Y={min_ball_y:.0f}, "
-                      f"threshold={self.penetration_goal_threshold})")
-            if debug:
-                print(f"[PENALTY]   >>> DEEP PENETRATION → GOL (depth={penetration_ratio:.2f})")
-            return False, -1, reason
 
         # ====================================================
-        # ANALISIS 2: SINYAL SAVED (hanya jika penetrasi DANGKAL)
+        # ANALISIS 2: SINYAL KEEPER-CENTRIC (SELALU dicek)
         # ====================================================
-        # Bola tidak masuk dalam → cek apakah memang di-save keeper
+        save_score = 0
+        save_signals = []
+        save_frame = -1
 
-        saved_signals = []
-
-        # --- Signal A: Ball-Keeper proximity saat bola berhenti ---
-        # Cek apakah bola berhenti/melambat DEKAT keeper
+        # --- Signal A: KEEPER_CATCH ---
+        # Bola overlap dengan keeper bbox DAN velocity turun drastis
+        catch_detected = False
         for idx in range(enter_idx, len(ball_positions)):
             f, bx, by = ball_positions[idx]
             if f >= len(velocities):
                 continue
 
-            keeper_center = self._get_keeper_center(tracks, f)
-            if keeper_center is None:
-                continue
+            if self._ball_inside_keeper_bbox(tracks, f, expand=self.overlap_bbox_expand):
+                vel = velocities[f]
+                if vel < self.save_ball_max_vel:
+                    # Cek sustained: velocity tetap rendah
+                    sustained = 0
+                    for ff in range(f, min(f + 10, len(velocities))):
+                        if velocities[ff] < self.save_ball_max_vel:
+                            sustained += 1
+                        else:
+                            break
 
-            dist = measure_distance((bx, by), keeper_center)
-            vel = velocities[f]
-
-            # Bola dekat keeper DAN velocity rendah
-            if dist < self.save_keeper_max_dist and vel < self.save_ball_max_vel:
-                # Cek sustained: velocity tetap rendah
-                sustained = 0
-                for ff in range(f, min(f + 8, len(velocities))):
-                    if velocities[ff] < self.save_ball_max_vel:
-                        sustained += 1
-                    else:
+                    if sustained >= 3:
+                        save_score += 4
+                        save_signals.append(
+                            f"KEEPER_CATCH: Bola di dalam bbox keeper + velocity drop "
+                            f"(vel={vel:.1f}, sustained={sustained}f)"
+                        )
+                        if save_frame == -1:
+                            save_frame = f
+                        catch_detected = True
+                        if debug:
+                            print(f"[PENALTY]   [SIGNAL-A] KEEPER_CATCH: frame={f}, "
+                                  f"vel={vel:.1f}, sustained={sustained} → +4")
                         break
 
-                if sustained >= 3:
-                    saved_signals.append(
-                        (f, f"PROXIMITY+VDROP: Bola berhenti dekat keeper "
-                            f"(dist={dist:.0f}px, vel={vel:.1f}, "
-                            f"sustained={sustained} frames)")
-                    )
-                    if debug:
-                        print(f"[PENALTY]   [SIGNAL-A] PROXIMITY+VDROP: "
-                              f"frame={f}, dist={dist:.0f}px, vel={vel:.1f}, "
-                              f"sustained={sustained}")
-                    break
+        # --- Signal B: KEEPER_BLOCK ---
+        # Bola dekat keeper DAN velocity turun tajam (tapi tidak overlap)
+        if not catch_detected:
+            for idx in range(enter_idx, len(ball_positions)):
+                f, bx, by = ball_positions[idx]
+                if f >= len(velocities):
+                    continue
 
-        # --- Signal B: Ball inside keeper bbox (overlap) ---
+                is_near, dist = self._keeper_near_ball(
+                    tracks, f, max_dist=self.save_keeper_max_dist
+                )
+                if not is_near:
+                    continue
+
+                vel = velocities[f]
+                if vel < self.save_ball_max_vel:
+                    sustained = 0
+                    for ff in range(f, min(f + 8, len(velocities))):
+                        if velocities[ff] < self.save_ball_max_vel:
+                            sustained += 1
+                        else:
+                            break
+
+                    if sustained >= 3:
+                        save_score += 3
+                        save_signals.append(
+                            f"KEEPER_BLOCK: Bola dekat keeper + velocity drop "
+                            f"(dist={dist:.0f}px, vel={vel:.1f}, sustained={sustained}f)"
+                        )
+                        if save_frame == -1:
+                            save_frame = f
+                        if debug:
+                            print(f"[PENALTY]   [SIGNAL-B] KEEPER_BLOCK: frame={f}, "
+                                  f"dist={dist:.0f}px, vel={vel:.1f}, "
+                                  f"sustained={sustained} → +3")
+                        break
+
+        # --- Signal C: KEEPER_OVERLAP (tanpa velocity drop) ---
+        # Bola overlap dengan keeper bbox untuk beberapa frame
         overlap_count = 0
         first_overlap_frame = -1
 
         for idx in range(enter_idx, len(ball_positions)):
             f, bx, by = ball_positions[idx]
-            keeper_bbox = self._get_keeper_bbox(tracks, f)
-            if keeper_bbox is None:
-                continue
-
-            kx1, ky1, kx2, ky2 = keeper_bbox
-            expand = self.overlap_bbox_expand
-
-            if (kx1 - expand <= bx <= kx2 + expand and
-                ky1 - expand <= by <= ky2 + expand):
+            if self._ball_inside_keeper_bbox(tracks, f, expand=self.overlap_bbox_expand):
                 overlap_count += 1
                 if first_overlap_frame == -1:
                     first_overlap_frame = f
 
-        if overlap_count >= self.overlap_min_frames:
-            saved_signals.append(
-                (first_overlap_frame,
-                 f"OVERLAP: Bola di dalam bbox keeper "
-                 f"selama {overlap_count} frame")
+        if overlap_count >= self.overlap_min_frames and not catch_detected:
+            save_score += 2
+            save_signals.append(
+                f"KEEPER_OVERLAP: Bola di dalam bbox keeper "
+                f"selama {overlap_count} frame"
             )
+            if save_frame == -1:
+                save_frame = first_overlap_frame
             if debug:
-                print(f"[PENALTY]   [SIGNAL-B] OVERLAP: {overlap_count} frame "
-                      f"(threshold={self.overlap_min_frames})")
+                print(f"[PENALTY]   [SIGNAL-C] KEEPER_OVERLAP: {overlap_count} frame → +2")
 
-        # --- Signal C: Bounce-back (bola keluar gawang setelah masuk) ---
-        frames_outside = 0
-        first_exit_frame = -1
-
-        for idx in range(enter_idx + 1, len(ball_positions)):
-            f, bx, by = ball_positions[idx]
-
-            # Bola keluar area gawang ke bawah (bounce back ke penendang)
-            if by > gawang_bottom + self.bounce_back_margin:
-                frames_outside += 1
-                if first_exit_frame == -1:
-                    first_exit_frame = f
-
-            # Bola keluar area gawang ke samping jauh
-            if bx < gx1 - 50 or bx > gx2 + 50:
-                if by > gy1:
-                    frames_outside += 1
-                    if first_exit_frame == -1:
-                        first_exit_frame = f
-
-        if frames_outside >= self.bounce_back_frames_thr:
-            saved_signals.append(
-                (first_exit_frame,
-                 f"BOUNCE: Bola memantul keluar gawang "
-                 f"({frames_outside} frame di luar)")
-            )
-            if debug:
-                print(f"[PENALTY]   [SIGNAL-C] BOUNCE: {frames_outside} frame "
-                      f"(threshold={self.bounce_back_frames_thr})")
-
-        # --- Signal D: Direction reversal (bola berubah arah Y) ---
-        direction_reversed = False
-
+        # --- Signal D: KEEPER_DEFLECT ---
+        # Bola berubah arah (direction reversal) DAN keeper dekat saat reversal
         if enter_idx >= 0 and enter_idx + 8 < len(ball_positions):
             y_before = []
             y_after = []
@@ -531,58 +548,139 @@ class PenaltyDetector:
                 dy_before = y_before[-1] - y_before[0]
                 dy_after = y_after[-1] - y_after[0]
 
-                # Bola naik (Y turun) lalu turun (Y naik) = dipantulkan
                 if dy_before < -5 and dy_after > 10:
-                    direction_reversed = True
-
-                    # Hanya count jika dekat keeper saat reversal
-                    rev_frame = ball_positions[min(enter_idx + 3, len(ball_positions) - 1)][0]
+                    rev_frame = ball_positions[
+                        min(enter_idx + 3, len(ball_positions) - 1)
+                    ][0]
                     rev_ball = self._get_ball_pos(tracks, rev_frame)
                     rev_keeper = self._get_keeper_center(tracks, rev_frame)
 
                     if rev_ball and rev_keeper:
                         rev_dist = measure_distance(rev_ball, rev_keeper)
                         if rev_dist < 150:
-                            saved_signals.append(
-                                (rev_frame,
-                                 f"REVERSAL: Bola berubah arah dekat keeper "
-                                 f"(dy_before={dy_before:.0f}, "
-                                 f"dy_after={dy_after:.0f}, "
-                                 f"dist_keeper={rev_dist:.0f}px)")
+                            save_score += 2
+                            save_signals.append(
+                                f"KEEPER_DEFLECT: Bola berubah arah dekat keeper "
+                                f"(dy_before={dy_before:.0f}, dy_after={dy_after:.0f}, "
+                                f"dist={rev_dist:.0f}px)"
                             )
+                            if save_frame == -1:
+                                save_frame = rev_frame
                             if debug:
-                                print(f"[PENALTY]   [SIGNAL-D] REVERSAL: "
+                                print(f"[PENALTY]   [SIGNAL-D] KEEPER_DEFLECT: "
                                       f"dy_before={dy_before:.0f}, "
                                       f"dy_after={dy_after:.0f}, "
-                                      f"dist={rev_dist:.0f}px")
+                                      f"dist={rev_dist:.0f}px → +2")
+
+        # --- Signal E: BOUNCE-BACK (DENGAN validasi keeper) ---
+        # Bola keluar gawang setelah masuk — tapi HANYA jika keeper dekat
+        frames_outside = 0
+        first_exit_frame = -1
+        keeper_near_during_bounce = False
+        min_keeper_dist_bounce = float('inf')
+
+        for idx in range(enter_idx + 1, len(ball_positions)):
+            f, bx, by = ball_positions[idx]
+
+            is_outside = False
+            if by > gawang_bottom + self.bounce_back_margin:
+                is_outside = True
+            if (bx < gx1 - 50 or bx > gx2 + 50) and by > gy1:
+                is_outside = True
+
+            if is_outside:
+                frames_outside += 1
+                if first_exit_frame == -1:
+                    first_exit_frame = f
+
+        if frames_outside >= self.bounce_back_frames_thr:
+            # Cek apakah keeper dekat bola di sekitar saat bola keluar
+            # Periksa window: dari saat bola masuk sampai saat bola keluar
+            bounce_check_start = enter_frame
+            bounce_check_end = min(
+                first_exit_frame + 10 if first_exit_frame >= 0 else check_end,
+                total - 1
+            )
+            for f in range(bounce_check_start, bounce_check_end + 1):
+                is_near, dist = self._keeper_near_ball(
+                    tracks, f, max_dist=self.bounce_keeper_max_dist
+                )
+                if dist < min_keeper_dist_bounce:
+                    min_keeper_dist_bounce = dist
+                if is_near:
+                    keeper_near_during_bounce = True
+
+            if keeper_near_during_bounce:
+                save_score += 2
+                save_signals.append(
+                    f"KEEPER_BOUNCE: Bola memantul keluar + keeper dekat "
+                    f"({frames_outside}f di luar, "
+                    f"min_keeper_dist={min_keeper_dist_bounce:.0f}px)"
+                )
+                if save_frame == -1:
+                    save_frame = first_exit_frame
+                if debug:
+                    print(f"[PENALTY]   [SIGNAL-E] KEEPER_BOUNCE: "
+                          f"{frames_outside}f di luar, "
+                          f"keeper_dist={min_keeper_dist_bounce:.0f}px → +2")
+            else:
+                # Bounce tanpa keeper = jaring bounce = bukan save
+                if debug:
+                    print(f"[PENALTY]   [SIGNAL-E] NET_BOUNCE: "
+                          f"{frames_outside}f di luar, "
+                          f"keeper terlalu jauh "
+                          f"(min_dist={min_keeper_dist_bounce:.0f}px "
+                          f"> {self.bounce_keeper_max_dist}px) → +0 (GOL)")
+
+        # ====================================================
+        # DEPTH MODIFIER
+        # ====================================================
+        # Penetrasi dangkal sedikit menambah score (lebih mungkin SAVED)
+        # Penetrasi dalam sedikit mengurangi score (lebih mungkin GOL)
+        if penetration_ratio < self.penetration_goal_threshold:
+            depth_modifier = 1
+            if debug:
+                print(f"[PENALTY]   [DEPTH-MOD] Penetrasi dangkal "
+                      f"({penetration_ratio:.2f} < {self.penetration_goal_threshold}) → +1")
+        else:
+            depth_modifier = -1
+            if debug:
+                print(f"[PENALTY]   [DEPTH-MOD] Penetrasi dalam "
+                      f"({penetration_ratio:.2f} >= {self.penetration_goal_threshold}) → -1")
+
+        total_score = save_score + depth_modifier
+
+        if debug:
+            print(f"[PENALTY]   [SCORE] save_signals={save_score}, "
+                  f"depth_mod={depth_modifier:+d}, "
+                  f"total={total_score} "
+                  f"(threshold={self.save_score_threshold})")
 
         # ====================================================
         # KEPUTUSAN AKHIR
         # ====================================================
-        # Penetrasi dangkal + minimal 1 sinyal SAVED = SAVED
-        if saved_signals:
-            save_frame = saved_signals[0][0]
-            all_reasons = " | ".join([s[1] for s in saved_signals])
-            reason = (f"SAVED ({len(saved_signals)} sinyal, "
-                      f"depth={penetration_ratio:.2f}) - {all_reasons}")
-
+        if total_score >= self.save_score_threshold:
+            all_reasons = " | ".join(save_signals)
+            reason = (f"SAVED (score={total_score}, depth={penetration_ratio:.2f}) "
+                      f"- {all_reasons}")
             if debug:
-                print(f"[PENALTY]   >>> SHALLOW + {len(saved_signals)} sinyal "
-                      f"→ SAVED (depth={penetration_ratio:.2f})")
-                for sf, sr in saved_signals:
-                    print(f"[PENALTY]       - {sr}")
-
+                print(f"[PENALTY]   >>> SAVED (score={total_score} "
+                      f">= {self.save_score_threshold})")
+                for s in save_signals:
+                    print(f"[PENALTY]       - {s}")
             return True, save_frame, reason
         else:
-            # Penetrasi dangkal tapi tidak ada sinyal save
-            # Bisa jadi bola masuk tipis di sudut → tetap GOL
-            reason = (f"GOL - Tidak ada sinyal save "
-                      f"(depth={penetration_ratio:.2f}, 0 sinyal)")
-
+            if save_signals:
+                all_reasons = " | ".join(save_signals)
+                reason = (f"GOL - Sinyal save tidak cukup kuat "
+                          f"(score={total_score} < {self.save_score_threshold}, "
+                          f"depth={penetration_ratio:.2f}) - {all_reasons}")
+            else:
+                reason = (f"GOL - Tidak ada sinyal keeper involvement "
+                          f"(score={total_score}, depth={penetration_ratio:.2f})")
             if debug:
-                print(f"[PENALTY]   >>> SHALLOW tapi 0 sinyal → GOL "
-                      f"(depth={penetration_ratio:.2f})")
-
+                print(f"[PENALTY]   >>> GOL (score={total_score} "
+                      f"< {self.save_score_threshold})")
             return False, -1, reason
 
     # ============================================================
@@ -691,7 +789,7 @@ class PenaltyDetector:
         total_frames = len(tracks['ball'])
 
         if debug:
-            print(f"\n[PENALTY] === PENALTY DETECTION v4 (PENETRATION DEPTH) ===")
+            print(f"\n[PENALTY] === PENALTY DETECTION v5 (KEEPER-CENTRIC) ===")
             print(f"[PENALTY] Total frames              : {total_frames}")
             print(f"[PENALTY] Kick velocity threshold    : "
                   f"{self.kick_velocity_threshold} px/frame")
@@ -707,12 +805,14 @@ class PenaltyDetector:
                   f"{self.save_check_window} frames")
             print(f"[PENALTY] Cooldown                   : "
                   f"{self.cooldown_frames} frames")
-            print(f"[PENALTY] --- Save Detection (v4) ---")
-            print(f"[PENALTY]   Penetration GOL threshold: "
+            print(f"[PENALTY] --- Save Detection (v5: Keeper-Centric) ---")
+            print(f"[PENALTY]   Depth threshold (modifier): "
                   f"{self.penetration_goal_threshold}")
-            print(f"[PENALTY]   Save keeper max dist     : "
+            print(f"[PENALTY]   Save score threshold     : "
+                  f"{self.save_score_threshold}")
+            print(f"[PENALTY]   Keeper max dist (block)  : "
                   f"{self.save_keeper_max_dist}px")
-            print(f"[PENALTY]   Save ball max vel        : "
+            print(f"[PENALTY]   Ball max vel (stop)      : "
                   f"{self.save_ball_max_vel} px/f")
             print(f"[PENALTY]   Overlap min frames       : "
                   f"{self.overlap_min_frames}")
@@ -720,6 +820,8 @@ class PenaltyDetector:
                   f"{self.overlap_bbox_expand}px")
             print(f"[PENALTY]   Bounce-back frames thr   : "
                   f"{self.bounce_back_frames_thr}")
+            print(f"[PENALTY]   Bounce keeper max dist   : "
+                  f"{self.bounce_keeper_max_dist}px")
             if self._manual_kick_mapping:
                 print(f"[PENALTY] Manual kick mapping        : "
                       f"{self._manual_kick_mapping}")
@@ -781,7 +883,7 @@ class PenaltyDetector:
                           f"frame {kick_frame} -> "
                           f"{'GOL' if manual_goal else 'SAVED'}")
             elif is_on_target:
-                # Deteksi otomatis v4: penetration depth
+                # Deteksi otomatis v5: keeper-centric
                 is_saved, save_frame, save_reason = self.check_keeper_save(
                     tracks, velocities, kick_frame, stable_gawang, debug=debug
                 )

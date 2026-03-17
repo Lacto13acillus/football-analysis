@@ -75,15 +75,18 @@ CONFIG = {
     "gawang_shrink_ratio"      : 0.05,
     "on_target_min_frames"     : 1,
 
-    # Penalty detection — save (v4: penetration depth)
+    # Penalty detection — save (v5: keeper-centric)
     "save_check_window"            : 60,
-    "penetration_goal_threshold"   : 0.35,  # >35% depth = GOL
-    "save_keeper_max_dist"         : 100,   # px, bola harus dekat keeper utk SAVED
-    "save_ball_max_vel"            : 5.0,   # px/f, velocity bola rendah utk SAVED
-    "overlap_min_frames"           : 3,
-    "overlap_bbox_expand"          : 15,
+    "penetration_goal_threshold"   : 0.35,
+    "save_score_threshold"         : 3,
+    "save_keeper_max_dist"         : 120,
+    "save_ball_max_vel"            : 5.0,
+    "overlap_min_frames"           : 2,
+    "overlap_bbox_expand"          : 20,
     "bounce_back_frames_thr"       : 8,
     "bounce_back_margin"           : 30,
+    "bounce_keeper_max_dist"       : 200,
+
 
     # Visualisasi
     "show_gawang"           : True,
@@ -502,7 +505,10 @@ def main():
     # TAHAP 5: Deteksi Penalty
     print("\n[MAIN] TAHAP 5: Deteksi Penalty (On Target + Gol/Saved)...")
     penalty_detector = PenaltyDetector(fps=fps)
-    penalty_detector.set_jersey_map(player_identifier)
+    penalty_detector.set_jersey_map(player_identifier),
+    penalty_detector.save_score_threshold    = CONFIG.get("save_score_threshold", 3)
+    penalty_detector.bounce_keeper_max_dist  = CONFIG.get("bounce_keeper_max_dist", 200)
+
 
     # --- Set kick detection parameters ---
     penalty_detector.kick_velocity_threshold = CONFIG.get("kick_velocity_threshold", 15.0)
