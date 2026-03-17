@@ -1,6 +1,6 @@
 # main.py
 # Pipeline Penalty Kick: On Target + Gol/Saved Detection
-# v3 — Multi-Method Save Detection (otomatis, tanpa manual_goal_mapping)
+# v4 — Penetration Depth + Multi-Signal Save Detection
 
 import os
 import sys
@@ -75,34 +75,15 @@ CONFIG = {
     "gawang_shrink_ratio"      : 0.05,
     "on_target_min_frames"     : 1,
 
-    # Penalty detection — save (multi-method v3)
-    "save_check_window"        : 60,
-
-    # M1: Keeper-Ball Overlap
-    "overlap_enabled"          : True,
-    "overlap_min_frames"       : 3,
-    "overlap_bbox_expand"      : 15,
-
-    # M2: Velocity Drop + Keeper Proximity
-    "vdrop_enabled"            : True,
-    "vdrop_proximity"          : 120,
-    "vdrop_ratio"              : 0.25,
-    "vdrop_abs_threshold"      : 5.0,
-    "vdrop_sustained_frames"   : 4,
-
-    # M3: Ball-Keeper Convergence
-    "converge_enabled"         : True,
-    "converge_min_dist"        : 50,
-    "converge_dist_decrease"   : 0.5,
-
-    # M4: Bounce-back
-    "bounce_enabled"           : True,
-    "bounce_back_frames_thr"   : 5,
-    "bounce_back_margin"       : 30,
-    "bounce_strong_multiplier" : 2,
-
-    # M5: Direction Reversal
-    "reversal_enabled"         : True,
+    # Penalty detection — save (v4: penetration depth)
+    "save_check_window"            : 60,
+    "penetration_goal_threshold"   : 0.35,  # >35% depth = GOL
+    "save_keeper_max_dist"         : 100,   # px, bola harus dekat keeper utk SAVED
+    "save_ball_max_vel"            : 5.0,   # px/f, velocity bola rendah utk SAVED
+    "overlap_min_frames"           : 3,
+    "overlap_bbox_expand"          : 15,
+    "bounce_back_frames_thr"       : 8,
+    "bounce_back_margin"           : 30,
 
     # Visualisasi
     "show_gawang"           : True,
@@ -115,7 +96,7 @@ CONFIG = {
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Penalty Kick: On Target + Gol/Saved Detection"
+        description="Penalty Kick: On Target + Gol/Saved Detection v4"
     )
     parser.add_argument("--input",  type=str)
     parser.add_argument("--output", type=str)
@@ -416,7 +397,7 @@ def main():
         CONFIG["use_stub"] = True
 
     print("\n" + "=" * 62)
-    print("   PENALTY KICK: ON TARGET + GOL/SAVED DETECTION")
+    print("   PENALTY KICK: ON TARGET + GOL/SAVED DETECTION v4")
     print("   Player Merah vs Player Abu-Abu")
     print("=" * 62)
     print(f"  Input        : {CONFIG['input_video']}")
@@ -425,19 +406,8 @@ def main():
     print(f"  Gunakan cache: {'Ya' if CONFIG['use_stub'] else 'Tidak'}")
     print(f"  Manual kick  : {len(CONFIG.get('manual_kick_mapping', {}))} entries")
     print(f"  Manual goal  : {len(CONFIG.get('manual_goal_mapping', {}))} entries")
-    print(f"  Save methods : ", end="")
-    methods_on = []
-    if CONFIG.get("overlap_enabled", True):
-        methods_on.append("OVERLAP")
-    if CONFIG.get("vdrop_enabled", True):
-        methods_on.append("VDROP")
-    if CONFIG.get("converge_enabled", True):
-        methods_on.append("CONVERGE")
-    if CONFIG.get("bounce_enabled", True):
-        methods_on.append("BOUNCE")
-    if CONFIG.get("reversal_enabled", True):
-        methods_on.append("REVERSAL")
-    print(", ".join(methods_on) if methods_on else "NONE")
+    print(f"  Save method  : PENETRATION DEPTH "
+          f"(threshold={CONFIG.get('penetration_goal_threshold', 0.35)})")
     print("=" * 62)
 
     # TAHAP 1: Baca video
@@ -543,34 +513,15 @@ def main():
     penalty_detector.gawang_shrink_ratio     = CONFIG.get("gawang_shrink_ratio", 0.05)
     penalty_detector.on_target_min_frames    = CONFIG.get("on_target_min_frames", 1)
 
-    # --- Set save detection parameters (multi-method v3) ---
-    penalty_detector.save_check_window       = CONFIG.get("save_check_window", 60)
-
-    # M1: Overlap
-    penalty_detector.overlap_enabled         = CONFIG.get("overlap_enabled", True)
-    penalty_detector.overlap_min_frames      = CONFIG.get("overlap_min_frames", 3)
-    penalty_detector.overlap_bbox_expand     = CONFIG.get("overlap_bbox_expand", 15)
-
-    # M2: Velocity Drop
-    penalty_detector.vdrop_enabled           = CONFIG.get("vdrop_enabled", True)
-    penalty_detector.vdrop_proximity         = CONFIG.get("vdrop_proximity", 120)
-    penalty_detector.vdrop_ratio             = CONFIG.get("vdrop_ratio", 0.25)
-    penalty_detector.vdrop_abs_threshold     = CONFIG.get("vdrop_abs_threshold", 5.0)
-    penalty_detector.vdrop_sustained_frames  = CONFIG.get("vdrop_sustained_frames", 4)
-
-    # M3: Convergence
-    penalty_detector.converge_enabled        = CONFIG.get("converge_enabled", True)
-    penalty_detector.converge_min_dist       = CONFIG.get("converge_min_dist", 50)
-    penalty_detector.converge_dist_decrease  = CONFIG.get("converge_dist_decrease", 0.5)
-
-    # M4: Bounce-back
-    penalty_detector.bounce_enabled          = CONFIG.get("bounce_enabled", True)
-    penalty_detector.bounce_back_frames_thr  = CONFIG.get("bounce_back_frames_thr", 5)
-    penalty_detector.bounce_back_margin      = CONFIG.get("bounce_back_margin", 30)
-    penalty_detector.bounce_strong_multiplier = CONFIG.get("bounce_strong_multiplier", 2)
-
-    # M5: Reversal
-    penalty_detector.reversal_enabled        = CONFIG.get("reversal_enabled", True)
+    # --- Set save detection parameters (v4) ---
+    penalty_detector.save_check_window          = CONFIG.get("save_check_window", 60)
+    penalty_detector.penetration_goal_threshold = CONFIG.get("penetration_goal_threshold", 0.35)
+    penalty_detector.save_keeper_max_dist       = CONFIG.get("save_keeper_max_dist", 100)
+    penalty_detector.save_ball_max_vel          = CONFIG.get("save_ball_max_vel", 5.0)
+    penalty_detector.overlap_min_frames         = CONFIG.get("overlap_min_frames", 3)
+    penalty_detector.overlap_bbox_expand        = CONFIG.get("overlap_bbox_expand", 15)
+    penalty_detector.bounce_back_frames_thr     = CONFIG.get("bounce_back_frames_thr", 8)
+    penalty_detector.bounce_back_margin         = CONFIG.get("bounce_back_margin", 30)
 
     # --- Manual mappings ---
     manual_kick_map = CONFIG.get("manual_kick_mapping", {})
