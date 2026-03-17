@@ -1,5 +1,6 @@
 # main.py
 # Pipeline Penalty Kick: On Target + Gol/Saved Detection
+# v3 — Multi-Method Save Detection (otomatis, tanpa manual_goal_mapping)
 
 import os
 import sys
@@ -62,22 +63,10 @@ CONFIG = {
         1030: "Abu-Abu",
     },
 
-    # # Manual goal mapping (True = gol, False = tidak gol/saved)
-    # # Gunakan ini sebagai override jika deteksi otomatis salah
-    # # Kosongkan dict jika ingin full otomatis
-    # "manual_goal_mapping": {
-    #     86:   True,     # Kick 1: Merah  → GOL
-    #     266:  False,    # Kick 2: Abu-Abu → SAVED
-    #     476:  True,     # Kick 3: Merah  → GOL
-    #     668:  True,     # Kick 4: Abu-Abu → GOL
-    #     894:  True,     # Kick 5: Merah  → GOL
-    #     1030: True,     # Kick 6: Abu-Abu → GOL
-    # },
-
     # Possession
     "max_possession_distance": 200,
 
-    # Penalty detection
+    # Penalty detection — kick
     "kick_velocity_threshold"  : 15.0,
     "pre_kick_search"          : 50,
     "max_kicker_distance"      : 700,
@@ -86,10 +75,34 @@ CONFIG = {
     "gawang_shrink_ratio"      : 0.05,
     "on_target_min_frames"     : 1,
 
-    # Keeper save detection (bounce-back)
+    # Penalty detection — save (multi-method v3)
     "save_check_window"        : 60,
+
+    # M1: Keeper-Ball Overlap
+    "overlap_enabled"          : True,
+    "overlap_min_frames"       : 3,
+    "overlap_bbox_expand"      : 15,
+
+    # M2: Velocity Drop + Keeper Proximity
+    "vdrop_enabled"            : True,
+    "vdrop_proximity"          : 120,
+    "vdrop_ratio"              : 0.25,
+    "vdrop_abs_threshold"      : 5.0,
+    "vdrop_sustained_frames"   : 4,
+
+    # M3: Ball-Keeper Convergence
+    "converge_enabled"         : True,
+    "converge_min_dist"        : 50,
+    "converge_dist_decrease"   : 0.5,
+
+    # M4: Bounce-back
+    "bounce_enabled"           : True,
     "bounce_back_frames_thr"   : 5,
     "bounce_back_margin"       : 30,
+    "bounce_strong_multiplier" : 2,
+
+    # M5: Direction Reversal
+    "reversal_enabled"         : True,
 
     # Visualisasi
     "show_gawang"           : True,
@@ -412,6 +425,19 @@ def main():
     print(f"  Gunakan cache: {'Ya' if CONFIG['use_stub'] else 'Tidak'}")
     print(f"  Manual kick  : {len(CONFIG.get('manual_kick_mapping', {}))} entries")
     print(f"  Manual goal  : {len(CONFIG.get('manual_goal_mapping', {}))} entries")
+    print(f"  Save methods : ", end="")
+    methods_on = []
+    if CONFIG.get("overlap_enabled", True):
+        methods_on.append("OVERLAP")
+    if CONFIG.get("vdrop_enabled", True):
+        methods_on.append("VDROP")
+    if CONFIG.get("converge_enabled", True):
+        methods_on.append("CONVERGE")
+    if CONFIG.get("bounce_enabled", True):
+        methods_on.append("BOUNCE")
+    if CONFIG.get("reversal_enabled", True):
+        methods_on.append("REVERSAL")
+    print(", ".join(methods_on) if methods_on else "NONE")
     print("=" * 62)
 
     # TAHAP 1: Baca video
@@ -508,7 +534,7 @@ def main():
     penalty_detector = PenaltyDetector(fps=fps)
     penalty_detector.set_jersey_map(player_identifier)
 
-    # Set parameters
+    # --- Set kick detection parameters ---
     penalty_detector.kick_velocity_threshold = CONFIG.get("kick_velocity_threshold", 15.0)
     penalty_detector.pre_kick_search         = CONFIG.get("pre_kick_search", 50)
     penalty_detector.max_kicker_distance     = CONFIG.get("max_kicker_distance", 700)
@@ -516,11 +542,37 @@ def main():
     penalty_detector.cooldown_frames         = CONFIG.get("cooldown_frames", 120)
     penalty_detector.gawang_shrink_ratio     = CONFIG.get("gawang_shrink_ratio", 0.05)
     penalty_detector.on_target_min_frames    = CONFIG.get("on_target_min_frames", 1)
+
+    # --- Set save detection parameters (multi-method v3) ---
     penalty_detector.save_check_window       = CONFIG.get("save_check_window", 60)
+
+    # M1: Overlap
+    penalty_detector.overlap_enabled         = CONFIG.get("overlap_enabled", True)
+    penalty_detector.overlap_min_frames      = CONFIG.get("overlap_min_frames", 3)
+    penalty_detector.overlap_bbox_expand     = CONFIG.get("overlap_bbox_expand", 15)
+
+    # M2: Velocity Drop
+    penalty_detector.vdrop_enabled           = CONFIG.get("vdrop_enabled", True)
+    penalty_detector.vdrop_proximity         = CONFIG.get("vdrop_proximity", 120)
+    penalty_detector.vdrop_ratio             = CONFIG.get("vdrop_ratio", 0.25)
+    penalty_detector.vdrop_abs_threshold     = CONFIG.get("vdrop_abs_threshold", 5.0)
+    penalty_detector.vdrop_sustained_frames  = CONFIG.get("vdrop_sustained_frames", 4)
+
+    # M3: Convergence
+    penalty_detector.converge_enabled        = CONFIG.get("converge_enabled", True)
+    penalty_detector.converge_min_dist       = CONFIG.get("converge_min_dist", 50)
+    penalty_detector.converge_dist_decrease  = CONFIG.get("converge_dist_decrease", 0.5)
+
+    # M4: Bounce-back
+    penalty_detector.bounce_enabled          = CONFIG.get("bounce_enabled", True)
     penalty_detector.bounce_back_frames_thr  = CONFIG.get("bounce_back_frames_thr", 5)
     penalty_detector.bounce_back_margin      = CONFIG.get("bounce_back_margin", 30)
+    penalty_detector.bounce_strong_multiplier = CONFIG.get("bounce_strong_multiplier", 2)
 
-    # Manual mappings
+    # M5: Reversal
+    penalty_detector.reversal_enabled        = CONFIG.get("reversal_enabled", True)
+
+    # --- Manual mappings ---
     manual_kick_map = CONFIG.get("manual_kick_mapping", {})
     if manual_kick_map:
         penalty_detector.set_manual_kick_mapping(manual_kick_map)
