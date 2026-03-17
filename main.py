@@ -79,7 +79,7 @@ CONFIG = {
     "save_check_window"            : 60,
     "save_reaction_time"           : 0.25,   # detik — window setelah bola masuk gawang
     "penetration_goal_threshold"   : 0.35,
-    "save_score_threshold"         : 3,
+    "save_score_threshold"         : 2,
     "save_keeper_max_dist"         : 120,
     "save_ball_max_vel"            : 5.0,
     "overlap_min_frames"           : 2,

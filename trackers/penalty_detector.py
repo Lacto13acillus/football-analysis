@@ -77,7 +77,7 @@ class PenaltyDetector:
         self.bounce_keeper_max_dist  = 200
 
         # Scoring threshold untuk keputusan SAVED
-        self.save_score_threshold    = 3
+        self.save_score_threshold    = 2
 
         # --- Display ---
         self.kick_display_duration   = 50
