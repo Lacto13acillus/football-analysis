@@ -7,7 +7,6 @@ from utils.bbox_utils import (
     measure_distance,
     get_center_of_bbox,
     get_center_of_bbox_bottom,
-    stabilize_cone_positions,
 )
 import numpy as np
 from typing import Dict, List, Any, Optional, Tuple
@@ -18,12 +17,23 @@ class DribbleDetector:
         self.fps = fps
 
         # ============================================================
-        # PARAMETER RADIUS CONE — DIKECILKAN
+        # PARAMETER JUMLAH CONE
+        # ============================================================
+        self.expected_num_cones: Optional[int] = None  # Set ke 7 jika tahu
+
+        # ============================================================
+        # PARAMETER STABILISASI CONE
+        # ============================================================
+        self.min_cone_appearance_ratio: float = 0.03
+        self.cone_dedup_distance: float = 80.0
+
+        # ============================================================
+        # PARAMETER CONE RADIUS (untuk visualisasi)
         # ============================================================
         self.default_cone_radius: float = 25.0
-        self.cone_radius_multiplier: float = 0.8    # 1.5 → 0.8
-        self.min_cone_radius: float = 15.0           # 20 → 15
-        self.max_cone_radius: float = 40.0           # 80 → 40
+        self.cone_radius_multiplier: float = 0.8
+        self.min_cone_radius: float = 15.0
+        self.max_cone_radius: float = 40.0
         self.manual_cone_radii: Dict[int, float] = {}
 
         # ============================================================
@@ -43,34 +53,46 @@ class DribbleDetector:
         self.auto_mode_max_duration_sec: float = 10.0
 
         # ============================================================
-        # PARAMETER TEMPORAL FILTERING
-        # ============================================================
-        self.min_consecutive_touch_frames: int = 2
-
-        # ============================================================
-        # PARAMETER BALL EDGE DISTANCE
-        # ============================================================
-        self.use_ball_edge_distance: bool = True
-
-        # ============================================================
-        # PARAMETER TRAJECTORY INTERPOLATION
-        # ============================================================
-        self.interpolation_substeps: int = 3
-
-        # ============================================================
         # PARAMETER CONE ORDERING
         # ============================================================
         self.cone_order_direction: str = 'auto'
 
         # ============================================================
-        # PARAMETER STABILISASI CONE — DIPERBAIKI
+        # === BARU: PARAMETER DETEKSI SENTUHAN ZIG-ZAG ===
         # ============================================================
-        # Minimum kemunculan cone (rasio terhadap total frame)
-        self.min_cone_appearance_ratio: float = 0.01  # 5% → 1%
 
-        # Jarak minimum antar cone unik (untuk deduplikasi)
-        # Cone yang jaraknya < ini dianggap cone yang SAMA
-        self.cone_dedup_distance: float = 50.0
+        # --- Metode 1: Cone Displacement ---
+        self.use_cone_displacement: bool = True
+        # Jika posisi cone bergeser > threshold ini (px) dalam window,
+        # dianggap tertabrak
+        self.cone_displacement_threshold: float = 12.0
+        # Window frame untuk mendeteksi displacement
+        self.cone_displacement_window: int = 3
+        # Bola harus dekat cone (px) saat displacement terjadi
+        self.cone_displacement_ball_proximity: float = 150.0
+
+        # --- Metode 2: BBox Overlap ---
+        self.use_bbox_overlap: bool = True
+        # Padding negatif pada cone bbox (shrink) — makin besar,
+        # makin ketat (hanya overlap yang benar-benar nyata)
+        self.bbox_overlap_shrink: float = 3.0
+        # Minimum jumlah frame bbox overlap berturut-turut
+        self.min_overlap_consecutive_frames: int = 2
+
+        # --- Metode 3: Ball Speed Anomaly ---
+        self.use_speed_anomaly: bool = True
+        # Rasio perlambatan: jika speed drop ke < ratio * avg_speed
+        # saat dekat cone, dianggap menabrak
+        self.speed_drop_ratio: float = 0.3
+        # Bola harus dekat cone (px) saat speed drop
+        self.speed_anomaly_proximity: float = 60.0
+        # Window untuk hitung average speed
+        self.speed_avg_window: int = 10
+
+        # --- Kombinasi ---
+        # Minimum berapa metode yang harus agree untuk declare "touch"
+        # 1 = salah satu cukup, 2 = minimal 2 metode setuju
+        self.min_methods_agree: int = 1
 
         # ============================================================
         # INTERNAL STATE
@@ -79,6 +101,8 @@ class DribbleDetector:
         self._cone_radii: Dict[int, float] = {}
         self._ordered_cone_ids: List[int] = []
         self._cone_bbox_sizes: Dict[int, float] = {}
+        # Mapping dari stabilized cone ID → raw tracker cone IDs
+        self._cone_id_mapping: Dict[int, List[int]] = {}
 
     # ============================================================
     # PUBLIC GETTERS
@@ -126,28 +150,37 @@ class DribbleDetector:
         if debug:
             print(f"[DRIBBLE] Raw cone IDs: {len(raw_cones)}")
 
-        # LANGKAH 2: Deduplikasi — merge cone yang terlalu dekat
+        # LANGKAH 2: Deduplikasi
         self._stabilized_cones = self._deduplicate_cones(raw_cones, debug)
 
         if debug:
-            print(f"[DRIBBLE] Setelah deduplikasi: {len(self._stabilized_cones)} cone unik")
+            print(f"[DRIBBLE] Setelah deduplikasi: "
+                  f"{len(self._stabilized_cones)} cone unik")
 
         if len(self._stabilized_cones) < 2:
             print("[DRIBBLE] GAGAL: Minimal 2 cone diperlukan!")
             return False
 
-        # LANGKAH 3: Hitung bbox size per cone (untuk radius)
+        # LANGKAH 3: Hitung bbox size per cone (untuk radius visualisasi)
         self._compute_cone_bbox_sizes_dedup(tracks, cone_key, sample_frames)
         self._compute_cone_radii(debug)
         self._order_cones(debug)
 
         if debug:
-            print(f"\n[DRIBBLE] Total cone       : {len(self._stabilized_cones)}")
-            print(f"[DRIBBLE] Urutan cone IDs  : {self._ordered_cone_ids}")
-            print(f"[DRIBBLE] Temporal filter   : {self.min_consecutive_touch_frames} frames")
-            print(f"[DRIBBLE] Ball edge dist   : {'Ya' if self.use_ball_edge_distance else 'Tidak'}")
-            print(f"[DRIBBLE] Interpolation    : {self.interpolation_substeps} substeps")
-            print(f"[DRIBBLE] Detection mode   : {self.detection_mode}")
+            print(f"\n[DRIBBLE] Total cone           : {len(self._stabilized_cones)}")
+            print(f"[DRIBBLE] Urutan cone IDs      : {self._ordered_cone_ids}")
+            print(f"[DRIBBLE] Detection mode       : {self.detection_mode}")
+            print(f"[DRIBBLE] --- Metode Sentuhan ---")
+            print(f"[DRIBBLE]   Cone displacement  : "
+                  f"{'Ya' if self.use_cone_displacement else 'Tidak'} "
+                  f"(threshold={self.cone_displacement_threshold}px)")
+            print(f"[DRIBBLE]   BBox overlap       : "
+                  f"{'Ya' if self.use_bbox_overlap else 'Tidak'} "
+                  f"(shrink={self.bbox_overlap_shrink}px)")
+            print(f"[DRIBBLE]   Speed anomaly      : "
+                  f"{'Ya' if self.use_speed_anomaly else 'Tidak'} "
+                  f"(drop_ratio={self.speed_drop_ratio})")
+            print(f"[DRIBBLE]   Min methods agree  : {self.min_methods_agree}")
             for idx, cid in enumerate(self._ordered_cone_ids):
                 pos = self._stabilized_cones[cid]
                 r = self._cone_radii[cid]
@@ -170,7 +203,6 @@ class DribbleDetector:
         sample_frames: int,
         debug        : bool
     ) -> Dict[int, List[Tuple[float, float]]]:
-        """Kumpulkan semua posisi cone dari semua frame."""
         cone_positions: Dict[int, List[Tuple[float, float]]] = {}
         total = min(sample_frames, len(tracks.get(cone_key, [])))
 
@@ -184,7 +216,6 @@ class DribbleDetector:
                     cone_positions[cone_id] = []
                 cone_positions[cone_id].append(pos)
 
-        # Filter: cone harus muncul di cukup banyak frame
         min_appearances = max(1, int(total * self.min_cone_appearance_ratio))
         filtered: Dict[int, List[Tuple[float, float]]] = {}
 
@@ -208,15 +239,9 @@ class DribbleDetector:
         raw_cones: Dict[int, List[Tuple[float, float]]],
         debug    : bool
     ) -> Dict[int, Tuple[float, float]]:
-        """
-        Deduplikasi cone yang terlalu dekat satu sama lain.
+        if not raw_cones:
+            return {}
 
-        Masalah: Tracker sering membuat beberapa anchor ID untuk cone
-        yang sama (karena jitter deteksi, partial occlusion, dll).
-        Solusi: Merge cone yang jaraknya < cone_dedup_distance.
-        Cone dengan appearances terbanyak diprioritaskan.
-        """
-        # Hitung posisi rata-rata per cone
         cone_avg: Dict[int, Tuple[float, float]] = {}
         cone_counts: Dict[int, int] = {}
         for cid, positions in raw_cones.items():
@@ -225,56 +250,91 @@ class DribbleDetector:
             cone_avg[cid] = (avg_x, avg_y)
             cone_counts[cid] = len(positions)
 
-        # Sort by appearances (terbanyak dulu — ini yang paling reliable)
         sorted_ids = sorted(cone_avg.keys(), key=lambda x: -cone_counts[x])
 
-        # Greedy dedup: ambil cone, buang semua cone lain yang terlalu dekat
+        # Greedy dedup
         final_cones: Dict[int, Tuple[float, float]] = {}
-        used = set()
+        final_counts: Dict[int, int] = {}
+        # Track which raw IDs map to which final cone
+        raw_to_final: Dict[int, int] = {}  # raw_id → final_id (old_id)
 
         for cid in sorted_ids:
-            if cid in used:
-                continue
-
             pos = cone_avg[cid]
-            too_close = False
+            merged_into = None
 
             for existing_id, existing_pos in final_cones.items():
                 dist = measure_distance(pos, existing_pos)
                 if dist < self.cone_dedup_distance:
-                    too_close = True
+                    merged_into = existing_id
                     if debug:
-                        print(f"[DRIBBLE] Cone {cid} terlalu dekat ke Cone {existing_id} "
-                              f"(dist={dist:.0f}px < {self.cone_dedup_distance}px) → MERGE")
+                        print(f"[DRIBBLE] Cone {cid} ({cone_counts[cid]}x) "
+                              f"terlalu dekat ke Cone {existing_id} "
+                              f"({cone_counts[existing_id]}x) "
+                              f"(dist={dist:.0f}px) → MERGE")
                     break
 
-            if not too_close:
+            if merged_into is not None:
+                raw_to_final[cid] = merged_into
+            else:
                 final_cones[cid] = pos
-                used.add(cid)
+                final_counts[cid] = cone_counts[cid]
+                raw_to_final[cid] = cid
 
-        # Re-index cone IDs menjadi 0, 1, 2, ... agar rapi
-        reindexed: Dict[int, Tuple[float, float]] = {}
-        for new_id, (old_id, pos) in enumerate(final_cones.items()):
-            reindexed[new_id] = pos
+        # Potong ke expected_num_cones jika di-set
+        if (self.expected_num_cones is not None
+                and self.expected_num_cones > 0
+                and len(final_cones) > self.expected_num_cones):
+            sorted_final = sorted(
+                final_cones.keys(), key=lambda x: -final_counts[x]
+            )
+            keep_ids = set(sorted_final[:self.expected_num_cones])
+            removed_ids = set(sorted_final[self.expected_num_cones:])
+
             if debug:
-                print(f"[DRIBBLE] Final: Cone {old_id} → Cone {new_id} "
-                      f"at ({pos[0]:.0f}, {pos[1]:.0f})")
+                for rid in removed_ids:
+                    print(f"[DRIBBLE] Cone {rid} ({final_counts[rid]}x) "
+                          f"→ DIBUANG (melebihi expected="
+                          f"{self.expected_num_cones})")
+
+            final_cones = {
+                k: v for k, v in final_cones.items() if k in keep_ids
+            }
+
+        # Re-index & build mapping
+        sorted_by_count = sorted(
+            final_cones.keys(), key=lambda x: -final_counts.get(x, 0)
+        )
+        reindexed: Dict[int, Tuple[float, float]] = {}
+        self._cone_id_mapping = {}
+
+        for new_id, old_id in enumerate(sorted_by_count):
+            reindexed[new_id] = final_cones[old_id]
+            # Kumpulkan semua raw IDs yang map ke old_id ini
+            mapped_raw = [old_id]
+            for raw_id, final_id in raw_to_final.items():
+                if final_id == old_id and raw_id != old_id:
+                    mapped_raw.append(raw_id)
+            self._cone_id_mapping[new_id] = mapped_raw
+
+            if debug:
+                print(f"[DRIBBLE] Final: Cone {old_id} "
+                      f"({final_counts.get(old_id, 0)}x) → Cone {new_id} "
+                      f"at ({final_cones[old_id][0]:.0f}, "
+                      f"{final_cones[old_id][1]:.0f}) "
+                      f"[raw IDs: {mapped_raw}]")
 
         return reindexed
 
     def _compute_cone_bbox_sizes_dedup(
         self, tracks: Dict, cone_key: str, sample_frames: int
     ) -> None:
-        """
-        Hitung rata-rata bbox size per STABILIZED cone.
-        Karena cone sudah di-reindex, kita perlu match berdasarkan posisi.
-        """
         if not self._stabilized_cones:
             return
 
-        # Kumpulkan semua bbox sizes dari raw detections
-        all_sizes: List[float] = []
         total = min(sample_frames, len(tracks.get(cone_key, [])))
+        temp_sizes: Dict[int, List[float]] = {
+            scid: [] for scid in self._stabilized_cones
+        }
 
         for f in range(total):
             for cone_id, cone_data in tracks[cone_key][f].items():
@@ -289,22 +349,15 @@ class DribbleDetector:
                 det_pos = get_center_of_bbox_bottom(bbox)
                 size = max(w, h)
 
-                # Match ke stabilized cone terdekat
                 for scid, spos in self._stabilized_cones.items():
                     dist = measure_distance(det_pos, spos)
                     if dist < self.cone_dedup_distance:
-                        if scid not in self._cone_bbox_sizes:
-                            self._cone_bbox_sizes[scid] = []
-                        # Sementara simpan sebagai list, nanti di-average
-                        if not isinstance(self._cone_bbox_sizes.get(scid), list):
-                            self._cone_bbox_sizes[scid] = []
-                        self._cone_bbox_sizes[scid].append(size)
+                        temp_sizes[scid].append(size)
                         break
 
-        # Average
-        for scid in list(self._cone_bbox_sizes.keys()):
-            sizes = self._cone_bbox_sizes[scid]
-            if isinstance(sizes, list) and len(sizes) > 0:
+        self._cone_bbox_sizes = {}
+        for scid, sizes in temp_sizes.items():
+            if sizes:
                 self._cone_bbox_sizes[scid] = float(np.mean(sizes))
             else:
                 self._cone_bbox_sizes[scid] = 0.0
@@ -314,20 +367,21 @@ class DribbleDetector:
             if cone_id in self.manual_cone_radii:
                 radius = self.manual_cone_radii[cone_id]
                 source = "manual"
-            elif cone_id in self._cone_bbox_sizes and self._cone_bbox_sizes[cone_id] > 0:
-                radius = self._cone_bbox_sizes[cone_id] * self.cone_radius_multiplier
+            elif (cone_id in self._cone_bbox_sizes
+                  and self._cone_bbox_sizes[cone_id] > 0):
+                radius = (self._cone_bbox_sizes[cone_id]
+                          * self.cone_radius_multiplier)
                 source = "dynamic"
             else:
                 radius = self.default_cone_radius
                 source = "default"
 
-            radius = max(self.min_cone_radius, min(self.max_cone_radius, radius))
+            radius = max(self.min_cone_radius,
+                         min(self.max_cone_radius, radius))
             self._cone_radii[cone_id] = radius
 
             if debug:
                 bbox_s = self._cone_bbox_sizes.get(cone_id, 0)
-                if isinstance(bbox_s, list):
-                    bbox_s = float(np.mean(bbox_s)) if bbox_s else 0
                 print(f"[DRIBBLE] Cone {cone_id}: bbox_size={bbox_s:.0f}px "
                       f"→ radius={radius:.0f}px ({source})")
 
@@ -354,10 +408,10 @@ class DribbleDetector:
             direction = self.cone_order_direction
 
         sort_key = {
-            'top_to_bottom' : lambda x: x[1][1],
-            'bottom_to_top' : lambda x: -x[1][1],
-            'left_to_right' : lambda x: x[1][0],
-            'right_to_left' : lambda x: -x[1][0],
+            'top_to_bottom': lambda x: x[1][1],
+            'bottom_to_top': lambda x: -x[1][1],
+            'left_to_right': lambda x: x[1][0],
+            'right_to_left': lambda x: -x[1][0],
         }
 
         key_fn = sort_key.get(direction, lambda x: x[1][1])
@@ -365,148 +419,28 @@ class DribbleDetector:
         self._ordered_cone_ids = [cid for cid, _ in paired]
 
     # ============================================================
-    # HELPER: BALL EDGE DISTANCE
-    # ============================================================
-
-    def _compute_ball_cone_distance(
-        self,
-        ball_pos : Tuple[float, float],
-        cone_pos : Tuple[float, float],
-        ball_bbox: Optional[List[float]] = None
-    ) -> float:
-        if not self.use_ball_edge_distance or ball_bbox is None:
-            return measure_distance(ball_pos, cone_pos)
-
-        bx1, by1, bx2, by2 = ball_bbox
-        cx, cy = cone_pos
-        closest_x = max(bx1, min(cx, bx2))
-        closest_y = max(by1, min(cy, by2))
-        return measure_distance((closest_x, closest_y), cone_pos)
-
-    # ============================================================
-    # HELPER: TRAJECTORY INTERPOLATION
-    # ============================================================
-
-    def _interpolate_positions(
-        self,
-        pos_a: Tuple[float, float],
-        pos_b: Tuple[float, float],
-        steps: int
-    ) -> List[Tuple[float, float]]:
-        if steps <= 1:
-            return [pos_a, pos_b]
-
-        result = []
-        for i in range(steps + 1):
-            t = i / steps
-            x = pos_a[0] + (pos_b[0] - pos_a[0]) * t
-            y = pos_a[1] + (pos_b[1] - pos_a[1]) * t
-            result.append((x, y))
-        return result
-
-    # ============================================================
-    # CEK SENTUHAN BOLA KE CONE
-    # ============================================================
-
-    def check_ball_touches_any_cone(
-        self,
-        ball_pos : Tuple[float, float],
-        ball_bbox: Optional[List[float]] = None
-    ) -> List[Tuple[int, float]]:
-        touched = []
-        if not self._stabilized_cones:
-            return touched
-
-        for cone_id, cone_pos in self._stabilized_cones.items():
-            radius = self._cone_radii.get(cone_id, self.default_cone_radius)
-            dist = self._compute_ball_cone_distance(ball_pos, cone_pos, ball_bbox)
-            if dist <= radius:
-                touched.append((cone_id, dist))
-
-        return touched
-
-    def evaluate_trajectory_against_cones(
-        self,
-        ball_trajectory: List[Tuple[float, float]],
-        ball_bboxes    : Optional[List[Optional[List[float]]]] = None
-    ) -> Dict[int, Dict[str, Any]]:
-        results: Dict[int, Dict[str, Any]] = {}
-
-        for cone_id in self._stabilized_cones:
-            radius = self._cone_radii.get(cone_id, self.default_cone_radius)
-            cone_pos = self._stabilized_cones[cone_id]
-
-            min_dist = float('inf')
-            raw_touch_count = 0
-            first_touch = -1
-
-            consecutive_count = 0
-            max_consecutive = 0
-            valid_touch = False
-
-            for i, ball_pos in enumerate(ball_trajectory):
-                bbox = None
-                if ball_bboxes and i < len(ball_bboxes):
-                    bbox = ball_bboxes[i]
-
-                positions_to_check = [(ball_pos, bbox)]
-
-                if i > 0 and self.interpolation_substeps > 1:
-                    prev_pos = ball_trajectory[i - 1]
-                    interp = self._interpolate_positions(
-                        prev_pos, ball_pos, self.interpolation_substeps
-                    )
-                    for ip in interp[1:-1]:
-                        positions_to_check.append((ip, None))
-
-                frame_touched = False
-                for pos, bb in positions_to_check:
-                    dist = self._compute_ball_cone_distance(pos, cone_pos, bb)
-                    if dist < min_dist:
-                        min_dist = dist
-                    if dist <= radius:
-                        frame_touched = True
-
-                if frame_touched:
-                    raw_touch_count += 1
-                    consecutive_count += 1
-                    if first_touch == -1:
-                        first_touch = i
-                    if consecutive_count > max_consecutive:
-                        max_consecutive = consecutive_count
-                    if consecutive_count >= self.min_consecutive_touch_frames:
-                        valid_touch = True
-                else:
-                    consecutive_count = 0
-
-            results[cone_id] = {
-                'touched'          : valid_touch,
-                'min_distance'     : min_dist,
-                'touch_count'      : raw_touch_count,
-                'consecutive_max'  : max_consecutive,
-                'first_touch_idx'  : first_touch,
-                'radius'           : radius,
-            }
-
-        return results
-
-    # ============================================================
     # HELPERS
     # ============================================================
 
-    def _get_ball_pos(self, tracks: Dict, frame_num: int) -> Optional[Tuple[float, float]]:
+    def _get_ball_pos(
+        self, tracks: Dict, frame_num: int
+    ) -> Optional[Tuple[float, float]]:
         ball_data = tracks['ball'][frame_num].get(1)
         if ball_data and 'bbox' in ball_data:
             return get_center_of_bbox_bottom(ball_data['bbox'])
         return None
 
-    def _get_ball_bbox(self, tracks: Dict, frame_num: int) -> Optional[List[float]]:
+    def _get_ball_bbox(
+        self, tracks: Dict, frame_num: int
+    ) -> Optional[List[float]]:
         ball_data = tracks['ball'][frame_num].get(1)
         if ball_data and 'bbox' in ball_data:
             return ball_data['bbox']
         return None
 
-    def _get_player_pos(self, tracks: Dict, frame_num: int) -> Optional[Tuple[int, Tuple[float, float]]]:
+    def _get_player_pos(
+        self, tracks: Dict, frame_num: int
+    ) -> Optional[Tuple[int, Tuple[float, float]]]:
         players = tracks['players'][frame_num]
         for pid, pdata in players.items():
             bbox = pdata.get('bbox')
@@ -516,13 +450,430 @@ class DribbleDetector:
         return None
 
     # ============================================================
-    # AUTO-DETECT ARAH DRIBBLE DARI GERAKAN PEMAIN
+    # === BARU: METODE 1 — CONE DISPLACEMENT DETECTION ===
     # ============================================================
 
-    def _auto_detect_dribble_direction(
+    def _detect_cone_displacement(
+        self,
+        tracks   : Dict,
+        cone_key : str,
+        debug    : bool = True
+    ) -> Dict[int, Dict[str, Any]]:
+        """
+        Deteksi cone yang tertabrak berdasarkan pergeseran posisi bbox.
+        
+        Cone yang ditabrak akan bergeser posisinya secara tiba-tiba.
+        Kita track posisi setiap cone per frame dan cari displacement
+        yang signifikan.
+        """
+        if not self._stabilized_cones:
+            return {}
+
+        total_frames = len(tracks.get(cone_key, []))
+        results: Dict[int, Dict[str, Any]] = {
+            cid: {
+                'displaced': False,
+                'max_displacement': 0.0,
+                'displacement_frame': -1,
+                'ball_nearby': False,
+            }
+            for cid in self._stabilized_cones
+        }
+
+        # Kumpulkan posisi cone per frame, grouped by stabilized cone ID
+        cone_frame_positions: Dict[int, Dict[int, Tuple[float, float]]] = {
+            cid: {} for cid in self._stabilized_cones
+        }
+
+        for f in range(total_frames):
+            if cone_key not in tracks or f >= len(tracks[cone_key]):
+                continue
+            for raw_cone_id, cone_data in tracks[cone_key][f].items():
+                bbox = cone_data.get('bbox')
+                if bbox is None:
+                    continue
+                pos = get_center_of_bbox_bottom(bbox)
+                # Match ke stabilized cone terdekat
+                for scid, spos in self._stabilized_cones.items():
+                    # Cek apakah raw_id termasuk dalam mapping cone ini
+                    if raw_cone_id in self._cone_id_mapping.get(scid, []):
+                        cone_frame_positions[scid][f] = pos
+                        break
+                    # Fallback: cek jarak
+                    dist = measure_distance(pos, spos)
+                    if dist < self.cone_dedup_distance * 1.5:
+                        cone_frame_positions[scid][f] = pos
+                        break
+
+        # Cek displacement per cone
+        window = self.cone_displacement_window
+        threshold = self.cone_displacement_threshold
+
+        for scid, frame_positions in cone_frame_positions.items():
+            if len(frame_positions) < 2:
+                continue
+
+            sorted_frames = sorted(frame_positions.keys())
+
+            for i in range(len(sorted_frames)):
+                f_current = sorted_frames[i]
+                pos_current = frame_positions[f_current]
+
+                # Bandingkan dengan posisi di frame-frame sebelumnya
+                # dalam window
+                for j in range(max(0, i - window), i):
+                    f_prev = sorted_frames[j]
+                    pos_prev = frame_positions[f_prev]
+
+                    displacement = measure_distance(pos_current, pos_prev)
+
+                    if displacement > threshold:
+                        # Cek apakah bola dekat saat itu
+                        ball_nearby = False
+                        for bf in range(
+                            max(0, f_prev - 2),
+                            min(total_frames, f_current + 3)
+                        ):
+                            ball_pos = self._get_ball_pos(tracks, bf)
+                            if ball_pos:
+                                ball_cone_dist = measure_distance(
+                                    ball_pos,
+                                    self._stabilized_cones[scid]
+                                )
+                                if ball_cone_dist < self.cone_displacement_ball_proximity:
+                                    ball_nearby = True
+                                    break
+
+                        if displacement > results[scid]['max_displacement']:
+                            results[scid]['max_displacement'] = displacement
+                            results[scid]['displacement_frame'] = f_current
+                            results[scid]['ball_nearby'] = ball_nearby
+
+                            if ball_nearby:
+                                results[scid]['displaced'] = True
+
+        if debug:
+            print(f"[DRIBBLE] --- Cone Displacement Results ---")
+            for cid in self._ordered_cone_ids:
+                r = results[cid]
+                status = "DISPLACED!" if r['displaced'] else "stable"
+                print(f"[DRIBBLE]   Cone {cid}: {status} "
+                      f"(max_shift={r['max_displacement']:.1f}px, "
+                      f"frame={r['displacement_frame']}, "
+                      f"ball_near={r['ball_nearby']})")
+
+        return results
+
+    # ============================================================
+    # === BARU: METODE 2 — BBOX OVERLAP DETECTION ===
+    # ============================================================
+
+    def _detect_bbox_overlap(
+        self,
+        tracks   : Dict,
+        cone_key : str,
+        debug    : bool = True
+    ) -> Dict[int, Dict[str, Any]]:
+        """
+        Deteksi sentuhan berdasarkan overlap bounding box bola dan cone.
+        
+        Lebih akurat dari radius: hanya trigger saat bbox benar-benar
+        bersinggungan. Shrink cone bbox untuk menghindari false positive.
+        """
+        if not self._stabilized_cones:
+            return {}
+
+        total_frames = len(tracks.get(cone_key, []))
+        shrink = self.bbox_overlap_shrink
+        min_consec = self.min_overlap_consecutive_frames
+
+        results: Dict[int, Dict[str, Any]] = {
+            cid: {
+                'overlapped': False,
+                'overlap_count': 0,
+                'max_consecutive': 0,
+                'first_overlap_frame': -1,
+            }
+            for cid in self._stabilized_cones
+        }
+
+        # Per frame, cek overlap
+        consecutive: Dict[int, int] = {cid: 0 for cid in self._stabilized_cones}
+
+        for f in range(total_frames):
+            # Dapatkan ball bbox
+            ball_bbox = self._get_ball_bbox(tracks, f)
+            if ball_bbox is None:
+                for cid in self._stabilized_cones:
+                    consecutive[cid] = 0
+                continue
+
+            bx1, by1, bx2, by2 = ball_bbox
+
+            # Dapatkan semua cone bboxes di frame ini
+            cone_bboxes_this_frame: Dict[int, List[float]] = {}
+            if cone_key in tracks and f < len(tracks[cone_key]):
+                for raw_cone_id, cone_data in tracks[cone_key][f].items():
+                    cbbox = cone_data.get('bbox')
+                    if cbbox is None:
+                        continue
+                    # Match ke stabilized cone
+                    pos = get_center_of_bbox_bottom(cbbox)
+                    for scid, spos in self._stabilized_cones.items():
+                        if raw_cone_id in self._cone_id_mapping.get(scid, []):
+                            cone_bboxes_this_frame[scid] = cbbox
+                            break
+                        dist = measure_distance(pos, spos)
+                        if dist < self.cone_dedup_distance * 1.5:
+                            cone_bboxes_this_frame[scid] = cbbox
+                            break
+
+            # Cek overlap per stabilized cone
+            for scid in self._stabilized_cones:
+                if scid not in cone_bboxes_this_frame:
+                    consecutive[scid] = 0
+                    continue
+
+                cx1, cy1, cx2, cy2 = cone_bboxes_this_frame[scid]
+
+                # Shrink cone bbox
+                cx1 += shrink
+                cy1 += shrink
+                cx2 -= shrink
+                cy2 -= shrink
+
+                if cx1 >= cx2 or cy1 >= cy2:
+                    consecutive[scid] = 0
+                    continue
+
+                # Cek intersection
+                ix1 = max(bx1, cx1)
+                iy1 = max(by1, cy1)
+                ix2 = min(bx2, cx2)
+                iy2 = min(by2, cy2)
+
+                if ix1 < ix2 and iy1 < iy2:
+                    # Ada overlap!
+                    results[scid]['overlap_count'] += 1
+                    consecutive[scid] += 1
+
+                    if results[scid]['first_overlap_frame'] == -1:
+                        results[scid]['first_overlap_frame'] = f
+
+                    if consecutive[scid] > results[scid]['max_consecutive']:
+                        results[scid]['max_consecutive'] = consecutive[scid]
+
+                    if consecutive[scid] >= min_consec:
+                        results[scid]['overlapped'] = True
+                else:
+                    consecutive[scid] = 0
+
+        if debug:
+            print(f"[DRIBBLE] --- BBox Overlap Results ---")
+            for cid in self._ordered_cone_ids:
+                r = results[cid]
+                status = "OVERLAP!" if r['overlapped'] else "clear"
+                print(f"[DRIBBLE]   Cone {cid}: {status} "
+                      f"(count={r['overlap_count']}, "
+                      f"max_consec={r['max_consecutive']}, "
+                      f"first_frame={r['first_overlap_frame']})")
+
+        return results
+
+    # ============================================================
+    # === BARU: METODE 3 — BALL SPEED ANOMALY ===
+    # ============================================================
+
+    def _detect_speed_anomaly(
         self,
         tracks: Dict,
         debug : bool = True
+    ) -> Dict[int, Dict[str, Any]]:
+        """
+        Deteksi sentuhan berdasarkan perlambatan tiba-tiba bola
+        saat berada dekat cone.
+        
+        Jika bola menabrak cone, kecepatannya akan drop secara
+        signifikan dibanding rata-rata.
+        """
+        if not self._stabilized_cones:
+            return {}
+
+        total_frames = len(tracks['ball'])
+        results: Dict[int, Dict[str, Any]] = {
+            cid: {
+                'speed_anomaly': False,
+                'min_speed_near_cone': float('inf'),
+                'avg_speed': 0.0,
+                'anomaly_frame': -1,
+            }
+            for cid in self._stabilized_cones
+        }
+
+        # Hitung ball speed per frame
+        ball_positions: List[Optional[Tuple[float, float]]] = []
+        for f in range(total_frames):
+            ball_positions.append(self._get_ball_pos(tracks, f))
+
+        ball_speeds: List[float] = [0.0]
+        for f in range(1, total_frames):
+            if ball_positions[f] and ball_positions[f - 1]:
+                speed = measure_distance(ball_positions[f], ball_positions[f - 1])
+                ball_speeds.append(speed)
+            else:
+                ball_speeds.append(0.0)
+
+        # Hitung running average speed
+        avg_window = self.speed_avg_window
+        overall_speeds = [s for s in ball_speeds if s > 0]
+        if not overall_speeds:
+            return results
+
+        global_avg_speed = float(np.mean(overall_speeds))
+
+        # Per cone, cek apakah ada speed drop saat bola dekat
+        proximity = self.speed_anomaly_proximity
+        drop_ratio = self.speed_drop_ratio
+
+        for scid, cone_pos in self._stabilized_cones.items():
+            min_speed_near = float('inf')
+            anomaly_frame = -1
+
+            for f in range(total_frames):
+                if ball_positions[f] is None:
+                    continue
+
+                dist_to_cone = measure_distance(ball_positions[f], cone_pos)
+                if dist_to_cone > proximity:
+                    continue
+
+                # Bola dekat cone — cek speed
+                speed = ball_speeds[f]
+
+                # Hitung local average speed (window sebelumnya)
+                start_w = max(0, f - avg_window)
+                local_speeds = [
+                    ball_speeds[k] for k in range(start_w, f) if ball_speeds[k] > 0
+                ]
+                local_avg = float(np.mean(local_speeds)) if local_speeds else global_avg_speed
+
+                if speed < min_speed_near:
+                    min_speed_near = speed
+                    anomaly_frame = f
+
+                # Cek apakah speed drop signifikan
+                if local_avg > 0 and speed < local_avg * drop_ratio:
+                    results[scid]['speed_anomaly'] = True
+
+            results[scid]['min_speed_near_cone'] = (
+                min_speed_near if min_speed_near != float('inf') else 0.0
+            )
+            results[scid]['avg_speed'] = global_avg_speed
+            results[scid]['anomaly_frame'] = anomaly_frame
+
+        if debug:
+            print(f"[DRIBBLE] --- Speed Anomaly Results ---")
+            print(f"[DRIBBLE]   Global avg speed: {global_avg_speed:.1f}px/frame")
+            for cid in self._ordered_cone_ids:
+                r = results[cid]
+                status = "ANOMALY!" if r['speed_anomaly'] else "normal"
+                print(f"[DRIBBLE]   Cone {cid}: {status} "
+                      f"(min_speed_near={r['min_speed_near_cone']:.1f}, "
+                      f"frame={r['anomaly_frame']})")
+
+        return results
+
+    # ============================================================
+    # === BARU: KOMBINASI SEMUA METODE ===
+    # ============================================================
+
+    def _evaluate_cone_touches_zigzag(
+        self,
+        tracks  : Dict,
+        cone_key: str = 'cones',
+        debug   : bool = True
+    ) -> Dict[int, Dict[str, Any]]:
+        """
+        Evaluasi sentuhan cone dengan menggabungkan semua metode.
+        
+        Setiap metode memberikan "vote". Cone dianggap disentuh jika
+        jumlah vote >= min_methods_agree.
+        """
+        if debug:
+            print(f"\n[DRIBBLE] === EVALUASI SENTUHAN CONE (ZIG-ZAG MODE) ===")
+
+        # Jalankan semua metode yang aktif
+        displacement_results = {}
+        overlap_results = {}
+        speed_results = {}
+
+        if self.use_cone_displacement:
+            displacement_results = self._detect_cone_displacement(
+                tracks, cone_key, debug
+            )
+
+        if self.use_bbox_overlap:
+            overlap_results = self._detect_bbox_overlap(
+                tracks, cone_key, debug
+            )
+
+        if self.use_speed_anomaly:
+            speed_results = self._detect_speed_anomaly(tracks, debug)
+
+        # Kombinasi
+        combined: Dict[int, Dict[str, Any]] = {}
+
+        for cid in self._stabilized_cones:
+            votes = 0
+            methods_triggered = []
+
+            if self.use_cone_displacement:
+                if displacement_results.get(cid, {}).get('displaced', False):
+                    votes += 1
+                    methods_triggered.append('displacement')
+
+            if self.use_bbox_overlap:
+                if overlap_results.get(cid, {}).get('overlapped', False):
+                    votes += 1
+                    methods_triggered.append('bbox_overlap')
+
+            if self.use_speed_anomaly:
+                if speed_results.get(cid, {}).get('speed_anomaly', False):
+                    votes += 1
+                    methods_triggered.append('speed_anomaly')
+
+            touched = votes >= self.min_methods_agree
+
+            combined[cid] = {
+                'touched': touched,
+                'votes': votes,
+                'methods_triggered': methods_triggered,
+                'displacement': displacement_results.get(cid, {}),
+                'bbox_overlap': overlap_results.get(cid, {}),
+                'speed_anomaly': speed_results.get(cid, {}),
+                'radius': self._cone_radii.get(cid, 0),
+            }
+
+        if debug:
+            print(f"\n[DRIBBLE] --- Hasil Kombinasi ---")
+            print(f"[DRIBBLE] Min methods agree: {self.min_methods_agree}")
+            for cid in self._ordered_cone_ids:
+                r = combined[cid]
+                status = "HIT" if r['touched'] else "AMAN"
+                methods_str = (", ".join(r['methods_triggered'])
+                               if r['methods_triggered'] else "none")
+                print(f"[DRIBBLE]   Cone {cid}: {status} "
+                      f"(votes={r['votes']}/{self.min_methods_agree}, "
+                      f"methods=[{methods_str}])")
+
+        return combined
+
+    # ============================================================
+    # AUTO-DETECT ARAH DRIBBLE
+    # ============================================================
+
+    def _auto_detect_dribble_direction(
+        self, tracks: Dict, debug: bool = True
     ) -> None:
         total_frames = len(tracks['players'])
         if total_frames < 10:
@@ -541,8 +892,6 @@ class DribbleDetector:
                 late_positions.append(result[1])
 
         if not early_positions or not late_positions:
-            if debug:
-                print("[DRIBBLE] Tidak bisa detect arah: pemain tidak ditemukan")
             return
 
         early_avg = (
@@ -555,10 +904,11 @@ class DribbleDetector:
         )
 
         if debug:
-            print(f"[DRIBBLE] Posisi pemain awal : ({early_avg[0]:.0f}, {early_avg[1]:.0f})")
-            print(f"[DRIBBLE] Posisi pemain akhir: ({late_avg[0]:.0f}, {late_avg[1]:.0f})")
+            print(f"[DRIBBLE] Posisi pemain awal : "
+                  f"({early_avg[0]:.0f}, {early_avg[1]:.0f})")
+            print(f"[DRIBBLE] Posisi pemain akhir: "
+                  f"({late_avg[0]:.0f}, {late_avg[1]:.0f})")
 
-        # Cari cone terdekat ke posisi awal dan akhir
         best_entry_id = None
         best_entry_dist = float('inf')
         best_exit_id = None
@@ -567,7 +917,6 @@ class DribbleDetector:
         for cid, cpos in self._stabilized_cones.items():
             d_early = measure_distance(early_avg, cpos)
             d_late = measure_distance(late_avg, cpos)
-
             if d_early < best_entry_dist:
                 best_entry_dist = d_early
                 best_entry_id = cid
@@ -589,18 +938,16 @@ class DribbleDetector:
             dy = exit_pos[1] - entry_pos[1]
 
             if abs(dx) >= abs(dy):
-                if dx > 0:
-                    self.cone_order_direction = 'left_to_right'
-                else:
-                    self.cone_order_direction = 'right_to_left'
+                self.cone_order_direction = (
+                    'left_to_right' if dx > 0 else 'right_to_left'
+                )
             else:
-                if dy > 0:
-                    self.cone_order_direction = 'top_to_bottom'
-                else:
-                    self.cone_order_direction = 'bottom_to_top'
+                self.cone_order_direction = (
+                    'top_to_bottom' if dy > 0 else 'bottom_to_top'
+                )
 
             if debug:
-                print(f"[DRIBBLE] Arah dribble terdeteksi: {self.cone_order_direction}")
+                print(f"[DRIBBLE] Arah dribble: {self.cone_order_direction}")
 
             self._order_cones(debug=False)
 
@@ -630,12 +977,13 @@ class DribbleDetector:
             if video_duration <= self.auto_mode_max_duration_sec:
                 mode = 'whole_video'
                 if debug:
-                    print(f"[DRIBBLE] Video pendek ({video_duration:.1f}s "
-                          f"<= {self.auto_mode_max_duration_sec}s) → mode: whole_video")
+                    print(f"[DRIBBLE] Video pendek ({video_duration:.1f}s) "
+                          f"→ mode: whole_video")
             else:
                 mode = 'entry_exit'
                 if debug:
-                    print(f"[DRIBBLE] Video panjang ({video_duration:.1f}s) → mode: entry_exit")
+                    print(f"[DRIBBLE] Video panjang ({video_duration:.1f}s) "
+                          f"→ mode: entry_exit")
 
         if mode == 'whole_video':
             return self._detect_whole_video(tracks, ball_possessions, debug)
@@ -655,8 +1003,8 @@ class DribbleDetector:
             print(f"[DRIBBLE] Total frames: {total_frames}")
             print(f"[DRIBBLE] Total cones : {len(self._stabilized_cones)}")
 
+        # Kumpulkan data bola
         ball_trajectory: List[Tuple[float, float]] = []
-        ball_bboxes: List[Optional[List[float]]] = []
         frames_with_ball = 0
         first_possession_frame = -1
         last_possession_frame = -1
@@ -664,19 +1012,18 @@ class DribbleDetector:
 
         for frame_num in range(total_frames):
             ball_pos = self._get_ball_pos(tracks, frame_num)
-            ball_bbox = self._get_ball_bbox(tracks, frame_num)
 
             has_ball = (
-                frame_num < len(ball_possessions) and
-                ball_possessions[frame_num] != -1
+                frame_num < len(ball_possessions)
+                and ball_possessions[frame_num] != -1
             )
 
             if ball_pos:
                 ball_trajectory.append(ball_pos)
-                ball_bboxes.append(ball_bbox)
             else:
-                ball_trajectory.append(ball_trajectory[-1] if ball_trajectory else (0, 0))
-                ball_bboxes.append(None)
+                ball_trajectory.append(
+                    ball_trajectory[-1] if ball_trajectory else (0, 0)
+                )
 
             if has_ball:
                 frames_with_ball += 1
@@ -689,13 +1036,14 @@ class DribbleDetector:
                     if player_result:
                         player_id_main = player_result[0]
 
-        if first_possession_frame == -1 or not ball_trajectory:
+        if first_possession_frame == -1:
             if debug:
                 print("[DRIBBLE] Tidak ada possession terdeteksi!")
             return []
 
-        cone_results = self.evaluate_trajectory_against_cones(
-            ball_trajectory, ball_bboxes
+        # === GUNAKAN METODE ZIG-ZAG ===
+        cone_results = self._evaluate_cone_touches_zigzag(
+            tracks, cone_key='cones', debug=debug
         )
 
         touched_cones = [
@@ -710,37 +1058,39 @@ class DribbleDetector:
         )
 
         attempt = {
-            'attempt_id'       : 1,
-            'player_id'        : player_id_main,
-            'frame_start'      : first_possession_frame,
-            'frame_end'        : last_possession_frame,
-            'duration_frames'  : duration_frames,
-            'duration_seconds' : round(duration_frames / self.fps, 2),
-            'success'          : success,
-            'total_cones'      : len(self._stabilized_cones),
-            'touched_cones'    : touched_cones,
-            'cone_details'     : cone_results,
-            'possession_ratio' : round(possession_ratio, 2),
-            'ball_trajectory'  : list(ball_trajectory),
+            'attempt_id'      : 1,
+            'player_id'       : player_id_main,
+            'frame_start'     : first_possession_frame,
+            'frame_end'       : last_possession_frame,
+            'duration_frames' : duration_frames,
+            'duration_seconds': round(duration_frames / self.fps, 2),
+            'success'         : success,
+            'total_cones'     : len(self._stabilized_cones),
+            'touched_cones'   : touched_cones,
+            'cone_details'    : cone_results,
+            'possession_ratio': round(possession_ratio, 2),
+            'ball_trajectory' : list(ball_trajectory),
         }
 
         if debug:
             status = "SUKSES ✓" if success else "GAGAL ✗"
-            print(f"[DRIBBLE] Hasil: {status}")
-            print(f"[DRIBBLE]   Frame range  : {first_possession_frame}-{last_possession_frame}")
+            print(f"\n[DRIBBLE] Hasil: {status}")
+            print(f"[DRIBBLE]   Frame range  : "
+                  f"{first_possession_frame}-{last_possession_frame}")
             print(f"[DRIBBLE]   Durasi       : {duration_frames} frames "
-                  f"({duration_frames/self.fps:.1f}s)")
-            print(f"[DRIBBLE]   Possession   : {possession_ratio*100:.0f}%")
+                  f"({duration_frames / self.fps:.1f}s)")
+            print(f"[DRIBBLE]   Possession   : {possession_ratio * 100:.0f}%")
             print(f"[DRIBBLE]   Cone disentuh: "
                   f"{len(touched_cones)}/{len(self._stabilized_cones)}")
+
             for cid in self._ordered_cone_ids:
                 res = cone_results[cid]
                 status_c = "HIT" if res['touched'] else "AMAN"
-                print(f"[DRIBBLE]     Cone {cid}: {status_c} - "
-                      f"min_dist={res['min_distance']:.1f}px "
-                      f"(radius={res['radius']:.0f}px, "
-                      f"touch_frames={res['touch_count']}, "
-                      f"consecutive={res['consecutive_max']})")
+                methods = res.get('methods_triggered', [])
+                methods_str = ", ".join(methods) if methods else "-"
+                print(f"[DRIBBLE]     Cone {cid}: {status_c} "
+                      f"(votes={res.get('votes', 0)}, "
+                      f"methods=[{methods_str}])")
 
         attempts = [attempt]
 
@@ -763,6 +1113,7 @@ class DribbleDetector:
         ball_possessions: List[int],
         debug           : bool
     ) -> List[Dict]:
+        """Entry/exit mode — untuk video panjang dengan multiple attempts."""
         total_frames = len(tracks['players'])
         entry_cone_id = self._ordered_cone_ids[0]
         exit_cone_id = self._ordered_cone_ids[-1]
@@ -772,23 +1123,27 @@ class DribbleDetector:
 
         if debug:
             print(f"\n[DRIBBLE] === DRIBBLE DETECTION (ENTRY/EXIT) ===")
-            print(f"[DRIBBLE] Total frames           : {total_frames}")
-            print(f"[DRIBBLE] Total cones             : {len(self._stabilized_cones)}")
             print(f"[DRIBBLE] Entry cone {entry_cone_id}: "
                   f"({entry_pos[0]:.0f}, {entry_pos[1]:.0f})")
             print(f"[DRIBBLE] Exit cone  {exit_cone_id}: "
                   f"({exit_pos[0]:.0f}, {exit_pos[1]:.0f})")
-            print(f"[DRIBBLE] Entry/exit zone radius  : {self.entry_exit_zone_radius}px")
 
+        # Untuk entry/exit mode, gunakan evaluasi zig-zag juga
+        cone_results = self._evaluate_cone_touches_zigzag(
+            tracks, cone_key='cones', debug=debug
+        )
+
+        touched_cones = [
+            cid for cid, res in cone_results.items()
+            if res['touched']
+        ]
+
+        # Deteksi attempt boundaries (entry → exit)
         attempts: List[Dict] = []
         last_attempt_end = -999
-
         state = 'idle'
         attempt_start_frame = -1
         attempt_player_id = -1
-        ball_trajectory: List[Tuple[float, float]] = []
-        ball_bboxes: List[Optional[List[float]]] = []
-        player_positions: List[Tuple[float, float]] = []
         frames_with_ball = 0
         attempt_total_frames = 0
 
@@ -798,39 +1153,28 @@ class DribbleDetector:
                 continue
             player_id, player_pos = player_result
 
-            ball_pos = self._get_ball_pos(tracks, frame_num)
-            ball_bbox = self._get_ball_bbox(tracks, frame_num)
-
             has_ball = (
-                frame_num < len(ball_possessions) and
-                ball_possessions[frame_num] != -1
+                frame_num < len(ball_possessions)
+                and ball_possessions[frame_num] != -1
             )
 
             if state == 'idle':
-                if has_ball and ball_pos:
+                if has_ball:
                     dist_to_entry = measure_distance(player_pos, entry_pos)
-                    if dist_to_entry <= self.entry_exit_zone_radius:
-                        if (frame_num - last_attempt_end) >= self.cooldown_frames:
-                            state = 'dribbling'
-                            attempt_start_frame = frame_num
-                            attempt_player_id = player_id
-                            ball_trajectory = [ball_pos]
-                            ball_bboxes = [ball_bbox]
-                            player_positions = [player_pos]
-                            frames_with_ball = 1
-                            attempt_total_frames = 1
-
-                            if debug:
-                                print(f"[DRIBBLE] Frame {frame_num}: "
-                                      f"MASUK entry zone → MULAI DRIBBLE")
+                    if (dist_to_entry <= self.entry_exit_zone_radius
+                            and (frame_num - last_attempt_end)
+                            >= self.cooldown_frames):
+                        state = 'dribbling'
+                        attempt_start_frame = frame_num
+                        attempt_player_id = player_id
+                        frames_with_ball = 1
+                        attempt_total_frames = 1
+                        if debug:
+                            print(f"[DRIBBLE] Frame {frame_num}: "
+                                  f"MASUK entry zone")
 
             elif state == 'dribbling':
                 attempt_total_frames += 1
-
-                if ball_pos:
-                    ball_trajectory.append(ball_pos)
-                    ball_bboxes.append(ball_bbox)
-                player_positions.append(player_pos)
                 if has_ball:
                     frames_with_ball += 1
 
@@ -838,61 +1182,45 @@ class DribbleDetector:
 
                 if dist_to_exit <= self.entry_exit_zone_radius:
                     duration_frames = frame_num - attempt_start_frame
-
                     if duration_frames >= self.min_attempt_frames:
-                        cone_results = self.evaluate_trajectory_against_cones(
-                            ball_trajectory, ball_bboxes
-                        )
-
-                        touched_cones = [
-                            cid for cid, res in cone_results.items()
-                            if res['touched']
-                        ]
-
                         success = len(touched_cones) == 0
                         possession_ratio = (
                             frames_with_ball / attempt_total_frames
                             if attempt_total_frames > 0 else 0.0
                         )
-
                         attempt = {
-                            'attempt_id'       : len(attempts) + 1,
-                            'player_id'        : attempt_player_id,
-                            'frame_start'      : attempt_start_frame,
-                            'frame_end'        : frame_num,
-                            'duration_frames'  : duration_frames,
-                            'duration_seconds' : round(duration_frames / self.fps, 2),
-                            'success'          : success,
-                            'total_cones'      : len(self._stabilized_cones),
-                            'touched_cones'    : touched_cones,
-                            'cone_details'     : cone_results,
-                            'possession_ratio' : round(possession_ratio, 2),
-                            'ball_trajectory'  : list(ball_trajectory),
+                            'attempt_id'      : len(attempts) + 1,
+                            'player_id'       : attempt_player_id,
+                            'frame_start'     : attempt_start_frame,
+                            'frame_end'       : frame_num,
+                            'duration_frames' : duration_frames,
+                            'duration_seconds': round(
+                                duration_frames / self.fps, 2
+                            ),
+                            'success'         : success,
+                            'total_cones'     : len(self._stabilized_cones),
+                            'touched_cones'   : touched_cones,
+                            'cone_details'    : cone_results,
+                            'possession_ratio': round(possession_ratio, 2),
                         }
                         attempts.append(attempt)
                         last_attempt_end = frame_num
 
                         if debug:
-                            status_text = "SUKSES ✓" if success else "GAGAL ✗"
-                            print(f"[DRIBBLE] Frame {frame_num}: SELESAI → {status_text}")
-                            print(f"[DRIBBLE]   Cone disentuh: "
-                                  f"{len(touched_cones)}/{len(self._stabilized_cones)}")
+                            s = "SUKSES ✓" if success else "GAGAL ✗"
+                            print(f"[DRIBBLE] Frame {frame_num}: "
+                                  f"SELESAI → {s}")
 
                     state = 'idle'
                     continue
 
                 if attempt_total_frames > max_attempt_frames:
-                    if debug:
-                        print(f"[DRIBBLE] Frame {frame_num}: TIMEOUT → reset")
                     state = 'idle'
                     continue
 
                 if attempt_total_frames > 20:
                     current_ratio = frames_with_ball / attempt_total_frames
                     if current_ratio < self.min_possession_ratio:
-                        if debug:
-                            print(f"[DRIBBLE] Frame {frame_num}: "
-                                  f"possession rendah ({current_ratio:.0%}) → BATAL")
                         state = 'idle'
                         continue
 
@@ -923,30 +1251,23 @@ class DribbleDetector:
             for tc in a['touched_cones']:
                 cone_hit_count[tc] = cone_hit_count.get(tc, 0) + 1
 
-        cone_avg_min_dist: Dict[int, List[float]] = {}
-        for a in attempts:
-            for cid, detail in a['cone_details'].items():
-                if cid not in cone_avg_min_dist:
-                    cone_avg_min_dist[cid] = []
-                cone_avg_min_dist[cid].append(detail['min_distance'])
-
         cone_analysis = {}
         for cid in self._ordered_cone_ids:
-            dists = cone_avg_min_dist.get(cid, [])
             cone_analysis[cid] = {
-                'avg_min_distance': round(float(np.mean(dists)), 1) if dists else 0.0,
-                'times_touched'  : cone_hit_count.get(cid, 0),
-                'radius'         : self._cone_radii.get(cid, 0.0),
+                'times_touched': cone_hit_count.get(cid, 0),
+                'radius': self._cone_radii.get(cid, 0.0),
             }
 
         return {
             'total_attempts'     : total,
             'successful_attempts': len(sukses),
             'failed_attempts'    : len(gagal),
-            'accuracy_pct'       : round(len(sukses) / total * 100, 1) if total > 0 else 0.0,
+            'accuracy_pct'       : round(
+                len(sukses) / total * 100, 1
+            ) if total > 0 else 0.0,
             'avg_duration'       : round(float(np.mean(
-                                       [a['duration_seconds'] for a in attempts])), 2)
-                                   if attempts else 0.0,
+                [a['duration_seconds'] for a in attempts]
+            )), 2) if attempts else 0.0,
             'cone_hit_frequency' : cone_hit_count,
             'cone_analysis'      : cone_analysis,
         }

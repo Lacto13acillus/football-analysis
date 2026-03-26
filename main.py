@@ -38,45 +38,57 @@ CONFIG = {
     "fps"         : 30,
 
     # ============================================================
-    # KONFIGURASI CONE RADIUS — DIKECILKAN
+    # CONE DETECTION
     # ============================================================
-    "cone_radius_multiplier"  : 0.8,     # 1.5 → 0.8
-    "default_cone_radius"     : 25.0,    # 40 → 25
-    "min_cone_radius"         : 15.0,    # 20 → 15
-    "max_cone_radius"         : 40.0,    # 80 → 40
+    "expected_num_cones"       : 7,       # ← BARU: jumlah cone sebenarnya
+    "cone_dedup_distance"      : 80.0,    # ← DIUBAH: 50 → 80
+    "min_cone_appearance_ratio": 0.03,    # ← DIUBAH: 0.01 → 0.03
 
     # ============================================================
-    # KONFIGURASI DRIBBLE
+    # CONE RADIUS (untuk visualisasi)
+    # ============================================================
+    "cone_radius_multiplier"  : 0.8,
+    "default_cone_radius"     : 25.0,
+    "min_cone_radius"         : 15.0,
+    "max_cone_radius"         : 40.0,
+
+    # ============================================================
+    # DRIBBLE ATTEMPT
     # ============================================================
     "entry_exit_zone_radius"  : 150.0,
     "min_attempt_frames"      : 15,
     "cooldown_frames"         : 30,
-
     "cone_order_direction"    : "auto",
+    "detection_mode"          : "auto",
+    "auto_mode_max_duration_sec": 10.0,
 
     # ============================================================
-    # MODE DETEKSI DRIBBLE
-    # ============================================================
-    "detection_mode"              : "auto",
-    "auto_mode_max_duration_sec"  : 10.0,
-
-    # ============================================================
-    # KONFIGURASI POSSESSION
+    # POSSESSION
     # ============================================================
     "max_possession_distance" : 130,
 
     # ============================================================
-    # KONFIGURASI DETEKSI SENTUHAN
+    # === BARU: ZIG-ZAG TOUCH DETECTION ===
     # ============================================================
-    "min_consecutive_touch_frames": 2,
-    "use_ball_edge_distance"      : True,
-    "interpolation_substeps"      : 3,
+    # Metode 1: Cone displacement (cone bergeser = tertabrak)
+    "use_cone_displacement"          : True,
+    "cone_displacement_threshold"    : 12.0,   # px pergeseran minimum
+    "cone_displacement_window"       : 3,      # frame window
+    "cone_displacement_ball_proximity": 150.0, # bola harus dekat
 
-    # ============================================================
-    # KONFIGURASI STABILISASI CONE — BARU
-    # ============================================================
-    "min_cone_appearance_ratio": 0.01,   # 5% → 1% (tangkap semua cone)
-    "cone_dedup_distance"      : 50.0,   # Merge cone < 50px (hapus duplikat)
+    # Metode 2: BBox overlap (bbox bola tumpang tindih bbox cone)
+    "use_bbox_overlap"               : True,
+    "bbox_overlap_shrink"            : 3.0,    # shrink cone bbox (px)
+    "min_overlap_consecutive_frames" : 2,      # frame berturut-turut
+
+    # Metode 3: Ball speed anomaly (bola melambat dekat cone)
+    "use_speed_anomaly"              : True,
+    "speed_drop_ratio"               : 0.3,    # drop ke < 30% avg
+    "speed_anomaly_proximity"        : 60.0,   # px proximity
+    "speed_avg_window"               : 10,     # window rata-rata
+
+    # Kombinasi: min berapa metode harus setuju
+    "min_methods_agree"              : 1,      # 1 = salah satu cukup
 
     # ============================================================
     # VISUALISASI
@@ -420,22 +432,21 @@ def main():
 
     dribble_detector = DribbleDetector(fps=fps)
 
-    # Transfer SEMUA config ke detector
-    dribble_detector.cone_radius_multiplier       = CONFIG["cone_radius_multiplier"]
-    dribble_detector.default_cone_radius          = CONFIG["default_cone_radius"]
-    dribble_detector.min_cone_radius              = CONFIG["min_cone_radius"]
-    dribble_detector.max_cone_radius              = CONFIG["max_cone_radius"]
-    dribble_detector.entry_exit_zone_radius       = CONFIG["entry_exit_zone_radius"]
-    dribble_detector.min_attempt_frames           = CONFIG["min_attempt_frames"]
-    dribble_detector.cooldown_frames              = CONFIG["cooldown_frames"]
-    dribble_detector.cone_order_direction         = CONFIG["cone_order_direction"]
-    dribble_detector.min_consecutive_touch_frames = CONFIG["min_consecutive_touch_frames"]
-    dribble_detector.use_ball_edge_distance       = CONFIG["use_ball_edge_distance"]
-    dribble_detector.interpolation_substeps       = CONFIG["interpolation_substeps"]
-    dribble_detector.detection_mode               = CONFIG["detection_mode"]
-    dribble_detector.auto_mode_max_duration_sec   = CONFIG["auto_mode_max_duration_sec"]
-    dribble_detector.min_cone_appearance_ratio    = CONFIG["min_cone_appearance_ratio"]
-    dribble_detector.cone_dedup_distance          = CONFIG["cone_dedup_distance"]
+        # Transfer parameter BARU ke detector
+    dribble_detector.expected_num_cones              = CONFIG.get("expected_num_cones", None)
+    dribble_detector.use_cone_displacement           = CONFIG["use_cone_displacement"]
+    dribble_detector.cone_displacement_threshold     = CONFIG["cone_displacement_threshold"]
+    dribble_detector.cone_displacement_window        = CONFIG["cone_displacement_window"]
+    dribble_detector.cone_displacement_ball_proximity= CONFIG["cone_displacement_ball_proximity"]
+    dribble_detector.use_bbox_overlap                = CONFIG["use_bbox_overlap"]
+    dribble_detector.bbox_overlap_shrink             = CONFIG["bbox_overlap_shrink"]
+    dribble_detector.min_overlap_consecutive_frames  = CONFIG["min_overlap_consecutive_frames"]
+    dribble_detector.use_speed_anomaly               = CONFIG["use_speed_anomaly"]
+    dribble_detector.speed_drop_ratio                = CONFIG["speed_drop_ratio"]
+    dribble_detector.speed_anomaly_proximity         = CONFIG["speed_anomaly_proximity"]
+    dribble_detector.speed_avg_window                = CONFIG["speed_avg_window"]
+    dribble_detector.min_methods_agree               = CONFIG["min_methods_agree"]
+
 
     # sample_frames=-1 → scan SEMUA frame
     cone_ok = dribble_detector.initialize_cones(
