@@ -1,5 +1,6 @@
 # main.py
 # Pipeline utama: baca video -> deteksi -> tracking -> analisis dribbling -> render -> simpan
+# Versi simplified: 1 pemain, tanpa jersey mapping
 
 import os
 import sys
@@ -11,7 +12,6 @@ from typing import List, Dict, Optional
 sys.path.append('../')
 
 from trackers                          import Tracker
-from team_assigner.player_identifier   import PlayerBallAssigner
 from trackers.player_ball_assigner     import PlayerBallAssigner
 from trackers.dribble_detector         import DribbleDetector
 from draw_dribble import (
@@ -20,8 +20,8 @@ from draw_dribble import (
     draw_dribble_status,
     draw_dribble_stats_panel,
     draw_result_flash,
-    draw_entry_exit_zones,      # opsional, untuk debug
-    draw_attempt_summary,       # opsional, untuk frame terakhir
+    draw_entry_exit_zones,
+    draw_attempt_summary,
 )
 
 from utils.bbox_utils import get_center_of_bbox_bottom
@@ -40,38 +40,17 @@ CONFIG = {
     "fps"         : 30,
 
     # ============================================================
-    # JERSEY MAPPING (SEED AWAL)
-    # ============================================================
-    "jersey_mapping": {
-        1: "#3",
-        2: "#19",
-        3: "Unknown",
-        4: "#3",
-        5: "#19",
-        6: "Unknown",
-        7: "Unknown"
-    },
-
-    # Parameter re-identification
-    "reassign_distance_threshold": 150.0,
-    "lost_timeout_frames"        : 60,
-
-    # ============================================================
     # KONFIGURASI DRIBBLE
     # ============================================================
-    # Radius cone
     "cone_radius_multiplier"  : 1.5,
     "default_cone_radius"     : 40.0,
     "min_cone_radius"         : 20.0,
     "max_cone_radius"         : 80.0,
 
-    # Dribble attempt detection
     "entry_exit_zone_radius"  : 150.0,
     "min_attempt_frames"      : 15,
     "cooldown_frames"         : 30,
-    "min_cones_passed"        : 2,
 
-    # Arah urutan cone: 'auto', 'top_to_bottom', 'left_to_right', dll
     "cone_order_direction"    : "auto",
 
     # ============================================================
@@ -80,12 +59,26 @@ CONFIG = {
     "max_possession_distance" : 130,
 
     # ============================================================
+    # KONFIGURASI DETEKSI SENTUHAN (BARU)
+    # ============================================================
+    # Minimum consecutive frames bola harus di dalam radius cone
+    # agar dianggap menyentuh cone. Nilai 1 = tanpa filter.
+    "min_consecutive_touch_frames": 2,
+
+    # Gunakan edge bola (bukan hanya center) untuk hitung jarak
+    "use_ball_edge_distance": True,
+
+    # Jumlah sub-step interpolasi antar frame
+    "interpolation_substeps": 3,
+
+    # ============================================================
     # VISUALISASI
     # ============================================================
     "show_cone_zones"    : True,
     "show_stats_panel"   : True,
     "debug_trajectory"   : True,
     "show_dribble_status": True,
+    "result_flash_frames": 45,   # durasi flash SUKSES/GAGAL dalam frame
 }
 
 
@@ -112,7 +105,7 @@ def compute_progressive_stats(
     detected_attempts: List[Dict],
     up_to_frame      : int
 ) -> Dict:
-    """Hitung statistik kumulatif dari attempt yang sudah ditampilkan."""
+    """Hitung statistik kumulatif dari attempt yang sudah selesai."""
     attempts_so_far = [
         a for a in detected_attempts
         if a['frame_end'] <= up_to_frame
@@ -122,36 +115,10 @@ def compute_progressive_stats(
     sukses = [a for a in attempts_so_far if a['success']]
     gagal = [a for a in attempts_so_far if not a['success']]
 
-    per_player: Dict[str, Dict] = {}
     cone_hit_count: Dict[int, int] = {}
-
     for a in attempts_so_far:
-        jersey = a['jersey']
-        if jersey not in per_player:
-            per_player[jersey] = {
-                'total': 0, 'success': 0, 'failed': 0,
-                'accuracy_pct': 0.0, 'avg_duration': 0.0,
-                'total_cones_hit': 0, '_dur_sum': 0.0,
-            }
-        per_player[jersey]['total'] += 1
-        per_player[jersey]['_dur_sum'] += a['duration_seconds']
-        per_player[jersey]['total_cones_hit'] += len(a['touched_cones'])
-        if a['success']:
-            per_player[jersey]['success'] += 1
-        else:
-            per_player[jersey]['failed'] += 1
-
         for tc in a['touched_cones']:
             cone_hit_count[tc] = cone_hit_count.get(tc, 0) + 1
-
-    for jersey, stat in per_player.items():
-        stat['accuracy_pct'] = round(
-            stat['success'] / stat['total'] * 100, 1
-        ) if stat['total'] > 0 else 0.0
-        stat['avg_duration'] = round(
-            stat['_dur_sum'] / stat['total'], 2
-        ) if stat['total'] > 0 else 0.0
-        del stat['_dur_sum']
 
     return {
         'total_attempts'     : total,
@@ -162,7 +129,6 @@ def compute_progressive_stats(
                                    [a['duration_seconds'] for a in attempts_so_far])), 2)
                                if attempts_so_far else 0.0,
         'cone_hit_frequency' : cone_hit_count,
-        'per_player'         : per_player,
     }
 
 
@@ -188,22 +154,12 @@ def print_dribble_details(attempts: List[Dict], stats: Dict) -> None:
             print(f"    Cone {cid}: {cnt}x disentuh")
         print("-" * 70)
 
-    print("  Statistik Per Pemain:")
-    for jersey, pstat in stats.get('per_player', {}).items():
-        filled = int(pstat['accuracy_pct'] / 10)
-        bar = "█" * filled + "░" * (10 - filled)
-        print(f"    {jersey:<10}: {pstat['success']:>2}/{pstat['total']:>2} "
-              f"| {bar} {pstat['accuracy_pct']:>5.1f}% "
-              f"| avg={pstat['avg_duration']:.1f}s "
-              f"| cone_hit={pstat.get('total_cones_hit', 0)}")
-    print(sep)
-
     if not attempts:
         print("  Tidak ada dribble attempt terdeteksi.\n")
         return
 
     print("\n  Detail Semua Dribble Attempts:")
-    print(f"  {'No':<4} {'Pemain':<10} {'Frame':<14} "
+    print(f"  {'No':<4} {'Player':<10} {'Frame':<14} "
           f"{'Durasi':>8} {'Cone Hit':>10} {'Status':<10}")
     print("  " + "-" * 60)
     for i, a in enumerate(attempts):
@@ -211,7 +167,7 @@ def print_dribble_details(attempts: List[Dict], stats: Dict) -> None:
         touched = len(a['touched_cones'])
         total_c = a['total_cones']
         print(f"  {i+1:<4} "
-              f"{a['jersey']:<10} "
+              f"{'P' + str(a['player_id']):<10} "
               f"{a['frame_start']:>4}-{a['frame_end']:<7} "
               f"{a['duration_seconds']:>6.1f}s "
               f"{touched:>3}/{total_c:<5} "
@@ -221,7 +177,9 @@ def print_dribble_details(attempts: List[Dict], stats: Dict) -> None:
             for tc in a['touched_cones']:
                 d = a['cone_details'][tc]['min_distance']
                 r = a['cone_details'][tc]['radius']
-                print(f"         └─ Cone {tc}: min_dist={d:.1f}px (radius={r:.1f}px)")
+                consec = a['cone_details'][tc].get('consecutive_max', 0)
+                print(f"         └─ Cone {tc}: min_dist={d:.1f}px "
+                      f"(radius={r:.1f}px, consecutive={consec})")
     print()
 
 
@@ -234,7 +192,6 @@ def render_frames(
     tracks            : Dict,
     ball_possessions  : List[int],
     detected_attempts : List[Dict],
-    player_identifier : PlayerBallAssigner,
     dribble_detector  : DribbleDetector,
     config            : Dict
 ) -> List[np.ndarray]:
@@ -243,6 +200,7 @@ def render_frames(
 
     stabilized_cones = dribble_detector.get_all_cones() or {}
     cone_radii = dribble_detector.get_cone_radii()
+    ordered_ids = dribble_detector.get_ordered_cone_ids()
 
     rolling_trajectory: List = []
 
@@ -251,6 +209,13 @@ def render_frames(
     for a in detected_attempts:
         for f in range(a['frame_start'], a['frame_end'] + 1):
             attempt_frame_map[f] = a
+
+    # Pre-compute: result flash frames
+    flash_frames: Dict[int, Dict] = {}
+    flash_duration = config.get("result_flash_frames", 45)
+    for a in detected_attempts:
+        for f in range(a['frame_end'], min(a['frame_end'] + flash_duration, total_frames)):
+            flash_frames[f] = a
 
     print(f"\n[RENDER] Mulai merender {total_frames} frames...")
 
@@ -269,15 +234,22 @@ def render_frames(
 
         # 1. Zona cone
         if config.get("show_cone_zones", True) and stabilized_cones:
+            ball_pos_for_viz = None
+            ball_data_viz = tracks["ball"][frame_num].get(1)
+            if ball_data_viz:
+                ball_pos_for_viz = get_center_of_bbox_bottom(ball_data_viz["bbox"])
+
             annotated = draw_cone_zones_on_frame(
                 annotated,
                 stabilized_cones = stabilized_cones,
                 cone_radii       = cone_radii,
+                ordered_ids      = ordered_ids,
                 touched_cones    = touched_cones_now if active_attempt else [],
-                active_attempt   = active_attempt is not None,
+                is_dribbling     = active_attempt is not None,
+                ball_pos         = ball_pos_for_viz,
             )
 
-        # 2. Bounding box pemain + label jersey
+        # 2. Bounding box pemain
         for player_id, player_data in tracks["players"][frame_num].items():
             bbox = player_data.get("bbox")
             if bbox is None:
@@ -291,12 +263,11 @@ def render_frames(
             box_color = (0, 200, 50) if has_ball else (200, 80, 50)
             cv2.rectangle(annotated, (x1, y1), (x2, y2), box_color, 2)
 
-            jersey = player_identifier.get_jersey_number_for_player(player_id)
-            label = f"#{jersey}"
-            (lw, lh), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
+            label = f"Player {player_id}"
+            (lw, lh), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.50, 1)
             cv2.rectangle(annotated, (x1, y1 - lh - 8), (x1 + lw + 8, y1), box_color, -1)
             cv2.putText(annotated, label, (x1 + 4, y1 - 4),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 1)
 
             if has_ball:
                 foot_x = (x1 + x2) // 2
@@ -332,12 +303,23 @@ def render_frames(
             annotated = draw_dribble_status(
                 annotated,
                 is_active   = True,
-                jersey      = active_attempt['jersey'],
                 touched_cnt = len(touched_cones_now),
                 total_cones = active_attempt['total_cones'],
+                duration_sec = (frame_num - active_attempt['frame_start']) / config.get('fps', 30),
             )
 
-        # 6. Panel statistik realtime
+        # 6. Result flash (SUKSES/GAGAL) setelah attempt selesai
+        flash_attempt = flash_frames.get(frame_num)
+        if flash_attempt and frame_num >= flash_attempt['frame_end']:
+            annotated = draw_result_flash(
+                annotated,
+                success       = flash_attempt['success'],
+                touched_cones = flash_attempt['touched_cones'],
+                total_cones   = flash_attempt['total_cones'],
+                attempt_number= flash_attempt['attempt_id'],
+            )
+
+        # 7. Panel statistik realtime
         if config.get("show_stats_panel", True):
             realtime_stats = compute_progressive_stats(detected_attempts, frame_num)
             annotated = draw_dribble_stats_panel(
@@ -347,7 +329,7 @@ def render_frames(
                 panel_width = 295,
             )
 
-        # 7. Label frame
+        # 8. Label frame
         h_frame, w_frame = annotated.shape[:2]
         cv2.putText(annotated, f"Frame: {frame_num}",
                     (w_frame - 140, h_frame - 10),
@@ -376,16 +358,19 @@ def main():
         CONFIG["debug_trajectory"] = True
 
     print("\n" + "=" * 70)
-    print("   FOOTBALL DRIBBLING ANALYTICS v1.0")
-    print("   Cone Touch Detection via Radius Logic")
+    print("   FOOTBALL DRIBBLING ANALYTICS v2.0")
+    print("   Cone Touch Detection — Enhanced Logic")
     print("=" * 70)
-    print(f"  Input        : {CONFIG['input_video']}")
-    print(f"  Output       : {CONFIG['output_video']}")
-    print(f"  Model        : {CONFIG['model_path']}")
-    print(f"  Gunakan cache: {'Ya' if CONFIG['use_stub'] else 'Tidak'}")
-    print(f"  Cone radius  : multiplier={CONFIG['cone_radius_multiplier']}, "
+    print(f"  Input             : {CONFIG['input_video']}")
+    print(f"  Output            : {CONFIG['output_video']}")
+    print(f"  Model             : {CONFIG['model_path']}")
+    print(f"  Gunakan cache     : {'Ya' if CONFIG['use_stub'] else 'Tidak'}")
+    print(f"  Cone radius       : multiplier={CONFIG['cone_radius_multiplier']}, "
           f"default={CONFIG['default_cone_radius']}px")
-    print(f"  Possession d : {CONFIG['max_possession_distance']}px")
+    print(f"  Possession dist   : {CONFIG['max_possession_distance']}px")
+    print(f"  Temporal filter   : {CONFIG['min_consecutive_touch_frames']} frames")
+    print(f"  Ball edge dist    : {'Ya' if CONFIG['use_ball_edge_distance'] else 'Tidak'}")
+    print(f"  Interpolation     : {CONFIG['interpolation_substeps']} substeps")
     print("=" * 70)
 
     # ==========================================================
@@ -407,6 +392,7 @@ def main():
     cap.release()
     if fps <= 0:
         fps = CONFIG["fps"]
+    CONFIG["fps"] = fps
     print(f"[MAIN] FPS: {fps}, Total frames: {len(frames)}")
 
     # ==========================================================
@@ -422,42 +408,24 @@ def main():
     )
 
     # ==========================================================
-    # TAHAP 3: Identifikasi Jersey Pemain
+    # TAHAP 3: Inisialisasi Dribble Detector & Cone
     # ==========================================================
-    print("\n[MAIN] TAHAP 3: Mapping jersey pemain...")
-
-    player_identifier = PlayerBallAssigner(
-        track_id_to_jersey          = CONFIG["jersey_mapping"],
-        reassign_distance_threshold = CONFIG["reassign_distance_threshold"],
-        lost_timeout_frames         = CONFIG["lost_timeout_frames"]
-    )
-
-    for frame_num in range(len(tracks['players'])):
-        player_identifier.update_frame(
-            frame_num     = frame_num,
-            player_tracks = tracks['players'][frame_num],
-            debug         = (frame_num % 100 == 0)
-        )
-    player_identifier.print_mappings()
-
-    # ==========================================================
-    # TAHAP 4: Inisialisasi Dribble Detector & Cone
-    # ==========================================================
-    print("\n[MAIN] TAHAP 4: Inisialisasi Dribble Detector & Cone...")
+    print("\n[MAIN] TAHAP 3: Inisialisasi Dribble Detector & Cone...")
 
     dribble_detector = DribbleDetector(fps=fps)
-    dribble_detector.set_jersey_map(player_identifier)
 
     # Transfer config ke detector
-    dribble_detector.cone_radius_multiplier = CONFIG["cone_radius_multiplier"]
-    dribble_detector.default_cone_radius    = CONFIG["default_cone_radius"]
-    dribble_detector.min_cone_radius        = CONFIG["min_cone_radius"]
-    dribble_detector.max_cone_radius        = CONFIG["max_cone_radius"]
-    dribble_detector.entry_exit_zone_radius = CONFIG["entry_exit_zone_radius"]
-    dribble_detector.min_attempt_frames     = CONFIG["min_attempt_frames"]
-    dribble_detector.cooldown_frames        = CONFIG["cooldown_frames"]
-    dribble_detector.min_cones_passed       = CONFIG["min_cones_passed"]
-    dribble_detector.cone_order_direction   = CONFIG["cone_order_direction"]
+    dribble_detector.cone_radius_multiplier       = CONFIG["cone_radius_multiplier"]
+    dribble_detector.default_cone_radius          = CONFIG["default_cone_radius"]
+    dribble_detector.min_cone_radius              = CONFIG["min_cone_radius"]
+    dribble_detector.max_cone_radius              = CONFIG["max_cone_radius"]
+    dribble_detector.entry_exit_zone_radius       = CONFIG["entry_exit_zone_radius"]
+    dribble_detector.min_attempt_frames           = CONFIG["min_attempt_frames"]
+    dribble_detector.cooldown_frames              = CONFIG["cooldown_frames"]
+    dribble_detector.cone_order_direction         = CONFIG["cone_order_direction"]
+    dribble_detector.min_consecutive_touch_frames = CONFIG["min_consecutive_touch_frames"]
+    dribble_detector.use_ball_edge_distance       = CONFIG["use_ball_edge_distance"]
+    dribble_detector.interpolation_substeps       = CONFIG["interpolation_substeps"]
 
     cone_ok = dribble_detector.initialize_cones(
         tracks, cone_key='cones', sample_frames=30, debug=True
@@ -468,55 +436,52 @@ def main():
         return
 
     # ==========================================================
-    # TAHAP 5: Assignment Possession Bola Per Frame
+    # TAHAP 4: Assignment Possession Bola Per Frame
     # ==========================================================
-    print("\n[MAIN] TAHAP 5: Menentukan possession bola per frame...")
+    print("\n[MAIN] TAHAP 4: Menentukan possession bola per frame...")
 
     assigner = PlayerBallAssigner(
         max_possession_distance=CONFIG["max_possession_distance"]
     )
-    assigner.set_player_identifier(player_identifier)
     ball_possessions = assigner.assign_ball_to_players_bulk(tracks)
 
     # ==========================================================
-    # TAHAP 6: Deteksi Dribble Attempts
+    # TAHAP 5: Deteksi Dribble Attempts
     # ==========================================================
-    print("\n[MAIN] TAHAP 6: Deteksi dribble attempts...")
+    print("\n[MAIN] TAHAP 5: Deteksi dribble attempts...")
 
     detected_attempts = dribble_detector.detect_dribble_attempts(
         tracks,
         ball_possessions,
-        player_identifier=player_identifier,
         debug=True
     )
 
     # ==========================================================
-    # TAHAP 7: Statistik
+    # TAHAP 6: Statistik
     # ==========================================================
-    print("\n[MAIN] TAHAP 7: Menghitung statistik...")
+    print("\n[MAIN] TAHAP 6: Menghitung statistik...")
 
     stats = dribble_detector.get_dribble_statistics(detected_attempts)
     print_dribble_details(detected_attempts, stats)
 
     # ==========================================================
-    # TAHAP 8: Render Video Output
+    # TAHAP 7: Render Video Output
     # ==========================================================
-    print("\n[MAIN] TAHAP 8: Merender video output...")
+    print("\n[MAIN] TAHAP 7: Merender video output...")
 
     output_frames = render_frames(
         frames            = frames,
         tracks            = tracks,
         ball_possessions  = ball_possessions,
         detected_attempts = detected_attempts,
-        player_identifier = player_identifier,
         dribble_detector  = dribble_detector,
         config            = CONFIG,
     )
 
     # ==========================================================
-    # TAHAP 9: Simpan Video Output
+    # TAHAP 8: Simpan Video Output
     # ==========================================================
-    print(f"\n[MAIN] TAHAP 9: Menyimpan video ke: {CONFIG['output_video']}...")
+    print(f"\n[MAIN] TAHAP 8: Menyimpan video ke: {CONFIG['output_video']}...")
 
     output_dir = os.path.dirname(CONFIG["output_video"])
     if output_dir and not os.path.exists(output_dir):
