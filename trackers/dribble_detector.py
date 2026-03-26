@@ -1,17 +1,4 @@
 # dribble_detector.py
-# Deteksi dribbling melewati cone course untuk 1 pemain.
-#
-# LOGIKA:
-#   - Setiap cone punya radius deteksi (dynamic dari bbox atau manual).
-#   - Dribble attempt dimulai saat pemain+bola masuk entry zone (cone pertama).
-#   - Dribble attempt selesai saat pemain+bola sampai exit zone (cone terakhir).
-#   - Selama attempt, jika bola masuk radius cone manapun → GAGAL.
-#   - Jika bola tidak masuk radius cone manapun → SUKSES.
-#
-# PENINGKATAN v2:
-#   - Temporal Filtering: sentuhan harus >= N consecutive frames
-#   - Ball Edge Distance: gunakan edge bbox bola, bukan hanya center
-#   - Trajectory Interpolation: interpolasi posisi antar frame
 
 import sys
 sys.path.append('../')
@@ -31,14 +18,12 @@ class DribbleDetector:
         self.fps = fps
 
         # ============================================================
-        # PARAMETER RADIUS CONE
+        # PARAMETER RADIUS CONE — DIKECILKAN
         # ============================================================
-        self.default_cone_radius: float = 40.0
-        self.cone_radius_multiplier: float = 1.5
-        self.min_cone_radius: float = 20.0
-        self.max_cone_radius: float = 80.0
-
-        # Override radius manual per cone: {cone_id: radius}
+        self.default_cone_radius: float = 25.0
+        self.cone_radius_multiplier: float = 0.8    # 1.5 → 0.8
+        self.min_cone_radius: float = 15.0           # 20 → 15
+        self.max_cone_radius: float = 40.0           # 80 → 40
         self.manual_cone_radii: Dict[int, float] = {}
 
         # ============================================================
@@ -52,35 +37,40 @@ class DribbleDetector:
         self.min_possession_ratio: float = 0.3
 
         # ============================================================
-        # PARAMETER TEMPORAL FILTERING (BARU)
+        # MODE DETEKSI
         # ============================================================
-        # Minimum consecutive frames bola di dalam radius cone
-        # agar dianggap sebagai sentuhan valid.
-        # Nilai 1 = tanpa filtering (seperti sebelumnya)
-        # Nilai 2-3 = mengurangi false positive dari noise deteksi
+        self.detection_mode: str = "auto"
+        self.auto_mode_max_duration_sec: float = 10.0
+
+        # ============================================================
+        # PARAMETER TEMPORAL FILTERING
+        # ============================================================
         self.min_consecutive_touch_frames: int = 2
 
         # ============================================================
-        # PARAMETER BALL EDGE DISTANCE (BARU)
+        # PARAMETER BALL EDGE DISTANCE
         # ============================================================
-        # Jika True, gunakan edge bounding box bola (bukan hanya center)
-        # untuk menghitung jarak ke cone. Lebih akurat karena bola
-        # punya ukuran fisik.
         self.use_ball_edge_distance: bool = True
 
         # ============================================================
-        # PARAMETER TRAJECTORY INTERPOLATION (BARU)
+        # PARAMETER TRAJECTORY INTERPOLATION
         # ============================================================
-        # Jumlah sub-step interpolasi antar frame berurutan.
-        # Berguna untuk mendeteksi sentuhan ketika bola bergerak
-        # cepat dan "melompat" melewati radius cone dalam 1 frame.
-        # Nilai 1 = tanpa interpolasi, 3-5 = lebih akurat.
         self.interpolation_substeps: int = 3
 
         # ============================================================
         # PARAMETER CONE ORDERING
         # ============================================================
         self.cone_order_direction: str = 'auto'
+
+        # ============================================================
+        # PARAMETER STABILISASI CONE — DIPERBAIKI
+        # ============================================================
+        # Minimum kemunculan cone (rasio terhadap total frame)
+        self.min_cone_appearance_ratio: float = 0.01  # 5% → 1%
+
+        # Jarak minimum antar cone unik (untuk deduplikasi)
+        # Cone yang jaraknya < ini dianggap cone yang SAMA
+        self.cone_dedup_distance: float = 50.0
 
         # ============================================================
         # INTERNAL STATE
@@ -111,7 +101,7 @@ class DribbleDetector:
         self,
         tracks       : Dict,
         cone_key     : str = 'cones',
-        sample_frames: int = 30,
+        sample_frames: int = -1,
         debug        : bool = True
     ) -> bool:
         if cone_key not in tracks or not tracks[cone_key]:
@@ -121,15 +111,33 @@ class DribbleDetector:
         if debug:
             print(f"\n[DRIBBLE] === INISIALISASI CONE ===")
 
-        self._stabilized_cones = stabilize_cone_positions(
-            tracks, cone_key=cone_key, sample_frames=sample_frames
+        total_frames = len(tracks[cone_key])
+        if sample_frames <= 0:
+            sample_frames = total_frames
+
+        if debug:
+            print(f"[DRIBBLE] Sample frames: {sample_frames}/{total_frames}")
+
+        # LANGKAH 1: Kumpulkan semua posisi cone dari semua frame
+        raw_cones = self._collect_all_cone_positions(
+            tracks, cone_key, sample_frames, debug
         )
+
+        if debug:
+            print(f"[DRIBBLE] Raw cone IDs: {len(raw_cones)}")
+
+        # LANGKAH 2: Deduplikasi — merge cone yang terlalu dekat
+        self._stabilized_cones = self._deduplicate_cones(raw_cones, debug)
+
+        if debug:
+            print(f"[DRIBBLE] Setelah deduplikasi: {len(self._stabilized_cones)} cone unik")
 
         if len(self._stabilized_cones) < 2:
             print("[DRIBBLE] GAGAL: Minimal 2 cone diperlukan!")
             return False
 
-        self._compute_cone_bbox_sizes(tracks, cone_key, sample_frames)
+        # LANGKAH 3: Hitung bbox size per cone (untuk radius)
+        self._compute_cone_bbox_sizes_dedup(tracks, cone_key, sample_frames)
         self._compute_cone_radii(debug)
         self._order_cones(debug)
 
@@ -139,6 +147,7 @@ class DribbleDetector:
             print(f"[DRIBBLE] Temporal filter   : {self.min_consecutive_touch_frames} frames")
             print(f"[DRIBBLE] Ball edge dist   : {'Ya' if self.use_ball_edge_distance else 'Tidak'}")
             print(f"[DRIBBLE] Interpolation    : {self.interpolation_substeps} substeps")
+            print(f"[DRIBBLE] Detection mode   : {self.detection_mode}")
             for idx, cid in enumerate(self._ordered_cone_ids):
                 pos = self._stabilized_cones[cid]
                 r = self._cone_radii[cid]
@@ -154,10 +163,117 @@ class DribbleDetector:
 
         return True
 
-    def _compute_cone_bbox_sizes(
+    def _collect_all_cone_positions(
+        self,
+        tracks       : Dict,
+        cone_key     : str,
+        sample_frames: int,
+        debug        : bool
+    ) -> Dict[int, List[Tuple[float, float]]]:
+        """Kumpulkan semua posisi cone dari semua frame."""
+        cone_positions: Dict[int, List[Tuple[float, float]]] = {}
+        total = min(sample_frames, len(tracks.get(cone_key, [])))
+
+        for f in range(total):
+            for cone_id, cone_data in tracks[cone_key][f].items():
+                bbox = cone_data.get('bbox')
+                if bbox is None:
+                    continue
+                pos = get_center_of_bbox_bottom(bbox)
+                if cone_id not in cone_positions:
+                    cone_positions[cone_id] = []
+                cone_positions[cone_id].append(pos)
+
+        # Filter: cone harus muncul di cukup banyak frame
+        min_appearances = max(1, int(total * self.min_cone_appearance_ratio))
+        filtered: Dict[int, List[Tuple[float, float]]] = {}
+
+        for cone_id, positions in cone_positions.items():
+            if len(positions) >= min_appearances:
+                filtered[cone_id] = positions
+                if debug:
+                    avg_x = float(np.mean([p[0] for p in positions]))
+                    avg_y = float(np.mean([p[1] for p in positions]))
+                    print(f"[DRIBBLE] Cone {cone_id}: {len(positions)} appearances "
+                          f"→ avg=({avg_x:.0f}, {avg_y:.0f}) ✓")
+            else:
+                if debug:
+                    print(f"[DRIBBLE] Cone {cone_id}: {len(positions)} appearances "
+                          f"< {min_appearances} → DIBUANG")
+
+        return filtered
+
+    def _deduplicate_cones(
+        self,
+        raw_cones: Dict[int, List[Tuple[float, float]]],
+        debug    : bool
+    ) -> Dict[int, Tuple[float, float]]:
+        """
+        Deduplikasi cone yang terlalu dekat satu sama lain.
+
+        Masalah: Tracker sering membuat beberapa anchor ID untuk cone
+        yang sama (karena jitter deteksi, partial occlusion, dll).
+        Solusi: Merge cone yang jaraknya < cone_dedup_distance.
+        Cone dengan appearances terbanyak diprioritaskan.
+        """
+        # Hitung posisi rata-rata per cone
+        cone_avg: Dict[int, Tuple[float, float]] = {}
+        cone_counts: Dict[int, int] = {}
+        for cid, positions in raw_cones.items():
+            avg_x = float(np.mean([p[0] for p in positions]))
+            avg_y = float(np.mean([p[1] for p in positions]))
+            cone_avg[cid] = (avg_x, avg_y)
+            cone_counts[cid] = len(positions)
+
+        # Sort by appearances (terbanyak dulu — ini yang paling reliable)
+        sorted_ids = sorted(cone_avg.keys(), key=lambda x: -cone_counts[x])
+
+        # Greedy dedup: ambil cone, buang semua cone lain yang terlalu dekat
+        final_cones: Dict[int, Tuple[float, float]] = {}
+        used = set()
+
+        for cid in sorted_ids:
+            if cid in used:
+                continue
+
+            pos = cone_avg[cid]
+            too_close = False
+
+            for existing_id, existing_pos in final_cones.items():
+                dist = measure_distance(pos, existing_pos)
+                if dist < self.cone_dedup_distance:
+                    too_close = True
+                    if debug:
+                        print(f"[DRIBBLE] Cone {cid} terlalu dekat ke Cone {existing_id} "
+                              f"(dist={dist:.0f}px < {self.cone_dedup_distance}px) → MERGE")
+                    break
+
+            if not too_close:
+                final_cones[cid] = pos
+                used.add(cid)
+
+        # Re-index cone IDs menjadi 0, 1, 2, ... agar rapi
+        reindexed: Dict[int, Tuple[float, float]] = {}
+        for new_id, (old_id, pos) in enumerate(final_cones.items()):
+            reindexed[new_id] = pos
+            if debug:
+                print(f"[DRIBBLE] Final: Cone {old_id} → Cone {new_id} "
+                      f"at ({pos[0]:.0f}, {pos[1]:.0f})")
+
+        return reindexed
+
+    def _compute_cone_bbox_sizes_dedup(
         self, tracks: Dict, cone_key: str, sample_frames: int
     ) -> None:
-        size_acc: Dict[int, List[float]] = {}
+        """
+        Hitung rata-rata bbox size per STABILIZED cone.
+        Karena cone sudah di-reindex, kita perlu match berdasarkan posisi.
+        """
+        if not self._stabilized_cones:
+            return
+
+        # Kumpulkan semua bbox sizes dari raw detections
+        all_sizes: List[float] = []
         total = min(sample_frames, len(tracks.get(cone_key, [])))
 
         for f in range(total):
@@ -169,19 +285,36 @@ class DribbleDetector:
                 h = bbox[3] - bbox[1]
                 if w <= 0 or h <= 0:
                     continue
-                if cone_id not in size_acc:
-                    size_acc[cone_id] = []
-                size_acc[cone_id].append(max(w, h))
 
-        for cone_id, sizes in size_acc.items():
-            self._cone_bbox_sizes[cone_id] = float(np.mean(sizes))
+                det_pos = get_center_of_bbox_bottom(bbox)
+                size = max(w, h)
+
+                # Match ke stabilized cone terdekat
+                for scid, spos in self._stabilized_cones.items():
+                    dist = measure_distance(det_pos, spos)
+                    if dist < self.cone_dedup_distance:
+                        if scid not in self._cone_bbox_sizes:
+                            self._cone_bbox_sizes[scid] = []
+                        # Sementara simpan sebagai list, nanti di-average
+                        if not isinstance(self._cone_bbox_sizes.get(scid), list):
+                            self._cone_bbox_sizes[scid] = []
+                        self._cone_bbox_sizes[scid].append(size)
+                        break
+
+        # Average
+        for scid in list(self._cone_bbox_sizes.keys()):
+            sizes = self._cone_bbox_sizes[scid]
+            if isinstance(sizes, list) and len(sizes) > 0:
+                self._cone_bbox_sizes[scid] = float(np.mean(sizes))
+            else:
+                self._cone_bbox_sizes[scid] = 0.0
 
     def _compute_cone_radii(self, debug: bool = False) -> None:
         for cone_id in self._stabilized_cones:
             if cone_id in self.manual_cone_radii:
                 radius = self.manual_cone_radii[cone_id]
                 source = "manual"
-            elif cone_id in self._cone_bbox_sizes:
+            elif cone_id in self._cone_bbox_sizes and self._cone_bbox_sizes[cone_id] > 0:
                 radius = self._cone_bbox_sizes[cone_id] * self.cone_radius_multiplier
                 source = "dynamic"
             else:
@@ -193,6 +326,8 @@ class DribbleDetector:
 
             if debug:
                 bbox_s = self._cone_bbox_sizes.get(cone_id, 0)
+                if isinstance(bbox_s, list):
+                    bbox_s = float(np.mean(bbox_s)) if bbox_s else 0
                 print(f"[DRIBBLE] Cone {cone_id}: bbox_size={bbox_s:.0f}px "
                       f"→ radius={radius:.0f}px ({source})")
 
@@ -230,46 +365,26 @@ class DribbleDetector:
         self._ordered_cone_ids = [cid for cid, _ in paired]
 
     # ============================================================
-    # HELPER: BALL EDGE DISTANCE (BARU)
+    # HELPER: BALL EDGE DISTANCE
     # ============================================================
 
     def _compute_ball_cone_distance(
         self,
-        ball_pos: Tuple[float, float],
-        cone_pos: Tuple[float, float],
+        ball_pos : Tuple[float, float],
+        cone_pos : Tuple[float, float],
         ball_bbox: Optional[List[float]] = None
     ) -> float:
-        """
-        Hitung jarak bola ke cone.
-
-        Jika use_ball_edge_distance=True dan ball_bbox tersedia,
-        gunakan titik terdekat dari edge bounding box bola ke cone.
-        Ini lebih akurat karena bola punya ukuran fisik — center bola
-        mungkin jauh dari cone tapi edge-nya sudah menyentuh.
-
-        Args:
-            ball_pos : center position bola (x, y)
-            cone_pos : center position cone (x, y)
-            ball_bbox: bounding box bola [x1, y1, x2, y2] (opsional)
-
-        Returns:
-            Jarak terpendek (float)
-        """
         if not self.use_ball_edge_distance or ball_bbox is None:
             return measure_distance(ball_pos, cone_pos)
 
-        # Cari titik terdekat pada edge bbox bola ke cone_pos
         bx1, by1, bx2, by2 = ball_bbox
         cx, cy = cone_pos
-
-        # Clamp cone position ke dalam bbox → titik terdekat di bbox
         closest_x = max(bx1, min(cx, bx2))
         closest_y = max(by1, min(cy, by2))
-
         return measure_distance((closest_x, closest_y), cone_pos)
 
     # ============================================================
-    # HELPER: TRAJECTORY INTERPOLATION (BARU)
+    # HELPER: TRAJECTORY INTERPOLATION
     # ============================================================
 
     def _interpolate_positions(
@@ -278,14 +393,6 @@ class DribbleDetector:
         pos_b: Tuple[float, float],
         steps: int
     ) -> List[Tuple[float, float]]:
-        """
-        Interpolasi linier antara dua posisi.
-        Berguna saat bola bergerak cepat dan bisa "melompat"
-        melewati radius cone antara dua frame berurutan.
-
-        Returns:
-            List posisi termasuk pos_a dan pos_b
-        """
         if steps <= 1:
             return [pos_a, pos_b]
 
@@ -306,12 +413,6 @@ class DribbleDetector:
         ball_pos : Tuple[float, float],
         ball_bbox: Optional[List[float]] = None
     ) -> List[Tuple[int, float]]:
-        """
-        Cek apakah posisi bola saat ini menyentuh radius cone manapun.
-
-        Returns:
-            List of (cone_id, distance) untuk cone yang disentuh
-        """
         touched = []
         if not self._stabilized_cones:
             return touched
@@ -329,25 +430,6 @@ class DribbleDetector:
         ball_trajectory: List[Tuple[float, float]],
         ball_bboxes    : Optional[List[Optional[List[float]]]] = None
     ) -> Dict[int, Dict[str, Any]]:
-        """
-        Evaluasi seluruh trajectory bola terhadap semua cone.
-
-        PENINGKATAN:
-        1. Ball edge distance (jika ball_bboxes diberikan)
-        2. Trajectory interpolation antar frame
-        3. Temporal filtering — sentuhan hanya valid jika
-           consecutive frames >= min_consecutive_touch_frames
-
-        Returns:
-            {cone_id: {
-                'touched': bool,
-                'min_distance': float,
-                'touch_count': int,
-                'consecutive_max': int,     # max consecutive frames di dalam radius
-                'first_touch_idx': int,
-                'radius': float
-            }}
-        """
         results: Dict[int, Dict[str, Any]] = {}
 
         for cone_id in self._stabilized_cones:
@@ -358,32 +440,25 @@ class DribbleDetector:
             raw_touch_count = 0
             first_touch = -1
 
-            # Untuk temporal filtering
             consecutive_count = 0
             max_consecutive = 0
             valid_touch = False
 
             for i, ball_pos in enumerate(ball_trajectory):
-                # Ambil bbox bola jika tersedia
                 bbox = None
                 if ball_bboxes and i < len(ball_bboxes):
                     bbox = ball_bboxes[i]
 
-                # === Trajectory Interpolation ===
-                # Jika ada posisi sebelumnya, interpolasi antar frame
                 positions_to_check = [(ball_pos, bbox)]
 
-                if (i > 0 and self.interpolation_substeps > 1):
+                if i > 0 and self.interpolation_substeps > 1:
                     prev_pos = ball_trajectory[i - 1]
                     interp = self._interpolate_positions(
                         prev_pos, ball_pos, self.interpolation_substeps
                     )
-                    # Skip first (=prev_pos, sudah dicek di iterasi sebelumnya)
-                    # dan last (=ball_pos, akan dicek sebagai posisi utama)
                     for ip in interp[1:-1]:
                         positions_to_check.append((ip, None))
 
-                # Cek semua posisi (utama + interpolasi)
                 frame_touched = False
                 for pos, bb in positions_to_check:
                     dist = self._compute_ball_cone_distance(pos, cone_pos, bb)
@@ -397,11 +472,8 @@ class DribbleDetector:
                     consecutive_count += 1
                     if first_touch == -1:
                         first_touch = i
-
                     if consecutive_count > max_consecutive:
                         max_consecutive = consecutive_count
-
-                    # === Temporal Filtering ===
                     if consecutive_count >= self.min_consecutive_touch_frames:
                         valid_touch = True
                 else:
@@ -429,7 +501,6 @@ class DribbleDetector:
         return None
 
     def _get_ball_bbox(self, tracks: Dict, frame_num: int) -> Optional[List[float]]:
-        """Ambil bounding box bola di frame tertentu."""
         ball_data = tracks['ball'][frame_num].get(1)
         if ball_data and 'bbox' in ball_data:
             return ball_data['bbox']
@@ -445,6 +516,95 @@ class DribbleDetector:
         return None
 
     # ============================================================
+    # AUTO-DETECT ARAH DRIBBLE DARI GERAKAN PEMAIN
+    # ============================================================
+
+    def _auto_detect_dribble_direction(
+        self,
+        tracks: Dict,
+        debug : bool = True
+    ) -> None:
+        total_frames = len(tracks['players'])
+        if total_frames < 10:
+            return
+
+        early_positions = []
+        for f in range(min(10, total_frames)):
+            result = self._get_player_pos(tracks, f)
+            if result:
+                early_positions.append(result[1])
+
+        late_positions = []
+        for f in range(max(0, total_frames - 10), total_frames):
+            result = self._get_player_pos(tracks, f)
+            if result:
+                late_positions.append(result[1])
+
+        if not early_positions or not late_positions:
+            if debug:
+                print("[DRIBBLE] Tidak bisa detect arah: pemain tidak ditemukan")
+            return
+
+        early_avg = (
+            float(np.mean([p[0] for p in early_positions])),
+            float(np.mean([p[1] for p in early_positions]))
+        )
+        late_avg = (
+            float(np.mean([p[0] for p in late_positions])),
+            float(np.mean([p[1] for p in late_positions]))
+        )
+
+        if debug:
+            print(f"[DRIBBLE] Posisi pemain awal : ({early_avg[0]:.0f}, {early_avg[1]:.0f})")
+            print(f"[DRIBBLE] Posisi pemain akhir: ({late_avg[0]:.0f}, {late_avg[1]:.0f})")
+
+        # Cari cone terdekat ke posisi awal dan akhir
+        best_entry_id = None
+        best_entry_dist = float('inf')
+        best_exit_id = None
+        best_exit_dist = float('inf')
+
+        for cid, cpos in self._stabilized_cones.items():
+            d_early = measure_distance(early_avg, cpos)
+            d_late = measure_distance(late_avg, cpos)
+
+            if d_early < best_entry_dist:
+                best_entry_dist = d_early
+                best_entry_id = cid
+            if d_late < best_exit_dist:
+                best_exit_dist = d_late
+                best_exit_id = cid
+
+        if best_entry_id is not None and best_exit_id is not None:
+            if debug:
+                print(f"[DRIBBLE] Entry cone terdekat: {best_entry_id} "
+                      f"(dist={best_entry_dist:.0f}px)")
+                print(f"[DRIBBLE] Exit cone terdekat : {best_exit_id} "
+                      f"(dist={best_exit_dist:.0f}px)")
+
+            entry_pos = self._stabilized_cones[best_entry_id]
+            exit_pos = self._stabilized_cones[best_exit_id]
+
+            dx = exit_pos[0] - entry_pos[0]
+            dy = exit_pos[1] - entry_pos[1]
+
+            if abs(dx) >= abs(dy):
+                if dx > 0:
+                    self.cone_order_direction = 'left_to_right'
+                else:
+                    self.cone_order_direction = 'right_to_left'
+            else:
+                if dy > 0:
+                    self.cone_order_direction = 'top_to_bottom'
+                else:
+                    self.cone_order_direction = 'bottom_to_top'
+
+            if debug:
+                print(f"[DRIBBLE] Arah dribble terdeteksi: {self.cone_order_direction}")
+
+            self._order_cones(debug=False)
+
+    # ============================================================
     # DETEKSI DRIBBLE ATTEMPTS (CORE)
     # ============================================================
 
@@ -454,16 +614,155 @@ class DribbleDetector:
         ball_possessions: List[int],
         debug           : bool = True
     ) -> List[Dict]:
-        """
-        Deteksi semua dribble attempt dan evaluasi sentuhan cone.
-
-        Returns:
-            List[Dict] dribble attempts
-        """
         if not self._stabilized_cones or len(self._ordered_cone_ids) < 2:
             print("[DRIBBLE] ERROR: Cone belum diinisialisasi atau < 2!")
             return []
 
+        total_frames = len(tracks['players'])
+        video_duration = total_frames / self.fps
+
+        if debug:
+            print(f"\n[DRIBBLE] === AUTO-DETECT ARAH DRIBBLE ===")
+        self._auto_detect_dribble_direction(tracks, debug)
+
+        mode = self.detection_mode
+        if mode == 'auto':
+            if video_duration <= self.auto_mode_max_duration_sec:
+                mode = 'whole_video'
+                if debug:
+                    print(f"[DRIBBLE] Video pendek ({video_duration:.1f}s "
+                          f"<= {self.auto_mode_max_duration_sec}s) → mode: whole_video")
+            else:
+                mode = 'entry_exit'
+                if debug:
+                    print(f"[DRIBBLE] Video panjang ({video_duration:.1f}s) → mode: entry_exit")
+
+        if mode == 'whole_video':
+            return self._detect_whole_video(tracks, ball_possessions, debug)
+        else:
+            return self._detect_entry_exit(tracks, ball_possessions, debug)
+
+    def _detect_whole_video(
+        self,
+        tracks          : Dict,
+        ball_possessions: List[int],
+        debug           : bool
+    ) -> List[Dict]:
+        total_frames = len(tracks['players'])
+
+        if debug:
+            print(f"\n[DRIBBLE] === DRIBBLE DETECTION (WHOLE VIDEO) ===")
+            print(f"[DRIBBLE] Total frames: {total_frames}")
+            print(f"[DRIBBLE] Total cones : {len(self._stabilized_cones)}")
+
+        ball_trajectory: List[Tuple[float, float]] = []
+        ball_bboxes: List[Optional[List[float]]] = []
+        frames_with_ball = 0
+        first_possession_frame = -1
+        last_possession_frame = -1
+        player_id_main = -1
+
+        for frame_num in range(total_frames):
+            ball_pos = self._get_ball_pos(tracks, frame_num)
+            ball_bbox = self._get_ball_bbox(tracks, frame_num)
+
+            has_ball = (
+                frame_num < len(ball_possessions) and
+                ball_possessions[frame_num] != -1
+            )
+
+            if ball_pos:
+                ball_trajectory.append(ball_pos)
+                ball_bboxes.append(ball_bbox)
+            else:
+                ball_trajectory.append(ball_trajectory[-1] if ball_trajectory else (0, 0))
+                ball_bboxes.append(None)
+
+            if has_ball:
+                frames_with_ball += 1
+                if first_possession_frame == -1:
+                    first_possession_frame = frame_num
+                last_possession_frame = frame_num
+
+                if player_id_main == -1:
+                    player_result = self._get_player_pos(tracks, frame_num)
+                    if player_result:
+                        player_id_main = player_result[0]
+
+        if first_possession_frame == -1 or not ball_trajectory:
+            if debug:
+                print("[DRIBBLE] Tidak ada possession terdeteksi!")
+            return []
+
+        cone_results = self.evaluate_trajectory_against_cones(
+            ball_trajectory, ball_bboxes
+        )
+
+        touched_cones = [
+            cid for cid, res in cone_results.items()
+            if res['touched']
+        ]
+
+        success = len(touched_cones) == 0
+        duration_frames = last_possession_frame - first_possession_frame + 1
+        possession_ratio = (
+            frames_with_ball / total_frames if total_frames > 0 else 0.0
+        )
+
+        attempt = {
+            'attempt_id'       : 1,
+            'player_id'        : player_id_main,
+            'frame_start'      : first_possession_frame,
+            'frame_end'        : last_possession_frame,
+            'duration_frames'  : duration_frames,
+            'duration_seconds' : round(duration_frames / self.fps, 2),
+            'success'          : success,
+            'total_cones'      : len(self._stabilized_cones),
+            'touched_cones'    : touched_cones,
+            'cone_details'     : cone_results,
+            'possession_ratio' : round(possession_ratio, 2),
+            'ball_trajectory'  : list(ball_trajectory),
+        }
+
+        if debug:
+            status = "SUKSES ✓" if success else "GAGAL ✗"
+            print(f"[DRIBBLE] Hasil: {status}")
+            print(f"[DRIBBLE]   Frame range  : {first_possession_frame}-{last_possession_frame}")
+            print(f"[DRIBBLE]   Durasi       : {duration_frames} frames "
+                  f"({duration_frames/self.fps:.1f}s)")
+            print(f"[DRIBBLE]   Possession   : {possession_ratio*100:.0f}%")
+            print(f"[DRIBBLE]   Cone disentuh: "
+                  f"{len(touched_cones)}/{len(self._stabilized_cones)}")
+            for cid in self._ordered_cone_ids:
+                res = cone_results[cid]
+                status_c = "HIT" if res['touched'] else "AMAN"
+                print(f"[DRIBBLE]     Cone {cid}: {status_c} - "
+                      f"min_dist={res['min_distance']:.1f}px "
+                      f"(radius={res['radius']:.0f}px, "
+                      f"touch_frames={res['touch_count']}, "
+                      f"consecutive={res['consecutive_max']})")
+
+        attempts = [attempt]
+
+        if debug:
+            sukses = sum(1 for a in attempts if a['success'])
+            gagal = sum(1 for a in attempts if not a['success'])
+            pct = sukses / len(attempts) * 100 if attempts else 0.0
+            print(f"\n[DRIBBLE] === HASIL AKHIR ===")
+            print(f"[DRIBBLE] Total attempts : {len(attempts)}")
+            print(f"[DRIBBLE] SUKSES         : {sukses}")
+            print(f"[DRIBBLE] GAGAL          : {gagal}")
+            print(f"[DRIBBLE] Akurasi        : {pct:.1f}%")
+            print(f"[DRIBBLE] =========================\n")
+
+        return attempts
+
+    def _detect_entry_exit(
+        self,
+        tracks          : Dict,
+        ball_possessions: List[int],
+        debug           : bool
+    ) -> List[Dict]:
         total_frames = len(tracks['players'])
         entry_cone_id = self._ordered_cone_ids[0]
         exit_cone_id = self._ordered_cone_ids[-1]
@@ -472,7 +771,7 @@ class DribbleDetector:
         max_attempt_frames = int(self.max_attempt_duration_sec * self.fps)
 
         if debug:
-            print(f"\n[DRIBBLE] === DRIBBLE DETECTION ===")
+            print(f"\n[DRIBBLE] === DRIBBLE DETECTION (ENTRY/EXIT) ===")
             print(f"[DRIBBLE] Total frames           : {total_frames}")
             print(f"[DRIBBLE] Total cones             : {len(self._stabilized_cones)}")
             print(f"[DRIBBLE] Entry cone {entry_cone_id}: "
@@ -480,13 +779,10 @@ class DribbleDetector:
             print(f"[DRIBBLE] Exit cone  {exit_cone_id}: "
                   f"({exit_pos[0]:.0f}, {exit_pos[1]:.0f})")
             print(f"[DRIBBLE] Entry/exit zone radius  : {self.entry_exit_zone_radius}px")
-            print(f"[DRIBBLE] Max attempt duration    : {self.max_attempt_duration_sec}s")
-            print(f"[DRIBBLE] Temporal filter         : {self.min_consecutive_touch_frames} frames")
 
         attempts: List[Dict] = []
         last_attempt_end = -999
 
-        # State machine
         state = 'idle'
         attempt_start_frame = -1
         attempt_player_id = -1
@@ -510,7 +806,6 @@ class DribbleDetector:
                 ball_possessions[frame_num] != -1
             )
 
-            # ---- STATE: IDLE ----
             if state == 'idle':
                 if has_ball and ball_pos:
                     dist_to_entry = measure_distance(player_pos, entry_pos)
@@ -529,7 +824,6 @@ class DribbleDetector:
                                 print(f"[DRIBBLE] Frame {frame_num}: "
                                       f"MASUK entry zone → MULAI DRIBBLE")
 
-            # ---- STATE: DRIBBLING ----
             elif state == 'dribbling':
                 attempt_total_frames += 1
 
@@ -540,17 +834,14 @@ class DribbleDetector:
                 if has_ball:
                     frames_with_ball += 1
 
-                # Cek apakah sampai exit zone
                 dist_to_exit = measure_distance(player_pos, exit_pos)
 
                 if dist_to_exit <= self.entry_exit_zone_radius:
                     duration_frames = frame_num - attempt_start_frame
 
                     if duration_frames >= self.min_attempt_frames:
-                        # Evaluasi sentuhan cone dengan peningkatan
                         cone_results = self.evaluate_trajectory_against_cones(
-                            ball_trajectory,
-                            ball_bboxes
+                            ball_trajectory, ball_bboxes
                         )
 
                         touched_cones = [
@@ -559,7 +850,6 @@ class DribbleDetector:
                         ]
 
                         success = len(touched_cones) == 0
-
                         possession_ratio = (
                             frames_with_ball / attempt_total_frames
                             if attempt_total_frames > 0 else 0.0
@@ -583,43 +873,20 @@ class DribbleDetector:
                         last_attempt_end = frame_num
 
                         if debug:
-                            status = "SUKSES ✓" if success else "GAGAL ✗"
-                            print(f"[DRIBBLE] Frame {frame_num}: "
-                                  f"SELESAI → {status}")
-                            print(f"[DRIBBLE]   Durasi       : "
-                                  f"{duration_frames} frames "
-                                  f"({duration_frames/self.fps:.1f}s)")
+                            status_text = "SUKSES ✓" if success else "GAGAL ✗"
+                            print(f"[DRIBBLE] Frame {frame_num}: SELESAI → {status_text}")
                             print(f"[DRIBBLE]   Cone disentuh: "
                                   f"{len(touched_cones)}/{len(self._stabilized_cones)}")
-                            for tc in touched_cones:
-                                d = cone_results[tc]['min_distance']
-                                r = cone_results[tc]['radius']
-                                cnt = cone_results[tc]['touch_count']
-                                consec = cone_results[tc]['consecutive_max']
-                                print(f"[DRIBBLE]     Cone {tc}: "
-                                      f"min_dist={d:.1f}px "
-                                      f"(radius={r:.0f}px, "
-                                      f"{cnt} frame total, "
-                                      f"max_consecutive={consec})")
-                            print(f"[DRIBBLE]   Possession   : "
-                                  f"{possession_ratio*100:.0f}%")
-                    else:
-                        if debug:
-                            print(f"[DRIBBLE] Frame {frame_num}: "
-                                  f"attempt terlalu singkat "
-                                  f"({duration_frames} < {self.min_attempt_frames})")
 
                     state = 'idle'
                     continue
 
-                # Timeout
                 if attempt_total_frames > max_attempt_frames:
                     if debug:
                         print(f"[DRIBBLE] Frame {frame_num}: TIMEOUT → reset")
                     state = 'idle'
                     continue
 
-                # Kehilangan bola
                 if attempt_total_frames > 20:
                     current_ratio = frames_with_ball / attempt_total_frames
                     if current_ratio < self.min_possession_ratio:
@@ -629,7 +896,6 @@ class DribbleDetector:
                         state = 'idle'
                         continue
 
-        # Summary
         if debug:
             sukses = sum(1 for a in attempts if a['success'])
             gagal = sum(1 for a in attempts if not a['success'])

@@ -1,6 +1,4 @@
 # main.py
-# Pipeline utama: baca video -> deteksi -> tracking -> analisis dribbling -> render -> simpan
-# Versi simplified: 1 pemain, tanpa jersey mapping
 
 import os
 import sys
@@ -40,13 +38,16 @@ CONFIG = {
     "fps"         : 30,
 
     # ============================================================
+    # KONFIGURASI CONE RADIUS — DIKECILKAN
+    # ============================================================
+    "cone_radius_multiplier"  : 0.8,     # 1.5 → 0.8
+    "default_cone_radius"     : 25.0,    # 40 → 25
+    "min_cone_radius"         : 15.0,    # 20 → 15
+    "max_cone_radius"         : 40.0,    # 80 → 40
+
+    # ============================================================
     # KONFIGURASI DRIBBLE
     # ============================================================
-    "cone_radius_multiplier"  : 1.5,
-    "default_cone_radius"     : 40.0,
-    "min_cone_radius"         : 20.0,
-    "max_cone_radius"         : 80.0,
-
     "entry_exit_zone_radius"  : 150.0,
     "min_attempt_frames"      : 15,
     "cooldown_frames"         : 30,
@@ -54,22 +55,28 @@ CONFIG = {
     "cone_order_direction"    : "auto",
 
     # ============================================================
+    # MODE DETEKSI DRIBBLE
+    # ============================================================
+    "detection_mode"              : "auto",
+    "auto_mode_max_duration_sec"  : 10.0,
+
+    # ============================================================
     # KONFIGURASI POSSESSION
     # ============================================================
     "max_possession_distance" : 130,
 
     # ============================================================
-    # KONFIGURASI DETEKSI SENTUHAN (BARU)
+    # KONFIGURASI DETEKSI SENTUHAN
     # ============================================================
-    # Minimum consecutive frames bola harus di dalam radius cone
-    # agar dianggap menyentuh cone. Nilai 1 = tanpa filter.
     "min_consecutive_touch_frames": 2,
+    "use_ball_edge_distance"      : True,
+    "interpolation_substeps"      : 3,
 
-    # Gunakan edge bola (bukan hanya center) untuk hitung jarak
-    "use_ball_edge_distance": True,
-
-    # Jumlah sub-step interpolasi antar frame
-    "interpolation_substeps": 3,
+    # ============================================================
+    # KONFIGURASI STABILISASI CONE — BARU
+    # ============================================================
+    "min_cone_appearance_ratio": 0.01,   # 5% → 1% (tangkap semua cone)
+    "cone_dedup_distance"      : 50.0,   # Merge cone < 50px (hapus duplikat)
 
     # ============================================================
     # VISUALISASI
@@ -78,7 +85,7 @@ CONFIG = {
     "show_stats_panel"   : True,
     "debug_trajectory"   : True,
     "show_dribble_status": True,
-    "result_flash_frames": 45,   # durasi flash SUKSES/GAGAL dalam frame
+    "result_flash_frames": 45,
 }
 
 
@@ -105,7 +112,6 @@ def compute_progressive_stats(
     detected_attempts: List[Dict],
     up_to_frame      : int
 ) -> Dict:
-    """Hitung statistik kumulatif dari attempt yang sudah selesai."""
     attempts_so_far = [
         a for a in detected_attempts
         if a['frame_end'] <= up_to_frame
@@ -204,13 +210,11 @@ def render_frames(
 
     rolling_trajectory: List = []
 
-    # Pre-compute: frame ranges per attempt untuk highlight
     attempt_frame_map: Dict[int, Dict] = {}
     for a in detected_attempts:
         for f in range(a['frame_start'], a['frame_end'] + 1):
             attempt_frame_map[f] = a
 
-    # Pre-compute: result flash frames
     flash_frames: Dict[int, Dict] = {}
     flash_duration = config.get("result_flash_frames", 45)
     for a in detected_attempts:
@@ -226,7 +230,6 @@ def render_frames(
 
         annotated = frame.copy()
 
-        # Cek apakah frame ini termasuk dalam dribble attempt
         active_attempt = attempt_frame_map.get(frame_num)
         touched_cones_now = []
         if active_attempt:
@@ -290,7 +293,7 @@ def render_frames(
                 if len(rolling_trajectory) > 60:
                     rolling_trajectory.pop(0)
 
-        # 4. Trajectory bola (debug)
+        # 4. Trajectory bola
         if config.get("debug_trajectory", False) and len(rolling_trajectory) > 1:
             annotated = draw_ball_trajectory_on_frame(
                 annotated,
@@ -308,7 +311,7 @@ def render_frames(
                 duration_sec = (frame_num - active_attempt['frame_start']) / config.get('fps', 30),
             )
 
-        # 6. Result flash (SUKSES/GAGAL) setelah attempt selesai
+        # 6. Result flash
         flash_attempt = flash_frames.get(frame_num)
         if flash_attempt and frame_num >= flash_attempt['frame_end']:
             annotated = draw_result_flash(
@@ -358,7 +361,7 @@ def main():
         CONFIG["debug_trajectory"] = True
 
     print("\n" + "=" * 70)
-    print("   FOOTBALL DRIBBLING ANALYTICS v2.0")
+    print("   FOOTBALL DRIBBLING ANALYTICS v2.1")
     print("   Cone Touch Detection — Enhanced Logic")
     print("=" * 70)
     print(f"  Input             : {CONFIG['input_video']}")
@@ -366,8 +369,11 @@ def main():
     print(f"  Model             : {CONFIG['model_path']}")
     print(f"  Gunakan cache     : {'Ya' if CONFIG['use_stub'] else 'Tidak'}")
     print(f"  Cone radius       : multiplier={CONFIG['cone_radius_multiplier']}, "
-          f"default={CONFIG['default_cone_radius']}px")
+          f"default={CONFIG['default_cone_radius']}px, "
+          f"range=[{CONFIG['min_cone_radius']}, {CONFIG['max_cone_radius']}]")
+    print(f"  Cone dedup dist   : {CONFIG['cone_dedup_distance']}px")
     print(f"  Possession dist   : {CONFIG['max_possession_distance']}px")
+    print(f"  Detection mode    : {CONFIG['detection_mode']}")
     print(f"  Temporal filter   : {CONFIG['min_consecutive_touch_frames']} frames")
     print(f"  Ball edge dist    : {'Ya' if CONFIG['use_ball_edge_distance'] else 'Tidak'}")
     print(f"  Interpolation     : {CONFIG['interpolation_substeps']} substeps")
@@ -414,7 +420,7 @@ def main():
 
     dribble_detector = DribbleDetector(fps=fps)
 
-    # Transfer config ke detector
+    # Transfer SEMUA config ke detector
     dribble_detector.cone_radius_multiplier       = CONFIG["cone_radius_multiplier"]
     dribble_detector.default_cone_radius          = CONFIG["default_cone_radius"]
     dribble_detector.min_cone_radius              = CONFIG["min_cone_radius"]
@@ -426,9 +432,14 @@ def main():
     dribble_detector.min_consecutive_touch_frames = CONFIG["min_consecutive_touch_frames"]
     dribble_detector.use_ball_edge_distance       = CONFIG["use_ball_edge_distance"]
     dribble_detector.interpolation_substeps       = CONFIG["interpolation_substeps"]
+    dribble_detector.detection_mode               = CONFIG["detection_mode"]
+    dribble_detector.auto_mode_max_duration_sec   = CONFIG["auto_mode_max_duration_sec"]
+    dribble_detector.min_cone_appearance_ratio    = CONFIG["min_cone_appearance_ratio"]
+    dribble_detector.cone_dedup_distance          = CONFIG["cone_dedup_distance"]
 
+    # sample_frames=-1 → scan SEMUA frame
     cone_ok = dribble_detector.initialize_cones(
-        tracks, cone_key='cones', sample_frames=30, debug=True
+        tracks, cone_key='cones', sample_frames=-1, debug=True
     )
 
     if not cone_ok:
