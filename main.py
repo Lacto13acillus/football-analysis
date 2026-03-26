@@ -388,7 +388,7 @@ def main():
     print(f"  Detection mode    : {CONFIG['detection_mode']}")
     # print(f"  Temporal filter   : {CONFIG['min_consecutive_touch_frames']} frames")
     # print(f"  Ball edge dist    : {'Ya' if CONFIG['use_ball_edge_distance'] else 'Tidak'}")
-    print(f"  Interpolation     : {CONFIG['interpolation_substeps']} substeps")
+    # print(f"  Interpolation     : {CONFIG['interpolation_substeps']} substeps")
     print("=" * 70)
 
     # ==========================================================
