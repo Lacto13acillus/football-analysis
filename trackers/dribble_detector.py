@@ -65,7 +65,7 @@ class DribbleDetector:
         self.use_cone_displacement: bool = True
         # Jika posisi cone bergeser > threshold ini (px) dalam window,
         # dianggap tertabrak
-        self.cone_displacement_threshold: float = 12.0
+        self.cone_displacement_threshold: float = 20.0
         # Window frame untuk mendeteksi displacement
         self.cone_displacement_window: int = 3
         # Bola harus dekat cone (px) saat displacement terjadi
@@ -75,9 +75,10 @@ class DribbleDetector:
         self.use_bbox_overlap: bool = True
         # Padding negatif pada cone bbox (shrink) — makin besar,
         # makin ketat (hanya overlap yang benar-benar nyata)
-        self.bbox_overlap_shrink: float = 3.0
+        self.bbox_overlap_shrink: float = 5.0
         # Minimum jumlah frame bbox overlap berturut-turut
-        self.min_overlap_consecutive_frames: int = 2
+        self.min_overlap_consecutive_frames: int = 3
+        self.bbox_overlap_min_iou: float = 0.05
 
         # --- Metode 3: Ball Speed Anomaly ---
         self.use_speed_anomaly: bool = True
@@ -461,10 +462,12 @@ class DribbleDetector:
     ) -> Dict[int, Dict[str, Any]]:
         """
         Deteksi cone yang tertabrak berdasarkan pergeseran posisi bbox.
-        
-        Cone yang ditabrak akan bergeser posisinya secara tiba-tiba.
-        Kita track posisi setiap cone per frame dan cari displacement
-        yang signifikan.
+
+        PERBAIKAN:
+        - Track displacement per RAW cone ID secara terpisah,
+          bukan campur semua raw ID dalam cluster yang sama.
+        - Ini mencegah false positive dari tracker ID switching.
+        - Gunakan median posisi sebagai baseline, bukan frame-to-frame.
         """
         if not self._stabilized_cones:
             return {}
@@ -480,10 +483,8 @@ class DribbleDetector:
             for cid in self._stabilized_cones
         }
 
-        # Kumpulkan posisi cone per frame, grouped by stabilized cone ID
-        cone_frame_positions: Dict[int, Dict[int, Tuple[float, float]]] = {
-            cid: {} for cid in self._stabilized_cones
-        }
+        # Kumpulkan posisi per RAW cone ID (bukan per stabilized)
+        raw_cone_positions: Dict[int, Dict[int, Tuple[float, float]]] = {}
 
         for f in range(total_frames):
             if cone_key not in tracks or f >= len(tracks[cone_key]):
@@ -493,46 +494,45 @@ class DribbleDetector:
                 if bbox is None:
                     continue
                 pos = get_center_of_bbox_bottom(bbox)
-                # Match ke stabilized cone terdekat
-                for scid, spos in self._stabilized_cones.items():
-                    # Cek apakah raw_id termasuk dalam mapping cone ini
-                    if raw_cone_id in self._cone_id_mapping.get(scid, []):
-                        cone_frame_positions[scid][f] = pos
-                        break
-                    # Fallback: cek jarak
-                    dist = measure_distance(pos, spos)
-                    if dist < self.cone_dedup_distance * 1.5:
-                        cone_frame_positions[scid][f] = pos
-                        break
+                if raw_cone_id not in raw_cone_positions:
+                    raw_cone_positions[raw_cone_id] = {}
+                raw_cone_positions[raw_cone_id][f] = pos
 
-        # Cek displacement per cone
         window = self.cone_displacement_window
         threshold = self.cone_displacement_threshold
 
-        for scid, frame_positions in cone_frame_positions.items():
-            if len(frame_positions) < 2:
-                continue
+        # Per stabilized cone, cek displacement dari SETIAP raw ID-nya
+        for scid, raw_ids in self._cone_id_mapping.items():
+            best_displacement = 0.0
+            best_frame = -1
+            best_ball_nearby = False
 
-            sorted_frames = sorted(frame_positions.keys())
+            for raw_id in raw_ids:
+                if raw_id not in raw_cone_positions:
+                    continue
 
-            for i in range(len(sorted_frames)):
-                f_current = sorted_frames[i]
-                pos_current = frame_positions[f_current]
+                frame_positions = raw_cone_positions[raw_id]
+                if len(frame_positions) < 3:
+                    continue
 
-                # Bandingkan dengan posisi di frame-frame sebelumnya
-                # dalam window
-                for j in range(max(0, i - window), i):
-                    f_prev = sorted_frames[j]
-                    pos_prev = frame_positions[f_prev]
+                sorted_frames = sorted(frame_positions.keys())
 
-                    displacement = measure_distance(pos_current, pos_prev)
+                # Hitung baseline posisi (median dari semua posisi raw ID ini)
+                all_x = [frame_positions[f][0] for f in sorted_frames]
+                all_y = [frame_positions[f][1] for f in sorted_frames]
+                baseline_pos = (float(np.median(all_x)), float(np.median(all_y)))
 
-                    if displacement > threshold:
-                        # Cek apakah bola dekat saat itu
+                # Cek setiap frame: apakah posisi menyimpang jauh dari baseline?
+                for f in sorted_frames:
+                    pos = frame_positions[f]
+                    deviation = measure_distance(pos, baseline_pos)
+
+                    if deviation > threshold and deviation > best_displacement:
+                        # Cek apakah bola dekat saat displacement
                         ball_nearby = False
                         for bf in range(
-                            max(0, f_prev - 2),
-                            min(total_frames, f_current + 3)
+                            max(0, f - 3),
+                            min(total_frames, f + 4)
                         ):
                             ball_pos = self._get_ball_pos(tracks, bf)
                             if ball_pos:
@@ -544,20 +544,25 @@ class DribbleDetector:
                                     ball_nearby = True
                                     break
 
-                        if displacement > results[scid]['max_displacement']:
-                            results[scid]['max_displacement'] = displacement
-                            results[scid]['displacement_frame'] = f_current
-                            results[scid]['ball_nearby'] = ball_nearby
+                        best_displacement = deviation
+                        best_frame = f
+                        best_ball_nearby = ball_nearby
 
-                            if ball_nearby:
-                                results[scid]['displaced'] = True
+            results[scid]['max_displacement'] = best_displacement
+            results[scid]['displacement_frame'] = best_frame
+            results[scid]['ball_nearby'] = best_ball_nearby
+
+            if best_displacement > threshold and best_ball_nearby:
+                results[scid]['displaced'] = True
 
         if debug:
             print(f"[DRIBBLE] --- Cone Displacement Results ---")
+            print(f"[DRIBBLE]   Threshold: {threshold}px (per raw ID, baseline=median)")
             for cid in self._ordered_cone_ids:
                 r = results[cid]
                 status = "DISPLACED!" if r['displaced'] else "stable"
-                print(f"[DRIBBLE]   Cone {cid}: {status} "
+                raw_ids = self._cone_id_mapping.get(cid, [])
+                print(f"[DRIBBLE]   Cone {cid} (raw={raw_ids}): {status} "
                       f"(max_shift={r['max_displacement']:.1f}px, "
                       f"frame={r['displacement_frame']}, "
                       f"ball_near={r['ball_nearby']})")
@@ -576,9 +581,12 @@ class DribbleDetector:
     ) -> Dict[int, Dict[str, Any]]:
         """
         Deteksi sentuhan berdasarkan overlap bounding box bola dan cone.
-        
-        Lebih akurat dari radius: hanya trigger saat bbox benar-benar
-        bersinggungan. Shrink cone bbox untuk menghindari false positive.
+
+        PERBAIKAN untuk zig-zag:
+        - Gunakan IoU (Intersection over Union) bukan hanya any overlap
+        - Minimum IoU threshold untuk menghindari false positive
+          dari bola yang lewat sangat dekat tapi tidak benar-benar menabrak
+        - Shrink cone bbox lebih agresif
         """
         if not self._stabilized_cones:
             return {}
@@ -586,22 +594,24 @@ class DribbleDetector:
         total_frames = len(tracks.get(cone_key, []))
         shrink = self.bbox_overlap_shrink
         min_consec = self.min_overlap_consecutive_frames
+        min_iou = self.bbox_overlap_min_iou
 
         results: Dict[int, Dict[str, Any]] = {
             cid: {
                 'overlapped': False,
                 'overlap_count': 0,
                 'max_consecutive': 0,
+                'max_iou': 0.0,
                 'first_overlap_frame': -1,
             }
             for cid in self._stabilized_cones
         }
 
-        # Per frame, cek overlap
-        consecutive: Dict[int, int] = {cid: 0 for cid in self._stabilized_cones}
+        consecutive: Dict[int, int] = {
+            cid: 0 for cid in self._stabilized_cones
+        }
 
         for f in range(total_frames):
-            # Dapatkan ball bbox
             ball_bbox = self._get_ball_bbox(tracks, f)
             if ball_bbox is None:
                 for cid in self._stabilized_cones:
@@ -610,14 +620,13 @@ class DribbleDetector:
 
             bx1, by1, bx2, by2 = ball_bbox
 
-            # Dapatkan semua cone bboxes di frame ini
+            # Dapatkan cone bboxes di frame ini
             cone_bboxes_this_frame: Dict[int, List[float]] = {}
             if cone_key in tracks and f < len(tracks[cone_key]):
                 for raw_cone_id, cone_data in tracks[cone_key][f].items():
                     cbbox = cone_data.get('bbox')
                     if cbbox is None:
                         continue
-                    # Match ke stabilized cone
                     pos = get_center_of_bbox_bottom(cbbox)
                     for scid, spos in self._stabilized_cones.items():
                         if raw_cone_id in self._cone_id_mapping.get(scid, []):
@@ -628,7 +637,6 @@ class DribbleDetector:
                             cone_bboxes_this_frame[scid] = cbbox
                             break
 
-            # Cek overlap per stabilized cone
             for scid in self._stabilized_cones:
                 if scid not in cone_bboxes_this_frame:
                     consecutive[scid] = 0
@@ -646,39 +654,56 @@ class DribbleDetector:
                     consecutive[scid] = 0
                     continue
 
-                # Cek intersection
+                # Hitung intersection
                 ix1 = max(bx1, cx1)
                 iy1 = max(by1, cy1)
                 ix2 = min(bx2, cx2)
                 iy2 = min(by2, cy2)
 
                 if ix1 < ix2 and iy1 < iy2:
-                    # Ada overlap!
-                    results[scid]['overlap_count'] += 1
-                    consecutive[scid] += 1
+                    intersection = (ix2 - ix1) * (iy2 - iy1)
+                    ball_area = max(1, (bx2 - bx1) * (by2 - by1))
+                    cone_area = max(1, (cx2 - cx1) * (cy2 - cy1))
+                    union = ball_area + cone_area - intersection
+                    iou = intersection / union if union > 0 else 0.0
 
-                    if results[scid]['first_overlap_frame'] == -1:
-                        results[scid]['first_overlap_frame'] = f
+                    # Track max IoU
+                    if iou > results[scid]['max_iou']:
+                        results[scid]['max_iou'] = iou
 
-                    if consecutive[scid] > results[scid]['max_consecutive']:
-                        results[scid]['max_consecutive'] = consecutive[scid]
+                    # Hanya hitung sebagai overlap jika IoU cukup tinggi
+                    if iou >= min_iou:
+                        results[scid]['overlap_count'] += 1
+                        consecutive[scid] += 1
 
-                    if consecutive[scid] >= min_consec:
-                        results[scid]['overlapped'] = True
+                        if results[scid]['first_overlap_frame'] == -1:
+                            results[scid]['first_overlap_frame'] = f
+
+                        if consecutive[scid] > results[scid]['max_consecutive']:
+                            results[scid]['max_consecutive'] = consecutive[scid]
+
+                        if consecutive[scid] >= min_consec:
+                            results[scid]['overlapped'] = True
+                    else:
+                        consecutive[scid] = 0
                 else:
                     consecutive[scid] = 0
 
         if debug:
             print(f"[DRIBBLE] --- BBox Overlap Results ---")
+            print(f"[DRIBBLE]   Shrink={shrink}px, min_IoU={min_iou}, "
+                  f"min_consec={min_consec}")
             for cid in self._ordered_cone_ids:
                 r = results[cid]
                 status = "OVERLAP!" if r['overlapped'] else "clear"
                 print(f"[DRIBBLE]   Cone {cid}: {status} "
                       f"(count={r['overlap_count']}, "
                       f"max_consec={r['max_consecutive']}, "
+                      f"max_iou={r['max_iou']:.3f}, "
                       f"first_frame={r['first_overlap_frame']})")
 
         return results
+
 
     # ============================================================
     # === BARU: METODE 3 — BALL SPEED ANOMALY ===

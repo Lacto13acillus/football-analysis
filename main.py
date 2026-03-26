@@ -31,7 +31,7 @@ from utils.bbox_utils import get_center_of_bbox_bottom
 
 CONFIG = {
     "input_video" : "input_videos/dribbling_count.mp4",
-    "output_video": "output_videos/dribbling_count.avi",
+    "output_video": "output_videos/dribbling_count2.avi",
     "model_path"  : "/home/dika/football-analysis/models/best.pt",
     "stub_path"   : "stubs/tracks_cache_dribble.pkl",
     "use_stub"    : False,
@@ -72,14 +72,15 @@ CONFIG = {
     # ============================================================
     # Metode 1: Cone displacement (cone bergeser = tertabrak)
     "use_cone_displacement"          : True,
-    "cone_displacement_threshold"    : 12.0,   # px pergeseran minimum
+    "cone_displacement_threshold"    : 20.0,   # px pergeseran minimum
     "cone_displacement_window"       : 3,      # frame window
     "cone_displacement_ball_proximity": 150.0, # bola harus dekat
 
     # Metode 2: BBox overlap (bbox bola tumpang tindih bbox cone)
     "use_bbox_overlap"               : True,
-    "bbox_overlap_shrink"            : 3.0,    # shrink cone bbox (px)
-    "min_overlap_consecutive_frames" : 2,      # frame berturut-turut
+    "bbox_overlap_shrink"            : 5.0,    # shrink cone bbox (px)
+    "min_overlap_consecutive_frames" : 3,      # frame berturut-turut
+    "bbox_overlap_min_iou"           : 0.05,   # ← BARU
 
     # Metode 3: Ball speed anomaly (bola melambat dekat cone)
     "use_speed_anomaly"              : True,
@@ -458,7 +459,7 @@ def main():
 
     dribble_detector = DribbleDetector(fps=fps)
 
-        # Transfer parameter BARU ke detector
+     # Transfer parameter BARU ke detector
     dribble_detector.expected_num_cones              = CONFIG.get("expected_num_cones", None)
     dribble_detector.use_cone_displacement           = CONFIG["use_cone_displacement"]
     dribble_detector.cone_displacement_threshold     = CONFIG["cone_displacement_threshold"]
@@ -472,6 +473,8 @@ def main():
     dribble_detector.speed_anomaly_proximity         = CONFIG["speed_anomaly_proximity"]
     dribble_detector.speed_avg_window                = CONFIG["speed_avg_window"]
     dribble_detector.min_methods_agree               = CONFIG["min_methods_agree"]
+    dribble_detector.bbox_overlap_min_iou            = CONFIG["bbox_overlap_min_iou"]
+
 
 
     # sample_frames=-1 → scan SEMUA frame
