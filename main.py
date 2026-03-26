@@ -88,7 +88,7 @@ CONFIG = {
     "speed_avg_window"               : 10,     # window rata-rata
 
     # Kombinasi: min berapa metode harus setuju
-    "min_methods_agree"              : 1,      # 1 = salah satu cukup
+    "min_methods_agree"              : 2,      # 1 = salah satu cukup
 
     # ============================================================
     # VISUALISASI
@@ -168,7 +168,9 @@ def print_dribble_details(attempts: List[Dict], stats: Dict) -> None:
 
     if stats.get('cone_hit_frequency'):
         print("  Cone Paling Sering Disentuh:")
-        for cid, cnt in sorted(stats['cone_hit_frequency'].items(), key=lambda x: -x[1]):
+        for cid, cnt in sorted(
+            stats['cone_hit_frequency'].items(), key=lambda x: -x[1]
+        ):
             print(f"    Cone {cid}: {cnt}x disentuh")
         print("-" * 70)
 
@@ -193,12 +195,36 @@ def print_dribble_details(attempts: List[Dict], stats: Dict) -> None:
 
         if a['touched_cones']:
             for tc in a['touched_cones']:
-                d = a['cone_details'][tc]['min_distance']
-                r = a['cone_details'][tc]['radius']
-                consec = a['cone_details'][tc].get('consecutive_max', 0)
-                print(f"         └─ Cone {tc}: min_dist={d:.1f}px "
-                      f"(radius={r:.1f}px, consecutive={consec})")
+                detail = a['cone_details'].get(tc, {})
+                votes = detail.get('votes', 0)
+                methods = detail.get('methods_triggered', [])
+                methods_str = ", ".join(methods) if methods else "-"
+
+                # Info per metode
+                extra_info = []
+                disp = detail.get('displacement', {})
+                if disp.get('displaced'):
+                    extra_info.append(
+                        f"shift={disp.get('max_displacement', 0):.0f}px"
+                    )
+                overlap = detail.get('bbox_overlap', {})
+                if overlap.get('overlapped'):
+                    extra_info.append(
+                        f"overlap={overlap.get('overlap_count', 0)}f"
+                    )
+                speed = detail.get('speed_anomaly', {})
+                if speed.get('speed_anomaly'):
+                    extra_info.append(
+                        f"speed_min={speed.get('min_speed_near_cone', 0):.1f}"
+                    )
+
+                extra_str = (
+                    " (" + ", ".join(extra_info) + ")" if extra_info else ""
+                )
+                print(f"         └─ Cone {tc}: votes={votes} "
+                      f"[{methods_str}]{extra_str}")
     print()
+
 
 
 # ============================================================

@@ -692,9 +692,11 @@ class DribbleDetector:
         """
         Deteksi sentuhan berdasarkan perlambatan tiba-tiba bola
         saat berada dekat cone.
-        
-        Jika bola menabrak cone, kecepatannya akan drop secara
-        signifikan dibanding rata-rata.
+
+        PERBAIKAN:
+        - Abaikan speed=0 (artefak interpolasi)
+        - Gunakan median bukan mean untuk average (lebih robust)
+        - Cek speed drop harus sustained (bukan 1 frame saja)
         """
         if not self._stabilized_cones:
             return {}
@@ -710,11 +712,12 @@ class DribbleDetector:
             for cid in self._stabilized_cones
         }
 
-        # Hitung ball speed per frame
+        # Hitung ball positions
         ball_positions: List[Optional[Tuple[float, float]]] = []
         for f in range(total_frames):
             ball_positions.append(self._get_ball_pos(tracks, f))
 
+        # Hitung ball speed per frame
         ball_speeds: List[float] = [0.0]
         for f in range(1, total_frames):
             if ball_positions[f] and ball_positions[f - 1]:
@@ -723,47 +726,70 @@ class DribbleDetector:
             else:
                 ball_speeds.append(0.0)
 
-        # Hitung running average speed
-        avg_window = self.speed_avg_window
-        overall_speeds = [s for s in ball_speeds if s > 0]
-        if not overall_speeds:
+        # Hitung global average speed — ABAIKAN speed=0
+        valid_speeds = [s for s in ball_speeds if s > 1.0]  # threshold > 1px
+        if not valid_speeds or len(valid_speeds) < 5:
+            if debug:
+                print(f"[DRIBBLE] Speed anomaly: tidak cukup data speed valid")
             return results
 
-        global_avg_speed = float(np.mean(overall_speeds))
+        global_avg_speed = float(np.median(valid_speeds))  # Median lebih robust
 
-        # Per cone, cek apakah ada speed drop saat bola dekat
+        # Per cone, cek apakah ada SUSTAINED speed drop saat bola dekat
         proximity = self.speed_anomaly_proximity
         drop_ratio = self.speed_drop_ratio
+        min_slow_frames = 3  # Harus lambat minimal 3 frame berturut-turut
 
         for scid, cone_pos in self._stabilized_cones.items():
             min_speed_near = float('inf')
             anomaly_frame = -1
+            consecutive_slow = 0
+            max_consecutive_slow = 0
 
             for f in range(total_frames):
                 if ball_positions[f] is None:
+                    consecutive_slow = 0
                     continue
 
                 dist_to_cone = measure_distance(ball_positions[f], cone_pos)
                 if dist_to_cone > proximity:
+                    consecutive_slow = 0
                     continue
 
-                # Bola dekat cone — cek speed
+                # Bola dekat cone
                 speed = ball_speeds[f]
 
-                # Hitung local average speed (window sebelumnya)
-                start_w = max(0, f - avg_window)
-                local_speeds = [
-                    ball_speeds[k] for k in range(start_w, f) if ball_speeds[k] > 0
-                ]
-                local_avg = float(np.mean(local_speeds)) if local_speeds else global_avg_speed
+                # Abaikan speed=0 (artefak interpolasi/duplikat frame)
+                if speed < 1.0:
+                    continue
 
+                # Track minimum speed
                 if speed < min_speed_near:
                     min_speed_near = speed
-                    anomaly_frame = f
 
-                # Cek apakah speed drop signifikan
+                # Hitung local average (window sebelumnya, abaikan 0)
+                start_w = max(0, f - self.speed_avg_window)
+                local_speeds = [
+                    ball_speeds[k]
+                    for k in range(start_w, f)
+                    if ball_speeds[k] > 1.0
+                ]
+                local_avg = (
+                    float(np.median(local_speeds))
+                    if len(local_speeds) >= 3
+                    else global_avg_speed
+                )
+
+                # Cek speed drop
                 if local_avg > 0 and speed < local_avg * drop_ratio:
-                    results[scid]['speed_anomaly'] = True
+                    consecutive_slow += 1
+                    if consecutive_slow > max_consecutive_slow:
+                        max_consecutive_slow = consecutive_slow
+                        anomaly_frame = f
+                    if consecutive_slow >= min_slow_frames:
+                        results[scid]['speed_anomaly'] = True
+                else:
+                    consecutive_slow = 0
 
             results[scid]['min_speed_near_cone'] = (
                 min_speed_near if min_speed_near != float('inf') else 0.0
@@ -773,7 +799,8 @@ class DribbleDetector:
 
         if debug:
             print(f"[DRIBBLE] --- Speed Anomaly Results ---")
-            print(f"[DRIBBLE]   Global avg speed: {global_avg_speed:.1f}px/frame")
+            print(f"[DRIBBLE]   Global median speed: {global_avg_speed:.1f}px/frame")
+            print(f"[DRIBBLE]   Min slow frames: {min_slow_frames}")
             for cid in self._ordered_cone_ids:
                 r = results[cid]
                 status = "ANOMALY!" if r['speed_anomaly'] else "normal"
