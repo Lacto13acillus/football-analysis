@@ -30,8 +30,8 @@ from utils.bbox_utils import get_center_of_bbox_bottom
 # ============================================================
 
 CONFIG = {
-    "input_video" : "input_videos/dribbling_count3.mp4",
-    "output_video": "output_videos/dribbling_count4.avi",
+    "input_video" : "input_videos/dribbling_count4.mp4",
+    "output_video": "output_videos/dribbling_count5.avi",
     "model_path"  : "/home/dika/football-analysis/models/best.pt",
     "stub_path"   : "stubs/tracks_cache_dribble.pkl",
     "use_stub"    : False,
