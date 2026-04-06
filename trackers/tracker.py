@@ -1,455 +1,565 @@
-# tracker.py
-import pickle
+# trackers/tracker.py
+# Tracker untuk heading detection project.
+# Mendukung 3 class dari YOLO:
+#   0: Heading (kepala pemain)
+#   1: ball
+#   2: player
+
 import os
 import sys
 import cv2
+import pickle
 import numpy as np
-import supervision as sv
 from ultralytics import YOLO
-from typing import Dict, List, Any, Optional, Tuple
+from typing import List, Dict, Optional, Any
 
 sys.path.append('../')
-from utils.bbox_utils import (
-    get_center_of_bbox,
-    get_center_of_bbox_bottom,
-    get_bbox_width,
-    interpolate_ball_positions,
-    measure_distance
-)
+
+# ============================================================
+# Supervision untuk tracking (opsional, fallback manual jika tidak ada)
+# ============================================================
+try:
+    import supervision as sv
+    HAS_SUPERVISION = True
+except ImportError:
+    HAS_SUPERVISION = False
+    print("[TRACKER] WARNING: supervision belum terinstall. "
+          "Tracking akan menggunakan mode sederhana (tanpa ByteTrack).")
 
 
 class Tracker:
-    def __init__(self, model_path: str):
-        """
-        Inisialisasi YOLO model dan ByteTrack tracker.
+    """
+    Tracker utama: deteksi objek dengan YOLO + tracking per frame.
 
+    Class mapping (sesuai data.yaml):
+        0 → Heading (bbox kepala pemain)
+        1 → ball
+        2 → player
+    """
+
+    # Class ID mapping
+    CLASS_HEADING = 0
+    CLASS_BALL    = 1
+    CLASS_PLAYER  = 2
+
+    CLASS_NAMES = {
+        0: 'Heading',
+        1: 'ball',
+        2: 'player',
+    }
+
+    def __init__(
+        self,
+        model_path: str,
+        conf_threshold: float = 0.25,
+        iou_threshold: float = 0.5,
+    ):
+        """
         Args:
-            model_path: path ke file model YOLOv8 (.pt)
+            model_path: Path ke model YOLO (.pt)
+            conf_threshold: Confidence threshold untuk deteksi
+            iou_threshold: IoU threshold untuk NMS
         """
-        self.model   = YOLO(model_path)
-        self.tracker = sv.ByteTrack()
+        self.model = YOLO(model_path)
+        self.conf_threshold = conf_threshold
+        self.iou_threshold = iou_threshold
 
-        # Mapping nama kelas dari model
-        self.cls_names     : Dict[int, str] = self.model.model.names
-        self.cls_names_inv : Dict[str, int] = {v: k for k, v in self.cls_names.items()}
-
-        # -------------------------------------------------------
-        # Cache anchor posisi cone untuk konsistensi ID antar frame
-        # Karena kamera statis, posisi cone tidak berubah
-        # -------------------------------------------------------
-        self._cone_anchors: Dict[int, Tuple[float, float]] = {}
-        self._cone_anchor_max_distance = 60.0  # Pixel threshold untuk match cone ke anchor
+        # Inisialisasi ByteTrack tracker (supervision) untuk player
+        if HAS_SUPERVISION:
+            self.player_tracker = sv.ByteTrack(
+                track_activation_threshold=0.25,
+                lost_track_buffer=30,
+                minimum_matching_threshold=0.8,
+                frame_rate=30,
+            )
+            # Tracker terpisah untuk heading (kepala) agar ID-nya independen
+            self.heading_tracker = sv.ByteTrack(
+                track_activation_threshold=0.25,
+                lost_track_buffer=15,
+                minimum_matching_threshold=0.7,
+                frame_rate=30,
+            )
+        else:
+            self.player_tracker = None
+            self.heading_tracker = None
 
         print(f"[TRACKER] Model loaded: {model_path}")
-        print(f"[TRACKER] Kelas terdeteksi: {list(self.cls_names.values())}")
-
-        # Deteksi nama kelas secara fleksibel (custom model vs COCO)
-        self._ball_cls_name   = self._find_class(['ball', 'sports ball'])
-        self._player_cls_name = self._find_class(['player', 'person'])
-        self._cone_cls_name   = self._find_class(['cone'])
-
-        print(f"[TRACKER] Kelas BOLA    : '{self._ball_cls_name}'")
-        print(f"[TRACKER] Kelas PEMAIN  : '{self._player_cls_name}'")
-        print(f"[TRACKER] Kelas CONE    : '{self._cone_cls_name}'")
-
-    def _find_class(self, candidates: List[str]) -> Optional[str]:
-        """
-        Cari nama kelas yang cocok dari daftar kandidat.
-        Mendukung custom model dengan nama kelas berbeda dari COCO.
-
-        Args:
-            candidates: list nama kelas kandidat (prioritas dari kiri)
-
-        Returns:
-            Nama kelas yang ditemukan, atau None jika tidak ada
-        """
-        for name in candidates:
-            if name in self.cls_names_inv:
-                return name
-        print(f"[TRACKER] WARNING: Kelas {candidates} tidak ditemukan di model!")
-        return None
-
-    def _get_class_id(self, class_name: Optional[str]) -> int:
-        """Dapatkan integer class ID dari nama kelas, atau -1 jika tidak ada."""
-        if class_name is None:
-            return -1
-        return self.cls_names_inv.get(class_name, -1)
+        print(f"[TRACKER] Confidence threshold: {self.conf_threshold}")
+        print(f"[TRACKER] IoU threshold: {self.iou_threshold}")
+        print(f"[TRACKER] ByteTrack: {'Aktif' if HAS_SUPERVISION else 'Tidak aktif'}")
 
     # ============================================================
-    # CONE TRACKING DENGAN ID KONSISTEN (Spatial Anchor Matching)
-    # ============================================================
-
-    def _match_cone_to_anchor(
-        self,
-        cx: float,
-        cy: float
-    ) -> int:
-        """
-        Cocokkan posisi cone ke anchor yang sudah ada menggunakan nearest-neighbor.
-        Jika tidak ada anchor yang cukup dekat, buat anchor baru.
-
-        Ini memastikan cone ID KONSISTEN antar frame meskipun
-        YOLO mendeteksi cone dalam urutan berbeda tiap frame.
-
-        Args:
-            cx, cy: posisi tengah-bawah cone yang terdeteksi
-
-        Returns:
-            cone_id yang konsisten
-        """
-        best_id   = None
-        best_dist = float('inf')
-
-        # Cari anchor terdekat yang belum di-assign di frame ini
-        for anchor_id, anchor_pos in self._cone_anchors.items():
-            dist = measure_distance((cx, cy), anchor_pos)
-            if dist < best_dist:
-                best_dist = dist
-                best_id   = anchor_id
-
-        if best_dist <= self._cone_anchor_max_distance:
-            # Cone ini cocok ke anchor yang sudah ada
-            # Update posisi anchor dengan exponential moving average (smooth)
-            ax, ay = self._cone_anchors[best_id]
-            alpha  = 0.1  # Learning rate - rendah agar tidak drift
-            self._cone_anchors[best_id] = (
-                ax * (1 - alpha) + cx * alpha,
-                ay * (1 - alpha) + cy * alpha
-            )
-            return best_id
-        else:
-            # Cone baru - buat anchor baru dengan ID berikutnya
-            new_id = len(self._cone_anchors)
-            # Pastikan ID tidak bentrok
-            while new_id in self._cone_anchors:
-                new_id += 1
-            self._cone_anchors[new_id] = (cx, cy)
-            print(f"[TRACKER] Anchor cone baru: ID {new_id} "
-                  f"di posisi ({cx:.1f}, {cy:.1f})")
-            return new_id
-
-    def _reset_cone_anchors(self) -> None:
-        """Reset semua anchor cone (panggil jika perlu re-inisialisasi)."""
-        self._cone_anchors.clear()
-        print("[TRACKER] Cone anchors direset.")
-
-    # ============================================================
-    # DETEKSI FRAMES
-    # ============================================================
-
-    def detect_frames(
-        self,
-        frames    : List[np.ndarray],
-        batch_size: int = 20
-    ) -> List[Any]:
-        """
-        Jalankan deteksi YOLOv8 pada list frames secara batch.
-
-        Args:
-            frames    : list frame video (numpy array BGR)
-            batch_size: jumlah frame per batch inference
-
-        Returns:
-            List hasil deteksi per frame
-        """
-        detections   = []
-        total_batches = (len(frames) + batch_size - 1) // batch_size
-
-        for i in range(0, len(frames), batch_size):
-            batch     = frames[i:i + batch_size]
-            batch_num = i // batch_size + 1
-            print(f"[TRACKER] Deteksi batch {batch_num}/{total_batches}...")
-            results = self.model.predict(batch, conf=0.1, verbose=False)
-            detections.extend(results)
-
-        return detections
-
-    # ============================================================
-    # TRACKING UTAMA
-    # ============================================================
-
-    def get_object_tracks(
-        self,
-        frames        : List[np.ndarray],
-        read_from_stub: bool = False,
-        stub_path     : Optional[str] = None
-    ) -> Dict[str, List[Dict[int, Dict[str, Any]]]]:
-        """
-        Deteksi dan tracking semua objek di setiap frame.
-
-        Perbaikan dari versi sebelumnya:
-        - Nama kelas bola fleksibel ('ball' atau 'sports ball')
-        - Cone ID konsisten antar frame via spatial anchor matching
-        - Circle cone difilter via nama kelas (bukan hanya aspect ratio)
-
-        Struktur output:
-        {
-            'players': [{player_id: {'bbox': [...], 'confidence': float}}, ...],
-            'ball'   : [{1: {'bbox': [...], 'confidence': float}}, ...],
-            'cones'  : [{cone_id: {'bbox': [...], 'confidence': float, ...}}, ...]
-        }
-
-        Args:
-            frames        : list frame video
-            read_from_stub: baca dari cache pickle jika True
-            stub_path     : path file pickle untuk cache
-
-        Returns:
-            Dict tracks semua objek
-        """
-        # Baca dari cache jika tersedia
-        if read_from_stub and stub_path and os.path.exists(stub_path):
-            print(f"[TRACKER] Membaca tracks dari cache: {stub_path}")
-            with open(stub_path, 'rb') as f:
-                return pickle.load(f)
-
-        # Validasi kelas yang dibutuhkan
-        if self._ball_cls_name is None:
-            print("[TRACKER] CRITICAL: Kelas bola tidak ditemukan!")
-            print(f"[TRACKER] Kelas tersedia: {list(self.cls_names.values())}")
-
-        # Jalankan deteksi batch
-        detections = self.detect_frames(frames)
-
-        # Reset cone anchors sebelum memproses video baru
-        self._reset_cone_anchors()
-
-        # Struktur tracks output
-        tracks: Dict[str, List[Dict[int, Dict[str, Any]]]] = {
-            "players": [],
-            "ball"   : [],
-            "cones"  : []
-        }
-
-        # Ambil class ID yang diperlukan (berdasarkan nama kelas model)
-        ball_cls_id   = self._get_class_id(self._ball_cls_name)
-        player_cls_id = self._get_class_id(self._player_cls_name)
-        cone_cls_id   = self._get_class_id(self._cone_cls_name)
-
-        # Set untuk cone ID yang sudah di-assign di frame ini
-        # (mencegah satu anchor di-assign ke dua cone dalam frame yang sama)
-        assigned_in_frame = set()
-
-        for frame_num, detection in enumerate(detections):
-            if frame_num % 50 == 0:
-                print(f"[TRACKER] Processing frame {frame_num}/{len(detections)}...")
-
-            # Inisialisasi frame kosong
-            tracks["players"].append({})
-            tracks["ball"].append({})
-            tracks["cones"].append({})
-
-            # Konversi ke supervision Detections
-            det_sv = sv.Detections.from_ultralytics(detection)
-
-            if len(det_sv) == 0:
-                continue
-
-            # Nama kelas dari deteksi frame ini
-            cls_names_local     = detection.names
-            cls_names_inv_local = {v: k for k, v in cls_names_local.items()}
-
-            # ---- TRACKING PEMAIN menggunakan ByteTrack ----
-            p_cls_id    = cls_names_inv_local.get(self._player_cls_name, -1)
-            person_mask = det_sv.class_id == p_cls_id
-            player_det  = det_sv[person_mask]
-
-            if len(player_det) > 0:
-                player_det_tracked = self.tracker.update_with_detections(player_det)
-                for det in player_det_tracked:
-                    bbox       = det[0].tolist()
-                    track_id   = int(det[4])
-                    confidence = float(det[2]) if len(det) > 2 else 0.5
-                    tracks["players"][frame_num][track_id] = {
-                        "bbox"      : bbox,
-                        "confidence": confidence
-                    }
-
-            # ---- DETEKSI BOLA (confidence tertinggi, ID selalu 1) ----
-            b_cls_id  = cls_names_inv_local.get(self._ball_cls_name, -1)
-            ball_mask = det_sv.class_id == b_cls_id
-            ball_det  = det_sv[ball_mask]
-
-            if len(ball_det) > 0:
-                # Ambil bola dengan confidence tertinggi
-                best_idx  = int(np.argmax(ball_det.confidence))
-                best_ball = ball_det[best_idx]
-                bbox      = best_ball.xyxy[0].tolist()
-                conf      = float(best_ball.confidence[0])
-
-                tracks["ball"][frame_num][1] = {
-                    "bbox"      : bbox,
-                    "confidence": conf
-                }
-
-            # ---- DETEKSI CONE dengan ID KONSISTEN ----
-            c_cls_id  = cls_names_inv_local.get(self._cone_cls_name, -1)
-            cone_mask = det_sv.class_id == c_cls_id
-            cone_det  = det_sv[cone_mask]
-
-            # Reset set assignment untuk frame baru
-            assigned_in_frame = set()
-
-            for idx in range(len(cone_det)):
-                bbox = cone_det.xyxy[idx].tolist()
-                conf = float(cone_det.confidence[idx])
-
-                # Filter confidence rendah
-                if conf < 0.25:
-                    continue
-
-                # Filter circle cone menggunakan aspect ratio
-                # Cone berdiri: tinggi > lebar (aspect_ratio > 0.8)
-                # Circle cone: lebar >= tinggi (aspect_ratio <= 0.8)
-                w = bbox[2] - bbox[0]
-                h = bbox[3] - bbox[1]
-                if w <= 0:
-                    continue
-
-                aspect_ratio = h / w
-                if aspect_ratio < 0.8:
-                    # Skip circle cone (pipih/setengah bola)
-                    continue
-
-                # Posisi referensi: titik tengah-bawah cone
-                cx, cy = get_center_of_bbox_bottom(bbox)
-
-                # Dapatkan cone_id yang konsisten via spatial anchor matching
-                cone_id = self._match_cone_to_anchor(cx, cy)
-
-                # Skip jika anchor ini sudah di-assign di frame ini
-                # (hindari duplikasi deteksi cone yang sama)
-                if cone_id in assigned_in_frame:
-                    continue
-                assigned_in_frame.add(cone_id)
-
-                tracks["cones"][frame_num][cone_id] = {
-                    "bbox"        : bbox,
-                    "confidence"  : conf,
-                    "aspect_ratio": aspect_ratio
-                }
-
-        # Interpolasi posisi bola yang hilang
-        print("[TRACKER] Interpolasi posisi bola...")
-        tracks["ball"] = interpolate_ball_positions(tracks["ball"])
-
-        # Debug: tampilkan statistik bola
-        ball_detected = sum(1 for f in tracks["ball"] if f.get(1))
-        print(f"[TRACKER] Bola terdeteksi: {ball_detected}/{len(tracks['ball'])} frames "
-              f"({ball_detected/len(tracks['ball'])*100:.1f}%)")
-
-        # Debug: tampilkan cone anchors yang terbentuk
-        print(f"[TRACKER] Total cone anchor unik: {len(self._cone_anchors)}")
-        for cid, pos in sorted(self._cone_anchors.items()):
-            print(f"[TRACKER]   Anchor cone ID {cid}: ({pos[0]:.1f}, {pos[1]:.1f})")
-
-        # Simpan ke cache
-        if stub_path:
-            os.makedirs(
-                os.path.dirname(stub_path) if os.path.dirname(stub_path) else '.',
-                exist_ok=True
-            )
-            with open(stub_path, 'wb') as f:
-                pickle.dump(tracks, f)
-            print(f"[TRACKER] Cache disimpan: {stub_path}")
-
-        return tracks
-
-    # ============================================================
-    # DRAW ANNOTATIONS
-    # ============================================================
-
-    def draw_annotations(
-        self,
-        frame            : np.ndarray,
-        tracks           : Dict,
-        frame_num        : int,
-        ball_possessions : List[int],
-        player_identifier = None
-    ) -> np.ndarray:
-        """Gambar bounding box dan annotasi di atas frame."""
-        annotated = frame.copy()
-
-        for player_id, player_data in tracks["players"][frame_num].items():
-            bbox = player_data["bbox"]
-            x1, y1, x2, y2 = map(int, bbox)
-
-            has_ball = (
-                frame_num < len(ball_possessions) and
-                ball_possessions[frame_num] == player_id
-            )
-            color = (0, 255, 0) if has_ball else (255, 0, 0)
-            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-
-            jersey = str(player_id)
-            if player_identifier:
-                jersey = player_identifier.get_jersey_number_for_player(player_id)
-            label = f"#{jersey}"
-            cv2.rectangle(annotated, (x1, y1 - 20), (x1 + 45, y1), color, -1)
-            cv2.putText(annotated, label, (x1 + 2, y1 - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-
-        ball_data = tracks["ball"][frame_num].get(1)
-        if ball_data:
-            bx1, by1, bx2, by2 = map(int, ball_data["bbox"])
-            cv2.ellipse(
-                annotated,
-                center    = ((bx1 + bx2) // 2, (by1 + by2) // 2),
-                axes      = ((bx2 - bx1) // 2, (by2 - by1) // 2),
-                angle     = 0, startAngle=0, endAngle=360,
-                color     = (0, 255, 255), thickness=2
-            )
-
-        return annotated
-
-    # ============================================================
-    # VIDEO I/O
+    # BACA & SIMPAN VIDEO
     # ============================================================
 
     @staticmethod
     def read_video(video_path: str) -> List[np.ndarray]:
-        """Baca video dari path dan kembalikan list frames."""
-        cap    = cv2.VideoCapture(video_path)
+        """Baca semua frame dari video."""
+        if not os.path.exists(video_path):
+            print(f"[TRACKER] ERROR: Video tidak ditemukan: {video_path}")
+            return []
+
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            print(f"[TRACKER] ERROR: Tidak bisa membuka video: {video_path}")
+            return []
+
         frames = []
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
             frames.append(frame)
+
         cap.release()
-        print(f"[VIDEO] Total frame dibaca: {len(frames)}")
+        print(f"[TRACKER] Video dibaca: {len(frames)} frames dari {video_path}")
         return frames
 
     @staticmethod
     def save_video(
-        output_frames: List[np.ndarray],
-        output_path  : str,
-        fps          : int = 24
+        frames: List[np.ndarray],
+        output_path: str,
+        fps: int = 30
     ) -> None:
-        """Simpan list frames menjadi file video."""
-        if not output_frames:
-            print("[VIDEO] Tidak ada frame untuk disimpan!")
+        """Simpan list frame menjadi video."""
+        if not frames:
+            print("[TRACKER] WARNING: Tidak ada frame untuk disimpan!")
             return
 
-        h, w   = output_frames[0].shape[:2]
-
-        # Pilih codec berdasarkan ekstensi file
-        ext = os.path.splitext(output_path)[1].lower()
-        if ext == '.mp4':
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        elif ext == '.avi':
-            fourcc = cv2.VideoWriter_fourcc(*"XVID")
-        else:
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-
-        os.makedirs(
-            os.path.dirname(output_path) if os.path.dirname(output_path) else '.',
-            exist_ok=True
-        )
+        h, w = frames[0].shape[:2]
+        fourcc = cv2.VideoWriter_fourcc(*'XVID')
         out = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
-        for frame in output_frames:
-            out.write(frame)
-        out.release()
 
-        print(f"[VIDEO] Disimpan: {output_path} "
-              f"({len(output_frames)} frames, {fps}fps)")
+        for frame in frames:
+            out.write(frame)
+
+        out.release()
+        print(f"[TRACKER] Video disimpan: {output_path} "
+              f"({len(frames)} frames, {fps} FPS)")
+
+    # ============================================================
+    # DETEKSI YOLO
+    # ============================================================
+
+    def _detect_frames(
+        self,
+        frames: List[np.ndarray],
+        batch_size: int = 20,
+    ) -> List[Any]:
+        """
+        Jalankan deteksi YOLO pada semua frame.
+
+        Returns:
+            List of YOLO detection results per frame.
+        """
+        detections = []
+        total = len(frames)
+
+        print(f"[TRACKER] Menjalankan deteksi YOLO pada {total} frames...")
+
+        for i in range(0, total, batch_size):
+            batch = frames[i:i + batch_size]
+            batch_results = self.model.predict(
+                batch,
+                conf=self.conf_threshold,
+                iou=self.iou_threshold,
+                verbose=False,
+            )
+            detections.extend(batch_results)
+
+            if (i // batch_size) % 5 == 0:
+                pct = min(i + batch_size, total) / total * 100
+                print(f"[TRACKER] Deteksi progress: "
+                      f"{min(i + batch_size, total)}/{total} ({pct:.1f}%)")
+
+        print(f"[TRACKER] Deteksi selesai: {len(detections)} frames diproses.")
+        return detections
+
+    # ============================================================
+    # KONVERSI DETEKSI KE TRACKS DICTIONARY
+    # ============================================================
+
+    def _detections_to_tracks(
+        self,
+        detections: List[Any],
+    ) -> Dict[str, List[Dict]]:
+        """
+        Konversi hasil deteksi YOLO menjadi tracks dictionary.
+
+        Tracks format:
+            {
+                'players': [
+                    {player_id: {'bbox': [x1,y1,x2,y2]}, ...},  # frame 0
+                    {player_id: {'bbox': [x1,y1,x2,y2]}, ...},  # frame 1
+                    ...
+                ],
+                'ball': [
+                    {1: {'bbox': [x1,y1,x2,y2]}},  # frame 0
+                    {1: {'bbox': [x1,y1,x2,y2]}},  # frame 1
+                    ...
+                ],
+                'heading': [
+                    {head_id: {'bbox': [x1,y1,x2,y2], 'confidence': c}, ...},
+                    ...
+                ],
+            }
+        """
+        tracks: Dict[str, List[Dict]] = {
+            'players': [],
+            'ball':    [],
+            'heading': [],
+        }
+
+        total_frames = len(detections)
+
+        for frame_num, detection in enumerate(detections):
+            if frame_num % 200 == 0:
+                print(f"[TRACKER] Konversi tracks: "
+                      f"frame {frame_num}/{total_frames}...")
+
+            # ----- Pisahkan deteksi per class -----
+            boxes = detection.boxes
+
+            player_bboxes = []
+            player_confs  = []
+            ball_bboxes   = []
+            ball_confs    = []
+            heading_bboxes = []
+            heading_confs  = []
+
+            for i in range(len(boxes)):
+                bbox = boxes.xyxy[i].cpu().numpy().tolist()
+                conf = float(boxes.conf[i].cpu().numpy())
+                cls  = int(boxes.cls[i].cpu().numpy())
+
+                if cls == self.CLASS_PLAYER:
+                    player_bboxes.append(bbox)
+                    player_confs.append(conf)
+                elif cls == self.CLASS_BALL:
+                    ball_bboxes.append(bbox)
+                    ball_confs.append(conf)
+                elif cls == self.CLASS_HEADING:
+                    heading_bboxes.append(bbox)
+                    heading_confs.append(conf)
+
+            # ----- PLAYER TRACKING (ByteTrack) -----
+            players_dict = {}
+
+            if player_bboxes:
+                if HAS_SUPERVISION and self.player_tracker is not None:
+                    # Gunakan supervision ByteTrack
+                    sv_detections = sv.Detections(
+                        xyxy=np.array(player_bboxes, dtype=np.float32),
+                        confidence=np.array(player_confs, dtype=np.float32),
+                    )
+                    sv_tracked = self.player_tracker.update_with_detections(
+                        sv_detections
+                    )
+
+                    for j in range(len(sv_tracked)):
+                        tracker_id = int(sv_tracked.tracker_id[j])
+                        bbox = sv_tracked.xyxy[j].tolist()
+                        players_dict[tracker_id] = {
+                            'bbox': bbox,
+                        }
+                else:
+                    # Fallback: tanpa tracking, pakai index sebagai ID
+                    for j, bbox in enumerate(player_bboxes):
+                        players_dict[j + 1] = {
+                            'bbox': bbox,
+                        }
+
+            tracks['players'].append(players_dict)
+
+            # ----- BALL -----
+            ball_dict = {}
+
+            if ball_bboxes:
+                # Ambil bola dengan confidence tertinggi
+                best_idx = int(np.argmax(ball_confs))
+                ball_dict[1] = {
+                    'bbox': ball_bboxes[best_idx],
+                    'confidence': ball_confs[best_idx],
+                }
+
+            tracks['ball'].append(ball_dict)
+
+            # ----- HEADING (kepala) TRACKING -----
+            heading_dict = {}
+
+            if heading_bboxes:
+                if HAS_SUPERVISION and self.heading_tracker is not None:
+                    sv_head_det = sv.Detections(
+                        xyxy=np.array(heading_bboxes, dtype=np.float32),
+                        confidence=np.array(heading_confs, dtype=np.float32),
+                    )
+                    sv_head_tracked = self.heading_tracker.update_with_detections(
+                        sv_head_det
+                    )
+
+                    for j in range(len(sv_head_tracked)):
+                        tracker_id = int(sv_head_tracked.tracker_id[j])
+                        bbox = sv_head_tracked.xyxy[j].tolist()
+                        conf = float(sv_head_tracked.confidence[j])
+                        heading_dict[tracker_id] = {
+                            'bbox': bbox,
+                            'confidence': conf,
+                        }
+                else:
+                    # Fallback: tanpa tracking
+                    for j, bbox in enumerate(heading_bboxes):
+                        heading_dict[j + 1] = {
+                            'bbox': bbox,
+                            'confidence': heading_confs[j],
+                        }
+
+            tracks['heading'].append(heading_dict)
+
+        print(f"[TRACKER] Konversi tracks selesai: {total_frames} frames.")
+        self._print_track_summary(tracks)
+
+        return tracks
+
+    def _print_track_summary(self, tracks: Dict) -> None:
+        """Print ringkasan tracking."""
+        total = len(tracks['players'])
+
+        # Hitung statistik
+        frames_with_players = sum(
+            1 for f in tracks['players'] if len(f) > 0
+        )
+        frames_with_ball = sum(
+            1 for f in tracks['ball'] if len(f) > 0
+        )
+        frames_with_heading = sum(
+            1 for f in tracks['heading'] if len(f) > 0
+        )
+
+        # Unique IDs
+        all_player_ids = set()
+        all_heading_ids = set()
+        for f in tracks['players']:
+            all_player_ids.update(f.keys())
+        for f in tracks['heading']:
+            all_heading_ids.update(f.keys())
+
+        print(f"\n[TRACKER] === TRACKING SUMMARY ===")
+        print(f"[TRACKER] Total frames         : {total}")
+        print(f"[TRACKER] Frames dengan player : "
+              f"{frames_with_players}/{total} "
+              f"({frames_with_players/total*100:.1f}%)")
+        print(f"[TRACKER] Frames dengan ball   : "
+              f"{frames_with_ball}/{total} "
+              f"({frames_with_ball/total*100:.1f}%)")
+        print(f"[TRACKER] Frames dengan heading: "
+              f"{frames_with_heading}/{total} "
+              f"({frames_with_heading/total*100:.1f}%)")
+        print(f"[TRACKER] Unique player IDs    : {len(all_player_ids)} "
+              f"({sorted(all_player_ids)[:10]}{'...' if len(all_player_ids) > 10 else ''})")
+        print(f"[TRACKER] Unique heading IDs   : {len(all_heading_ids)} "
+              f"({sorted(all_heading_ids)[:10]}{'...' if len(all_heading_ids) > 10 else ''})")
+        print(f"[TRACKER] ============================\n")
+
+    # ============================================================
+    # INTERPOLASI POSISI BOLA (gap filling)
+    # ============================================================
+
+    def _interpolate_ball_positions(
+        self,
+        tracks: Dict,
+        max_gap: int = 15,
+    ) -> Dict:
+        """
+        Interpolasi posisi bola untuk frame-frame di mana bola tidak terdeteksi.
+        Menggunakan linear interpolation antara deteksi terakhir dan berikutnya.
+
+        Args:
+            tracks: Dictionary tracks
+            max_gap: Maksimum gap (frame) yang akan di-interpolasi
+
+        Returns:
+            tracks dengan posisi bola yang sudah di-interpolasi
+        """
+        ball_frames = tracks['ball']
+        total = len(ball_frames)
+
+        if total == 0:
+            return tracks
+
+        # Cari semua frame yang punya bola
+        detected_frames = []
+        for i, bf in enumerate(ball_frames):
+            if bf.get(1) and 'bbox' in bf[1]:
+                detected_frames.append(i)
+
+        if len(detected_frames) < 2:
+            return tracks
+
+        interpolated_count = 0
+
+        # Interpolasi gap antar frame yang terdeteksi
+        for idx in range(len(detected_frames) - 1):
+            start_frame = detected_frames[idx]
+            end_frame = detected_frames[idx + 1]
+            gap = end_frame - start_frame - 1
+
+            if gap <= 0 or gap > max_gap:
+                continue
+
+            start_bbox = ball_frames[start_frame][1]['bbox']
+            end_bbox = ball_frames[end_frame][1]['bbox']
+
+            for g in range(1, gap + 1):
+                t = g / (gap + 1)
+                interp_bbox = [
+                    start_bbox[j] + (end_bbox[j] - start_bbox[j]) * t
+                    for j in range(4)
+                ]
+
+                frame_idx = start_frame + g
+                ball_frames[frame_idx][1] = {
+                    'bbox': interp_bbox,
+                    'confidence': 0.0,  # interpolated
+                    'interpolated': True,
+                }
+                interpolated_count += 1
+
+        if interpolated_count > 0:
+            print(f"[TRACKER] Ball interpolasi: {interpolated_count} frames diisi.")
+
+        tracks['ball'] = ball_frames
+        return tracks
+
+    # ============================================================
+    # MAIN: GET OBJECT TRACKS
+    # ============================================================
+
+    def get_object_tracks(
+        self,
+        frames: List[np.ndarray],
+        read_from_stub: bool = False,
+        stub_path: str = "stubs/tracks_cache.pkl",
+        interpolate_ball: bool = True,
+        ball_interpolation_max_gap: int = 15,
+    ) -> Dict[str, List[Dict]]:
+        """
+        Pipeline utama: deteksi + tracking semua objek.
+
+        Args:
+            frames: List frame video
+            read_from_stub: Baca dari cache jika ada
+            stub_path: Path file cache (.pkl)
+            interpolate_ball: Apakah interpolasi posisi bola
+            ball_interpolation_max_gap: Maks gap interpolasi bola
+
+        Returns:
+            tracks: {
+                'players': [{id: {'bbox': [x1,y1,x2,y2]}, ...}, ...],
+                'ball':    [{1:  {'bbox': [x1,y1,x2,y2]}, ...}, ...],
+                'heading': [{id: {'bbox': [x1,y1,x2,y2], 'confidence': c}, ...}, ...],
+            }
+        """
+        # ----- Cek cache -----
+        if read_from_stub and os.path.exists(stub_path):
+            print(f"[TRACKER] Membaca cache dari: {stub_path}")
+            with open(stub_path, 'rb') as f:
+                tracks = pickle.load(f)
+
+            # Validasi cache punya semua key yang diperlukan
+            required_keys = ['players', 'ball', 'heading']
+            missing = [k for k in required_keys if k not in tracks]
+
+            if missing:
+                print(f"[TRACKER] WARNING: Cache tidak punya key: {missing}")
+                # Tambahkan key yang missing dengan placeholder
+                for key in missing:
+                    total = len(tracks.get('players', tracks.get('ball', [])))
+                    tracks[key] = [{} for _ in range(total)]
+                    print(f"[TRACKER] Ditambahkan placeholder untuk '{key}': "
+                          f"{total} frames")
+
+            self._print_track_summary(tracks)
+            print(f"[TRACKER] Cache berhasil dimuat: {len(tracks['players'])} frames")
+            return tracks
+
+        # ----- Deteksi -----
+        detections = self._detect_frames(frames)
+
+        # ----- Konversi ke tracks -----
+        tracks = self._detections_to_tracks(detections)
+
+        # ----- Interpolasi bola -----
+        if interpolate_ball:
+            tracks = self._interpolate_ball_positions(
+                tracks, max_gap=ball_interpolation_max_gap
+            )
+
+        # ----- Simpan cache -----
+        stub_dir = os.path.dirname(stub_path)
+        if stub_dir and not os.path.exists(stub_dir):
+            os.makedirs(stub_dir, exist_ok=True)
+
+        with open(stub_path, 'wb') as f:
+            pickle.dump(tracks, f)
+        print(f"[TRACKER] Cache disimpan ke: {stub_path}")
+
+        return tracks
+
+    # ============================================================
+    # UTILITY: DRAW ANNOTATIONS (opsional, untuk debugging)
+    # ============================================================
+
+    def draw_annotations(
+        self,
+        frames: List[np.ndarray],
+        tracks: Dict,
+    ) -> List[np.ndarray]:
+        """
+        Gambar bounding box untuk semua objek (debug/testing).
+        """
+        output = []
+        total = len(frames)
+
+        for frame_num, frame in enumerate(frames):
+            annotated = frame.copy()
+
+            # Players
+            for pid, pdata in tracks['players'][frame_num].items():
+                bbox = pdata.get('bbox')
+                if bbox is None:
+                    continue
+                x1, y1, x2, y2 = map(int, bbox)
+                cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 200, 50), 2)
+                cv2.putText(annotated, f"Player {pid}",
+                            (x1, y1 - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                            (0, 200, 50), 1)
+
+            # Ball
+            ball_data = tracks['ball'][frame_num].get(1)
+            if ball_data and 'bbox' in ball_data:
+                bx1, by1, bx2, by2 = map(int, ball_data['bbox'])
+                bcx, bcy = (bx1 + bx2) // 2, (by1 + by2) // 2
+                r = max(6, (bx2 - bx1) // 2)
+                cv2.circle(annotated, (bcx, bcy), r, (0, 230, 255), 2)
+                cv2.putText(annotated, "Ball",
+                            (bx1, by1 - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.40,
+                            (0, 230, 255), 1)
+
+            # Heading (kepala)
+            for hid, hdata in tracks['heading'][frame_num].items():
+                bbox = hdata.get('bbox')
+                if bbox is None:
+                    continue
+                x1, y1, x2, y2 = map(int, bbox)
+                cv2.rectangle(annotated, (x1, y1), (x2, y2), (255, 180, 0), 2)
+                conf = hdata.get('confidence', 0)
+                cv2.putText(annotated, f"Head {hid} ({conf:.2f})",
+                            (x1, y1 - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.40,
+                            (255, 180, 0), 1)
+
+            output.append(annotated)
+
+        return output
