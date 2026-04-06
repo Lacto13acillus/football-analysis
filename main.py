@@ -23,7 +23,7 @@ from utils.bbox_utils import get_center_of_bbox
 
 
 # ============================================================
-# KONFIGURASI UTAMA
+# KONFIGURASI
 # ============================================================
 
 CONFIG = {
@@ -31,28 +31,28 @@ CONFIG = {
     "output_video": "output_videos/heading_count.avi",
     "model_path"  : "/home/dika/football-analysis/models/best.pt",
     "stub_path"   : "stubs/tracks_cache_heading.pkl",
-    "use_stub"    : False,
+    "use_stub"    : False,   # Pakai cache biar cepat
     "fps"         : 30,
 
-    # ============================================================
-    # PARAMETER HEADING DETECTION
-    # ============================================================
-    "head_bbox_margin"              : 15.0,   # Margin toleransi overlap
-    "max_head_ball_center_distance" : 60.0,   # Jarak center fallback
-    "max_approach_distance"         : 180.0,  # Jarak maks bola → pemain
-    "min_approach_frames"           : 3,
+    # PARAMETER HEADING
+    "head_bbox_margin"              : 20.0,
+    "max_head_ball_center_distance" : 80.0,
+    "max_approach_distance"         : 200.0,
+    "min_approach_frames"           : 2,
     "cooldown_frames"               : 25,
-    "max_approach_duration_sec"     : 3.0,
-    "min_away_frames"               : 8,
+    "max_approach_duration_sec"     : 4.0,
+    "min_away_frames"               : 5,
 
-    # ============================================================
     # VISUALISASI
-    # ============================================================
     "show_head_bbox"       : True,
     "show_stats_panel"     : True,
     "debug_trajectory"     : True,
     "show_heading_status"  : True,
     "result_flash_frames"  : 45,
+
+    # DEBUG: print jarak bola-kepala
+    "debug_distances"      : True,
+    "debug_sample_every"   : 5,
 }
 
 
@@ -62,7 +62,8 @@ def parse_args():
     )
     parser.add_argument("--input", type=str, help="Path video input")
     parser.add_argument("--output", type=str, help="Path video output")
-    parser.add_argument("--stub", action="store_true", help="Gunakan cache tracking")
+    parser.add_argument("--stub", action="store_true", help="Gunakan cache")
+    parser.add_argument("--no-stub", action="store_true", help="Jangan pakai cache")
     parser.add_argument("--debug", action="store_true", help="Debug trajectory")
     return parser.parse_args()
 
@@ -71,14 +72,12 @@ def compute_progressive_stats(
     heading_events: List[Dict],
     up_to_frame: int
 ) -> Dict:
-    """Statistik heading realtime sampai frame tertentu."""
     events_so_far = [
         e for e in heading_events if e['frame_end'] <= up_to_frame
     ]
     total = len(events_so_far)
     sukses = sum(1 for e in events_so_far if e['success'])
     gagal = total - sukses
-
     return {
         'total_headings': total,
         'successful_headings': sukses,
@@ -111,9 +110,9 @@ def print_heading_details(events: List[Dict], stats: Dict) -> None:
         print("  Tidak ada heading terdeteksi.\n")
         return
 
-    print(f"\n  {'No':<4} {'Player':<10} {'Frame':<14} "
+    print(f"\n  {'No':<4} {'Player':<10} {'Frame':<16} "
           f"{'Dist':>8} {'IoU':>8} {'Status':<10}")
-    print("  " + "-" * 60)
+    print("  " + "-" * 62)
     for i, e in enumerate(events):
         status = "SUKSES" if e['success'] else "GAGAL"
         print(f"  {i+1:<4} "
@@ -134,10 +133,9 @@ def render_frames(
 ) -> List[np.ndarray]:
     output_frames = []
     total_frames = len(frames)
-
     rolling_trajectory: List = []
 
-    # Pre-compute mapping frame → event aktif
+    # Pre-compute: frame → event aktif
     event_frame_map: Dict[int, Dict] = {}
     for e in heading_events:
         for f in range(e['frame_start'], e['frame_end'] + 1):
@@ -172,10 +170,9 @@ def render_frames(
                 continue
 
             x1, y1, x2, y2 = map(int, bbox)
-
             is_active = (
                 active_event is not None and
-                active_event['player_id'] == player_id
+                active_event.get('player_id') == player_id
             )
             box_color = (0, 200, 50) if is_active else (200, 80, 50)
             cv2.rectangle(annotated, (x1, y1), (x2, y2), box_color, 2)
@@ -191,7 +188,10 @@ def render_frames(
 
         # ------ 2. Bbox kepala (class Heading) ------
         if config.get("show_head_bbox", True):
-            heads_in_frame = tracks.get('heading', [{}] * total_frames)[frame_num]
+            heads_in_frame = tracks.get(
+                'heading', [{}] * total_frames
+            )[frame_num]
+
             for head_id, head_data in heads_in_frame.items():
                 head_bbox = head_data.get('bbox')
                 if head_bbox is None:
@@ -203,12 +203,10 @@ def render_frames(
 
                 if flash_info:
                     evt = flash_info['event']
-                    if evt.get('head_bbox') and head_bbox:
-                        # Cek apakah head bbox ini dekat dengan event head bbox
-                        if evt['success']:
-                            is_success = True
-                        else:
-                            is_fail = True
+                    if evt['success']:
+                        is_success = True
+                    else:
+                        is_fail = True
                 elif active_event:
                     is_contact = True
 
@@ -243,13 +241,13 @@ def render_frames(
                 max_points=40
             )
 
-        # ------ 5. Heading status indicator ------
+        # ------ 5. Heading status ------
         if config.get("show_heading_status", True) and active_event:
             annotated = draw_heading_status(
                 annotated,
                 is_approaching=True,
                 is_contact=(active_event['frame_contact'] == frame_num),
-                player_id=active_event['player_id'],
+                player_id=active_event.get('player_id', -1),
                 head_dist=active_event.get('head_ball_distance', 0),
                 iou=active_event.get('iou', 0),
             )
@@ -289,7 +287,7 @@ def render_frames(
 
 
 # ============================================================
-# MAIN PIPELINE
+# MAIN
 # ============================================================
 
 def main():
@@ -301,20 +299,23 @@ def main():
         CONFIG["output_video"] = args.output
     if args.stub:
         CONFIG["use_stub"] = True
+    if args.no_stub:
+        CONFIG["use_stub"] = False
     if args.debug:
         CONFIG["debug_trajectory"] = True
 
     print("\n" + "=" * 70)
-    print("   FOOTBALL HEADING ANALYTICS v1.0")
-    print("   Ball-Head Contact Detection (YOLO Class Based)")
+    print("   FOOTBALL HEADING ANALYTICS v1.1")
+    print("   Ball ↔ Head Overlap Detection (YOLO Class Based)")
     print("=" * 70)
-    print(f"  Input                : {CONFIG['input_video']}")
-    print(f"  Output               : {CONFIG['output_video']}")
-    print(f"  Model                : {CONFIG['model_path']}")
-    print(f"  Head bbox margin     : {CONFIG['head_bbox_margin']}px")
-    print(f"  Head-ball center dist: {CONFIG['max_head_ball_center_distance']}px")
-    print(f"  Approach distance    : {CONFIG['max_approach_distance']}px")
-    print(f"  Cooldown frames      : {CONFIG['cooldown_frames']}")
+    print(f"  Input                  : {CONFIG['input_video']}")
+    print(f"  Output                 : {CONFIG['output_video']}")
+    print(f"  Model                  : {CONFIG['model_path']}")
+    print(f"  Cache                  : {'Ya' if CONFIG['use_stub'] else 'Tidak'}")
+    print(f"  Head bbox margin       : {CONFIG['head_bbox_margin']}px")
+    print(f"  Head-ball center dist  : {CONFIG['max_head_ball_center_distance']}px")
+    print(f"  Approach distance      : {CONFIG['max_approach_distance']}px")
+    print(f"  Cooldown frames        : {CONFIG['cooldown_frames']}")
     print("=" * 70)
 
     # TAHAP 1: Baca Video
@@ -345,10 +346,8 @@ def main():
         stub_path=CONFIG["stub_path"]
     )
 
-    # Pastikan key 'heading' ada
     if 'heading' not in tracks:
         print("[MAIN] WARNING: 'heading' tidak ada di tracks.")
-        print("[MAIN] Pastikan Tracker menangani class_id=0 sebagai 'heading'.")
         tracks['heading'] = [{} for _ in range(len(frames))]
 
     # TAHAP 3: Inisialisasi Heading Detector
@@ -361,6 +360,13 @@ def main():
     heading_detector.cooldown_frames                = CONFIG["cooldown_frames"]
     heading_detector.max_approach_duration_sec      = CONFIG["max_approach_duration_sec"]
     heading_detector.min_away_frames                = CONFIG["min_away_frames"]
+
+    # TAHAP 3.5: DEBUG — Print jarak bola-kepala
+    if CONFIG.get("debug_distances", False):
+        heading_detector.debug_distances(
+            tracks,
+            sample_every=CONFIG.get("debug_sample_every", 5)
+        )
 
     # TAHAP 4: Deteksi Heading
     print("\n[MAIN] TAHAP 4: Deteksi heading events...")

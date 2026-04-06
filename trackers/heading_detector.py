@@ -1,7 +1,11 @@
 # heading_detector.py
-# Deteksi dan counting heading bola.
-# SUKSES = bbox bola overlap/menyentuh bbox kepala (class "Heading" dari YOLO)
-# GAGAL  = bola dekat pemain tapi TIDAK menyentuh bbox kepala
+# ============================================================
+# Logic sederhana & akurat:
+#   SUKSES = bbox ball overlap/menyentuh bbox Heading (kepala)
+#   GAGAL  = bola dekat pemain tapi TIDAK mengenai bbox Heading
+#
+# Tidak perlu match head→player, langsung cek ball↔head overlap.
+# ============================================================
 
 import sys
 sys.path.append('../')
@@ -16,39 +20,34 @@ class HeadingDetector:
         self.fps = fps
 
         # ============================================================
-        # PARAMETER KONTAK BOLA-KEPALA
+        # PARAMETER KONTAK BOLA ↔ KEPALA
         # ============================================================
-        # Margin tambahan (px) di sekitar bbox kepala untuk toleransi overlap
-        self.head_bbox_margin: float = 15.0
+        # Margin (px) di sekitar bbox kepala untuk toleransi overlap
+        self.head_bbox_margin: float = 20.0
 
-        # Jarak maksimum center bola ke center kepala (fallback jika tidak overlap)
-        self.max_head_ball_center_distance: float = 60.0
+        # Jarak maks center bola → center kepala (fallback)
+        self.max_head_ball_center_distance: float = 80.0
 
         # ============================================================
-        # PARAMETER HEADING ATTEMPT (kapan dianggap "mencoba heading")
+        # PARAMETER ATTEMPT DETECTION
         # ============================================================
-        # Jarak maksimum bola ke center pemain untuk dianggap "approach"
-        self.max_approach_distance: float = 180.0
+        # Jarak maks bola → center pemain untuk dianggap "mendekati"
+        self.max_approach_distance: float = 200.0
 
-        # Minimum frame bola dekat pemain sebelum dianggap attempt
-        self.min_approach_frames: int = 3
-
-        # Cooldown setelah heading terdeteksi (frame)
+        # Cooldown setelah 1 heading event (frame), hindari double count
         self.cooldown_frames: int = 25
 
-        # Maksimum durasi approach sebelum reset (detik)
-        self.max_approach_duration_sec: float = 3.0
+        # Min frame bola harus jauh dari semua kepala sebelum attempt baru
+        self.min_away_frames: int = 5
 
-        # Minimum frame bola harus jauh sebelum attempt baru
-        self.min_away_frames: int = 8
+        # Maks durasi pendekatan sebelum auto-reset (detik)
+        self.max_approach_duration_sec: float = 4.0
 
-        # ============================================================
-        # INTERNAL STATE
-        # ============================================================
-        self._heading_events: List[Dict] = []
+        # Min frame approach sebelum bisa dianggap attempt
+        self.min_approach_frames: int = 2
 
     # ============================================================
-    # HELPER: CEK OVERLAP / KONTAK BBOX
+    # HELPER: OVERLAP & DISTANCE
     # ============================================================
 
     def _bbox_overlap(
@@ -57,20 +56,15 @@ class HeadingDetector:
         bbox_b: List[float],
         margin: float = 0.0
     ) -> bool:
-        """
-        Cek apakah dua bounding box overlap (dengan margin tambahan).
-        bbox format: [x1, y1, x2, y2]
-        """
+        """Cek apakah dua bbox overlap (+ margin pada bbox_b)."""
         ax1, ay1, ax2, ay2 = bbox_a
         bx1, by1, bx2, by2 = bbox_b
 
-        # Expand bbox_b dengan margin
         bx1 -= margin
         by1 -= margin
         bx2 += margin
         by2 += margin
 
-        # Cek overlap
         return not (ax2 < bx1 or ax1 > bx2 or ay2 < by1 or ay1 > by2)
 
     def _compute_iou(
@@ -78,7 +72,7 @@ class HeadingDetector:
         bbox_a: List[float],
         bbox_b: List[float]
     ) -> float:
-        """Hitung Intersection over Union antara dua bbox."""
+        """Intersection over Union."""
         ax1, ay1, ax2, ay2 = bbox_a
         bx1, by1, bx2, by2 = bbox_b
 
@@ -90,61 +84,33 @@ class HeadingDetector:
         if ix2 <= ix1 or iy2 <= iy1:
             return 0.0
 
-        inter_area = (ix2 - ix1) * (iy2 - iy1)
+        inter = (ix2 - ix1) * (iy2 - iy1)
         area_a = (ax2 - ax1) * (ay2 - ay1)
         area_b = (bx2 - bx1) * (by2 - by1)
-        union_area = area_a + area_b - inter_area
+        union = area_a + area_b - inter
 
-        if union_area <= 0:
-            return 0.0
+        return inter / union if union > 0 else 0.0
 
-        return inter_area / union_area
-
-    def _ball_touches_head(
+    def _ball_touches_any_head(
         self,
         ball_bbox: List[float],
-        head_bbox: List[float]
-    ) -> Tuple[bool, float, float]:
+        heads_in_frame: Dict[int, Dict],
+    ) -> Tuple[bool, int, float, float]:
         """
-        Cek apakah bola menyentuh kepala.
+        Cek apakah bola menyentuh SALAH SATU bbox kepala di frame ini.
 
         Returns:
-            (is_touching, distance_centers, iou)
-        """
-        ball_center = get_center_of_bbox(ball_bbox)
-        head_center = get_center_of_bbox(head_bbox)
-        dist = measure_distance(ball_center, head_center)
-        iou = self._compute_iou(ball_bbox, head_bbox)
-
-        # Kontak jika:
-        # 1. Bbox overlap (dengan margin), ATAU
-        # 2. Jarak center cukup dekat
-        is_overlap = self._bbox_overlap(ball_bbox, head_bbox, self.head_bbox_margin)
-        is_close = dist <= self.max_head_ball_center_distance
-
-        is_touching = is_overlap or is_close
-
-        return is_touching, dist, iou
-
-    def _find_nearest_head_to_player(
-        self,
-        player_bbox: List[float],
-        heads_in_frame: Dict[int, Dict]
-    ) -> Optional[Tuple[int, List[float]]]:
-        """
-        Cari bbox kepala (class Heading) yang paling dekat dengan pemain.
-        Kepala harus berada di bagian atas bbox pemain.
+            (is_touching, best_head_id, distance, iou)
         """
         if not heads_in_frame:
-            return None
+            return False, -1, float('inf'), 0.0
 
-        player_center = get_center_of_bbox(player_bbox)
-        px1, py1, px2, py2 = player_bbox
-        player_top_half_y = py1 + (py2 - py1) * 0.5  # setengah atas pemain
+        ball_center = get_center_of_bbox(ball_bbox)
 
-        best_head_id = None
-        best_head_bbox = None
+        best_touching = False
+        best_head_id = -1
         best_dist = float('inf')
+        best_iou = 0.0
 
         for head_id, head_data in heads_in_frame.items():
             head_bbox = head_data.get('bbox')
@@ -152,26 +118,50 @@ class HeadingDetector:
                 continue
 
             head_center = get_center_of_bbox(head_bbox)
-            hcx, hcy = head_center
+            dist = measure_distance(ball_center, head_center)
+            iou = self._compute_iou(ball_bbox, head_bbox)
 
-            # Kepala harus di bagian atas bbox pemain
-            if hcy > player_top_half_y:
-                continue
+            is_overlap = self._bbox_overlap(
+                ball_bbox, head_bbox, self.head_bbox_margin
+            )
+            is_close = dist <= self.max_head_ball_center_distance
 
-            # Kepala harus overlap secara horizontal dengan pemain
-            if hcx < px1 - 30 or hcx > px2 + 30:
-                continue
+            touching = is_overlap or is_close
 
-            dist = measure_distance(player_center, head_center)
+            # Pilih kepala terdekat
             if dist < best_dist:
                 best_dist = dist
                 best_head_id = head_id
-                best_head_bbox = head_bbox
+                best_iou = iou
+                best_touching = touching
 
-        if best_head_id is not None:
-            return best_head_id, best_head_bbox
+        return best_touching, best_head_id, best_dist, best_iou
 
-        return None
+    def _ball_near_any_head(
+        self,
+        ball_bbox: List[float],
+        heads_in_frame: Dict[int, Dict],
+    ) -> Tuple[bool, float]:
+        """
+        Cek apakah bola berada dekat dengan salah satu kepala
+        (zona approach, lebih besar dari zona contact).
+        """
+        if not heads_in_frame:
+            return False, float('inf')
+
+        ball_center = get_center_of_bbox(ball_bbox)
+        min_dist = float('inf')
+
+        for head_id, head_data in heads_in_frame.items():
+            head_bbox = head_data.get('bbox')
+            if head_bbox is None:
+                continue
+            head_center = get_center_of_bbox(head_bbox)
+            dist = measure_distance(ball_center, head_center)
+            if dist < min_dist:
+                min_dist = dist
+
+        return min_dist <= self.max_approach_distance, min_dist
 
     # ============================================================
     # DETEKSI HEADING — CORE LOGIC
@@ -183,41 +173,52 @@ class HeadingDetector:
         debug: bool = True
     ) -> List[Dict]:
         """
-        Deteksi semua heading events.
+        Deteksi heading langsung dari overlap bbox ball ↔ bbox Heading.
 
-        Logic sederhana:
-        1. Setiap frame, cari pasangan player ↔ head (class Heading)
-        2. Cek apakah bola overlap/menyentuh bbox kepala
-        3. State machine: idle → approaching → contact → resolved
-
-        Sukses = bola mengenai bbox kepala
-        Gagal  = bola dekat pemain tapi tidak mengenai kepala
+        Logic (sangat sederhana):
+        - Setiap frame, cek apakah bbox bola overlap dengan bbox kepala manapun
+        - Jika overlap → HEADING SUKSES
+        - Jika bola dekat pemain tapi tidak overlap kepala → HEADING GAGAL
+        - Cooldown untuk hindari double counting
         """
         total_frames = len(tracks['players'])
         if total_frames == 0:
             return []
 
-        has_heading_key = 'heading' in tracks and len(tracks['heading']) == total_frames
+        has_heading = 'heading' in tracks and len(tracks['heading']) == total_frames
         max_approach_frames = int(self.max_approach_duration_sec * self.fps)
 
         if debug:
             print(f"\n[HEADING] === HEADING DETECTION ===")
-            print(f"[HEADING] Total frames            : {total_frames}")
-            print(f"[HEADING] FPS                     : {self.fps}")
-            print(f"[HEADING] Head bbox margin        : {self.head_bbox_margin}px")
-            print(f"[HEADING] Max head-ball center dist: {self.max_head_ball_center_distance}px")
-            print(f"[HEADING] Approach distance        : {self.max_approach_distance}px")
-            print(f"[HEADING] Cooldown frames          : {self.cooldown_frames}")
-            print(f"[HEADING] Class 'Heading' tersedia : {'Ya' if has_heading_key else 'Tidak'}")
+            print(f"[HEADING] Total frames              : {total_frames}")
+            print(f"[HEADING] FPS                       : {self.fps}")
+            print(f"[HEADING] Head bbox margin          : {self.head_bbox_margin}px")
+            print(f"[HEADING] Max head-ball center dist  : {self.max_head_ball_center_distance}px")
+            print(f"[HEADING] Approach distance          : {self.max_approach_distance}px")
+            print(f"[HEADING] Cooldown frames            : {self.cooldown_frames}")
+            print(f"[HEADING] Min away frames            : {self.min_away_frames}")
+            print(f"[HEADING] Class 'Heading' tersedia   : {'Ya' if has_heading else 'Tidak'}")
             print(f"[HEADING] ================================\n")
 
-        if not has_heading_key:
+        if not has_heading:
             print("[HEADING] ERROR: tracks['heading'] tidak ditemukan!")
-            print("[HEADING] Pastikan Tracker mendeteksi class 'Heading' (index 0).")
             return []
 
-        # State per player
-        player_states: Dict[int, Dict[str, Any]] = {}
+        # ============================================================
+        # SIMPLE STATE MACHINE (global, bukan per-player)
+        # ============================================================
+        # Karena ini cek langsung ball↔head, tidak perlu per-player state.
+        # Cukup global state: idle → approaching → resolved
+        # ============================================================
+
+        state = 'idle'
+        approach_start_frame = -1
+        approach_frames = 0
+        away_frames = self.min_away_frames  # mulai bisa langsung
+        last_event_frame = -999
+        closest_head_dist_during_approach = float('inf')
+        best_head_id_during_approach = -1
+
         heading_events: List[Dict] = []
         event_id_counter = 0
 
@@ -225,207 +226,173 @@ class HeadingDetector:
             if frame_num % 200 == 0 and debug:
                 print(f"[HEADING] Processing frame {frame_num}/{total_frames}...")
 
-            # --- Data frame ini ---
+            # --- Data bola ---
             ball_data = tracks['ball'][frame_num].get(1)
+            if ball_data is None or 'bbox' not in ball_data:
+                # Bola tidak ada
+                if state == 'idle':
+                    away_frames += 1
+                continue
+
+            ball_bbox = ball_data['bbox']
+
+            # --- Data kepala (class Heading) ---
             heads_in_frame = tracks['heading'][frame_num]
-            players = tracks['players'][frame_num]
 
-            ball_bbox = None
-            ball_center = None
-            if ball_data and 'bbox' in ball_data:
-                ball_bbox = ball_data['bbox']
-                ball_center = get_center_of_bbox(ball_bbox)
+            # --- Cek kontak bola-kepala ---
+            touching, touch_head_id, touch_dist, touch_iou = \
+                self._ball_touches_any_head(ball_bbox, heads_in_frame)
 
-            # --- Proses setiap pemain ---
-            for player_id, player_data in players.items():
-                player_bbox = player_data.get('bbox')
-                if player_bbox is None:
+            # --- Cek bola dekat kepala (approach zone) ---
+            near_head, near_dist = self._ball_near_any_head(ball_bbox, heads_in_frame)
+
+            # --- Cek bola dekat pemain (untuk deteksi GAGAL) ---
+            ball_near_player = False
+            nearest_player_id = -1
+            ball_center = get_center_of_bbox(ball_bbox)
+
+            for pid, pdata in tracks['players'][frame_num].items():
+                pbbox = pdata.get('bbox')
+                if pbbox is None:
+                    continue
+                pcenter = get_center_of_bbox(pbbox)
+                pdist = measure_distance(ball_center, pcenter)
+                if pdist <= self.max_approach_distance:
+                    ball_near_player = True
+                    nearest_player_id = pid
+                    break
+
+            # ======== STATE MACHINE ========
+
+            if state == 'idle':
+                # Cooldown
+                if (frame_num - last_event_frame) < self.cooldown_frames:
                     continue
 
-                # Inisialisasi state
-                if player_id not in player_states:
-                    player_states[player_id] = {
-                        'state': 'idle',
-                        'approach_start_frame': -1,
-                        'approach_frames': 0,
-                        'last_event_frame': -999,
-                        'away_frames': self.min_away_frames,
-                        'head_touch_frames': 0,
-                        'closest_head_dist': float('inf'),
-                        'best_iou': 0.0,
-                        'matched_head_id': None,
+                # Bola harus sudah jauh cukup lama
+                if away_frames < self.min_away_frames:
+                    if not near_head and not ball_near_player:
+                        away_frames += 1
+                    continue
+
+                # --- LANGSUNG CEK KONTAK ---
+                # Bahkan tanpa approach, jika bola tiba-tiba overlap kepala
+                if touching:
+                    event_id_counter += 1
+                    event = {
+                        'event_id': event_id_counter,
+                        'player_id': nearest_player_id,
+                        'head_id': touch_head_id,
+                        'frame_start': frame_num,
+                        'frame_contact': frame_num,
+                        'frame_end': frame_num,
+                        'success': True,
+                        'head_ball_distance': round(touch_dist, 1),
+                        'iou': round(touch_iou, 3),
+                        'duration_frames': 0,
+                        'duration_seconds': 0.0,
                     }
+                    heading_events.append(event)
+                    last_event_frame = frame_num
+                    away_frames = 0
 
-                ps = player_states[player_id]
+                    if debug:
+                        print(f"[HEADING] Frame {frame_num}: HEADING SUKSES ✓ "
+                              f"(instant contact, head_id={touch_head_id}, "
+                              f"dist={touch_dist:.0f}px, IoU={touch_iou:.3f})")
+                    continue
 
-                # Cari kepala yang cocok dengan pemain ini
-                head_match = self._find_nearest_head_to_player(
-                    player_bbox, heads_in_frame
-                )
-                head_bbox = head_match[1] if head_match else None
-                head_id = head_match[0] if head_match else None
+                # Bola mendekat ke kepala?
+                if near_head or ball_near_player:
+                    state = 'approaching'
+                    approach_start_frame = frame_num
+                    approach_frames = 1
+                    closest_head_dist_during_approach = near_dist
+                    best_head_id_during_approach = touch_head_id
+                else:
+                    away_frames += 1
 
-                # Cek kontak bola-kepala
-                ball_touches_head = False
-                head_ball_dist = float('inf')
-                head_ball_iou = 0.0
+            elif state == 'approaching':
+                approach_frames += 1
 
-                if ball_bbox is not None and head_bbox is not None:
-                    ball_touches_head, head_ball_dist, head_ball_iou = \
-                        self._ball_touches_head(ball_bbox, head_bbox)
+                # Update closest
+                if near_dist < closest_head_dist_during_approach:
+                    closest_head_dist_during_approach = near_dist
 
-                # Cek bola dekat pemain
-                ball_near_player = False
-                if ball_center is not None:
-                    player_center = get_center_of_bbox(player_bbox)
-                    dist_ball_player = measure_distance(ball_center, player_center)
-                    ball_near_player = dist_ball_player <= self.max_approach_distance
+                # --- KONTAK! HEADING SUKSES ---
+                if touching:
+                    event_id_counter += 1
+                    event = {
+                        'event_id': event_id_counter,
+                        'player_id': nearest_player_id,
+                        'head_id': touch_head_id,
+                        'frame_start': approach_start_frame,
+                        'frame_contact': frame_num,
+                        'frame_end': frame_num,
+                        'success': True,
+                        'head_ball_distance': round(touch_dist, 1),
+                        'iou': round(touch_iou, 3),
+                        'duration_frames': approach_frames,
+                        'duration_seconds': round(approach_frames / self.fps, 2),
+                    }
+                    heading_events.append(event)
+                    last_event_frame = frame_num
+                    away_frames = 0
+                    state = 'idle'
 
-                # ======== STATE MACHINE ========
+                    if debug:
+                        print(f"[HEADING] Frame {frame_num}: HEADING SUKSES ✓ "
+                              f"(approach {approach_frames}f, "
+                              f"head_id={touch_head_id}, "
+                              f"dist={touch_dist:.0f}px, IoU={touch_iou:.3f})")
+                    continue
 
-                if ps['state'] == 'idle':
-                    # Cooldown check
-                    if (frame_num - ps['last_event_frame']) < self.cooldown_frames:
-                        continue
+                # --- TIMEOUT ---
+                if approach_frames > max_approach_frames:
+                    if debug:
+                        print(f"[HEADING] Frame {frame_num}: TIMEOUT "
+                              f"(approach {approach_frames}f) → reset")
+                    state = 'idle'
+                    away_frames = 0
+                    continue
 
-                    # Bola harus sudah cukup jauh sebelumnya
-                    if ps['away_frames'] < self.min_away_frames:
-                        if not ball_near_player:
-                            ps['away_frames'] += 1
-                        continue
-
-                    # Bola mendekat ke pemain?
-                    if ball_near_player and ball_bbox is not None:
-                        ps['state'] = 'approaching'
-                        ps['approach_start_frame'] = frame_num
-                        ps['approach_frames'] = 1
-                        ps['head_touch_frames'] = 1 if ball_touches_head else 0
-                        ps['closest_head_dist'] = head_ball_dist
-                        ps['best_iou'] = head_ball_iou
-                        ps['matched_head_id'] = head_id
-                    else:
-                        if not ball_near_player:
-                            ps['away_frames'] += 1
-
-                elif ps['state'] == 'approaching':
-                    ps['approach_frames'] += 1
-
-                    # Update tracking
-                    if head_ball_dist < ps['closest_head_dist']:
-                        ps['closest_head_dist'] = head_ball_dist
-                    if head_ball_iou > ps['best_iou']:
-                        ps['best_iou'] = head_ball_iou
-                    if ball_touches_head:
-                        ps['head_touch_frames'] += 1
-
-                    # --- CEK KONTAK BOLA-KEPALA → SUKSES ---
-                    if ball_touches_head:
+                # --- BOLA MENJAUH (tidak ada kepala & tidak dekat pemain) ---
+                if not near_head and not ball_near_player:
+                    # Bola pergi tanpa menyentuh kepala
+                    if approach_frames >= self.min_approach_frames:
                         event_id_counter += 1
-                        event = self._create_event(
-                            event_id=event_id_counter,
-                            player_id=player_id,
-                            frame_start=ps['approach_start_frame'],
-                            frame_contact=frame_num,
-                            success=True,
-                            head_ball_dist=head_ball_dist,
-                            iou=head_ball_iou,
-                            head_touch_frames=ps['head_touch_frames'],
-                            head_bbox=head_bbox,
-                            ball_bbox=ball_bbox,
-                        )
+                        event = {
+                            'event_id': event_id_counter,
+                            'player_id': nearest_player_id,
+                            'head_id': best_head_id_during_approach,
+                            'frame_start': approach_start_frame,
+                            'frame_contact': frame_num,
+                            'frame_end': frame_num,
+                            'success': False,
+                            'head_ball_distance': round(
+                                closest_head_dist_during_approach, 1
+                            ),
+                            'iou': 0.0,
+                            'duration_frames': approach_frames,
+                            'duration_seconds': round(
+                                approach_frames / self.fps, 2
+                            ),
+                        }
                         heading_events.append(event)
+                        last_event_frame = frame_num
 
                         if debug:
-                            print(f"[HEADING] Frame {frame_num}: HEADING SUKSES ✓ "
-                                  f"(Player {player_id}, "
-                                  f"dist={head_ball_dist:.0f}px, "
-                                  f"IoU={head_ball_iou:.2f})")
+                            print(f"[HEADING] Frame {frame_num}: HEADING GAGAL ✗ "
+                                  f"(bola menjauh tanpa kontak kepala, "
+                                  f"closest_dist="
+                                  f"{closest_head_dist_during_approach:.0f}px)")
 
-                        ps['state'] = 'idle'
-                        ps['last_event_frame'] = frame_num
-                        ps['away_frames'] = 0
-                        continue
+                    state = 'idle'
+                    away_frames = 0
 
-                    # --- BOLA DEKAT PEMAIN TAPI TIDAK KENA KEPALA ---
-                    # Jika bola sangat dekat badan (di bawah kepala) → GAGAL
-                    if (ball_near_player and
-                        ball_center is not None and
-                        head_bbox is not None and
-                        ps['approach_frames'] >= self.min_approach_frames):
-
-                        # Bola di bawah area kepala = kena badan
-                        head_bottom = head_bbox[3]  # y2 dari head bbox
-                        ball_cy = ball_center[1]
-
-                        if ball_cy > head_bottom and dist_ball_player < 100:
-                            event_id_counter += 1
-                            event = self._create_event(
-                                event_id=event_id_counter,
-                                player_id=player_id,
-                                frame_start=ps['approach_start_frame'],
-                                frame_contact=frame_num,
-                                success=False,
-                                head_ball_dist=head_ball_dist,
-                                iou=head_ball_iou,
-                                head_touch_frames=ps['head_touch_frames'],
-                                head_bbox=head_bbox,
-                                ball_bbox=ball_bbox,
-                            )
-                            heading_events.append(event)
-
-                            if debug:
-                                print(f"[HEADING] Frame {frame_num}: HEADING GAGAL ✗ "
-                                      f"(Player {player_id}, bola kena badan, "
-                                      f"head_dist={head_ball_dist:.0f}px)")
-
-                            ps['state'] = 'idle'
-                            ps['last_event_frame'] = frame_num
-                            ps['away_frames'] = 0
-                            continue
-
-                    # --- TIMEOUT ---
-                    if ps['approach_frames'] > max_approach_frames:
-                        if debug:
-                            print(f"[HEADING] Frame {frame_num}: TIMEOUT "
-                                  f"(Player {player_id})")
-                        ps['state'] = 'idle'
-                        ps['away_frames'] = 0
-                        continue
-
-                    # --- BOLA MENJAUH → RESOLVE ---
-                    if not ball_near_player:
-                        if ps['approach_frames'] >= self.min_approach_frames:
-                            # Pernah kontak kepala?
-                            success = ps['head_touch_frames'] >= 2
-
-                            event_id_counter += 1
-                            event = self._create_event(
-                                event_id=event_id_counter,
-                                player_id=player_id,
-                                frame_start=ps['approach_start_frame'],
-                                frame_contact=frame_num,
-                                success=success,
-                                head_ball_dist=ps['closest_head_dist'],
-                                iou=ps['best_iou'],
-                                head_touch_frames=ps['head_touch_frames'],
-                                head_bbox=head_bbox,
-                                ball_bbox=ball_bbox,
-                            )
-                            heading_events.append(event)
-
-                            status = "SUKSES ✓" if success else "GAGAL ✗"
-                            if debug:
-                                print(f"[HEADING] Frame {frame_num}: {status} "
-                                      f"(Player {player_id}, bola menjauh, "
-                                      f"head_touch={ps['head_touch_frames']})")
-
-                            ps['last_event_frame'] = frame_num
-
-                        ps['state'] = 'idle'
-                        ps['away_frames'] = 0
-
-        self._heading_events = heading_events
-
+        # ============================================================
+        # HASIL
+        # ============================================================
         if debug:
             sukses = sum(1 for e in heading_events if e['success'])
             gagal = sum(1 for e in heading_events if not e['success'])
@@ -435,41 +402,62 @@ class HeadingDetector:
             print(f"[HEADING] SUKSES          : {sukses}")
             print(f"[HEADING] GAGAL           : {gagal}")
             if total > 0:
-                print(f"[HEADING] Akurasi         : {sukses/total*100:.1f}%")
+                print(f"[HEADING] Akurasi         : "
+                      f"{sukses/total*100:.1f}%")
             print(f"[HEADING] =====================\n")
 
         return heading_events
 
-    def _create_event(
+    # ============================================================
+    # DEBUG: Print jarak bola-kepala per frame (untuk tuning)
+    # ============================================================
+
+    def debug_distances(
         self,
-        event_id: int,
-        player_id: int,
-        frame_start: int,
-        frame_contact: int,
-        success: bool,
-        head_ball_dist: float,
-        iou: float,
-        head_touch_frames: int,
-        head_bbox: Optional[List[float]],
-        ball_bbox: Optional[List[float]],
-    ) -> Dict:
-        return {
-            'event_id': event_id,
-            'player_id': player_id,
-            'frame_start': frame_start,
-            'frame_contact': frame_contact,
-            'frame_end': frame_contact,
-            'success': success,
-            'head_ball_distance': round(head_ball_dist, 1),
-            'iou': round(iou, 3),
-            'head_touch_frames': head_touch_frames,
-            'head_bbox': head_bbox,
-            'ball_bbox': ball_bbox,
-            'duration_frames': frame_contact - frame_start,
-            'duration_seconds': round(
-                (frame_contact - frame_start) / self.fps, 2
-            ),
-        }
+        tracks: Dict,
+        sample_every: int = 10,
+    ) -> None:
+        """
+        Print jarak bola ke semua kepala setiap N frame.
+        Berguna untuk tuning parameter.
+        """
+        total_frames = len(tracks['players'])
+        print(f"\n[DEBUG] === JARAK BOLA-KEPALA (setiap {sample_every} frame) ===")
+        print(f"{'Frame':<8} {'BallPos':<20} {'HeadID':<8} "
+              f"{'HeadPos':<20} {'Dist':<10} {'Overlap':<10}")
+        print("-" * 80)
+
+        for f in range(0, total_frames, sample_every):
+            ball_data = tracks['ball'][f].get(1)
+            if not ball_data or 'bbox' not in ball_data:
+                continue
+
+            ball_bbox = ball_data['bbox']
+            ball_center = get_center_of_bbox(ball_bbox)
+
+            heads = tracks['heading'][f]
+            if not heads:
+                continue
+
+            for hid, hdata in heads.items():
+                hbbox = hdata.get('bbox')
+                if hbbox is None:
+                    continue
+                hcenter = get_center_of_bbox(hbbox)
+                dist = measure_distance(ball_center, hcenter)
+                overlap = self._bbox_overlap(
+                    ball_bbox, hbbox, self.head_bbox_margin
+                )
+
+                print(f"{f:<8} "
+                      f"({ball_center[0]:.0f},{ball_center[1]:.0f}){'':<8} "
+                      f"{hid:<8} "
+                      f"({hcenter[0]:.0f},{hcenter[1]:.0f}){'':<8} "
+                      f"{dist:<10.1f} "
+                      f"{'YA' if overlap else '-':<10}")
+
+        print("-" * 80)
+        print()
 
     # ============================================================
     # STATISTIK
@@ -504,7 +492,9 @@ class HeadingDetector:
             'total_headings': total,
             'successful_headings': len(sukses),
             'failed_headings': len(gagal),
-            'accuracy_pct': round(len(sukses) / total * 100, 1) if total > 0 else 0.0,
+            'accuracy_pct': round(
+                len(sukses) / total * 100, 1
+            ) if total > 0 else 0.0,
             'avg_dist_success': avg_dist_success,
             'avg_iou_success': avg_iou_success,
             'player_stats': player_stats,
