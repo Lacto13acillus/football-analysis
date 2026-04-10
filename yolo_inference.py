@@ -2,7 +2,7 @@ from ultralytics import YOLO
 
 model = YOLO('/home/dika/football-analysis/models/best.pt')
 
-results = model.predict('./input_videos/heading.mp4', save=True)
+results = model.predict('./input_videos/dribbling_count.mp4', save=True)
 print(results[0])
 separator = '==================================='
 print(separator)
