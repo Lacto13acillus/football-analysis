@@ -1,8 +1,8 @@
 from ultralytics import YOLO
 
-model = YOLO('/home/dika/football-analysis/models/dribbling-models.pt')
+model = YOLO('/home/dika/football-analysis/models/longpass.pt')
 
-results = model.predict('./input_videos/dribbling_count.mp4', save=True)
+results = model.predict('./input_videos/longpass.mp4', save=True)
 print(results[0])
 separator = '==================================='
 print(separator)
