@@ -26,13 +26,13 @@ class LongPassDetector:
         # PARAMETER POSSESSION (bola dekat kaki = memiliki bola)
         # ============================================================
         # Jarak maks bola ke kaki pemain untuk dianggap "possession"
-        self.ball_possession_distance: float = 100.0
+        self.ball_possession_distance: float = 150.0
 
         # ============================================================
         # PARAMETER KICK DETECTION
         # ============================================================
         # Jarak minimal bola dari pengirim agar dianggap "sudah ditendang"
-        self.kick_away_distance: float = 150.0
+        self.kick_away_distance: float = 200.0
 
         # Min frames bola harus dekat pemain sebelum dianggap possession valid
         self.min_possession_frames: int = 3
@@ -41,10 +41,16 @@ class LongPassDetector:
         # PARAMETER RECEIVE DETECTION
         # ============================================================
         # Jarak maks bola ke kaki penerima agar dianggap "diterima"
-        self.receive_distance: float = 120.0
+        self.receive_distance: float = 200.0
 
         # Min frames bola harus dekat kaki penerima untuk konfirmasi
         self.min_receive_frames: int = 2
+
+        # Adaptive scaling: skala receive_distance berdasarkan tinggi bbox pemain
+        # Jika pemain bbox lebih besar (dekat kamera), threshold lebih besar.
+        # Multiplier: receive_distance * (player_bbox_height / reference_height)
+        self.adaptive_receive: bool = True
+        self.reference_player_height: float = 200.0  # pixel tinggi bbox referensi
 
         # ============================================================
         # PARAMETER FLIGHT / TIMEOUT
@@ -89,6 +95,42 @@ class LongPassDetector:
                 continue
             positions[pid] = get_foot_position(bbox)
         return positions
+
+    def _get_player_bbox_height(
+        self,
+        tracks: Dict,
+        frame_num: int,
+        player_id: int
+    ) -> float:
+        """Ambil tinggi bbox pemain di frame tertentu."""
+        pdata = tracks['players'][frame_num].get(player_id)
+        if pdata is None:
+            return self.reference_player_height
+        bbox = pdata.get('bbox')
+        if bbox is None:
+            return self.reference_player_height
+        return max(1.0, bbox[3] - bbox[1])
+
+    def _get_adaptive_receive_distance(
+        self,
+        tracks: Dict,
+        frame_num: int,
+        player_id: int
+    ) -> float:
+        """
+        Hitung receive_distance adaptif berdasarkan ukuran bbox pemain.
+        Pemain yang bbox-nya lebih besar (lebih dekat kamera) butuh
+        threshold lebih besar karena pixel-nya lebih banyak.
+        """
+        if not self.adaptive_receive:
+            return self.receive_distance
+
+        player_height = self._get_player_bbox_height(tracks, frame_num, player_id)
+        scale = player_height / self.reference_player_height
+        # Clamp scale agar tidak terlalu ekstrem
+        scale = max(0.6, min(2.5, scale))
+        adaptive_dist = self.receive_distance * scale
+        return adaptive_dist
 
     def _get_player_center_positions(
         self,
@@ -336,14 +378,31 @@ class LongPassDetector:
             elif state == 'ball_in_air':
                 flight_frames += 1
 
+                # Hitung adaptive receive distance untuk penerima
+                current_recv_dist = self._get_adaptive_receive_distance(
+                    tracks, frame_num, receiver_id
+                )
+
                 # Update closest distance ke penerima
                 dist_receiver = dist_to_b if receiver_id == player_b else dist_to_a
                 if dist_receiver < closest_to_receiver:
                     closest_to_receiver = dist_receiver
 
+                # Debug: print jarak setiap 10 frame saat flight
+                if debug and flight_frames % 10 == 0:
+                    print(f"[LONGPASS]   flight f={frame_num}: "
+                          f"dist_recv={dist_receiver:.0f}px "
+                          f"(threshold={current_recv_dist:.0f}px), "
+                          f"closest={closest_to_receiver:.0f}px")
+
                 # --- CEK BOLA DITERIMA ---
-                if dist_receiver <= self.receive_distance:
+                if dist_receiver <= current_recv_dist:
                     receive_frames += 1
+
+                    if debug:
+                        print(f"[LONGPASS]   f={frame_num}: bola DEKAT penerima! "
+                              f"dist={dist_receiver:.0f}px <= {current_recv_dist:.0f}px "
+                              f"(receive_frames={receive_frames}/{self.min_receive_frames})")
 
                     if receive_frames >= self.min_receive_frames:
                         # LONGPASS SUKSES!
@@ -372,15 +431,18 @@ class LongPassDetector:
                             print(f"[LONGPASS] Frame {frame_num}: LONGPASS SUKSES ✓ "
                                   f"(P{sender_id}→P{receiver_id}, "
                                   f"flight={flight_frames}f/{flight_frames/self.fps:.1f}s, "
-                                  f"recv_dist={dist_receiver:.0f}px)")
+                                  f"recv_dist={dist_receiver:.0f}px, "
+                                  f"threshold={current_recv_dist:.0f}px)")
                         continue
                 else:
                     receive_frames = 0
 
                 # --- CEK BOLA KEMBALI KE PENGIRIM ---
+                # Gunakan ball_possession_distance (bukan receive_distance)
+                # agar tidak terlalu agresif menandai GAGAL
                 dist_sender = dist_to_a if sender_id == player_a else dist_to_b
-                if dist_sender <= self.receive_distance and flight_frames > 10:
-                    # Bola kembali ke pengirim — GAGAL
+                if dist_sender <= self.ball_possession_distance and flight_frames > 15:
+                    # Bola benar-benar kembali dekat kaki pengirim — GAGAL
                     event_id_counter += 1
                     event = {
                         'event_id': event_id_counter,
@@ -406,7 +468,8 @@ class LongPassDetector:
                     if debug:
                         print(f"[LONGPASS] Frame {frame_num}: LONGPASS GAGAL ✗ "
                               f"(bola kembali ke pengirim P{sender_id}, "
-                              f"closest={closest_to_receiver:.0f}px)")
+                              f"dist_sender={dist_sender:.0f}px, "
+                              f"closest_to_recv={closest_to_receiver:.0f}px)")
                     continue
 
                 # --- TIMEOUT ---
