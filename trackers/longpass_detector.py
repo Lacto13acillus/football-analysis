@@ -32,7 +32,7 @@ class LongPassDetector:
         # PARAMETER KICK DETECTION
         # ============================================================
         # Jarak minimal bola dari pengirim agar dianggap "sudah ditendang"
-        self.kick_away_distance: float = 200.0
+        self.kick_away_distance: float = 150.0
 
         # Min frames bola harus dekat pemain sebelum dianggap possession valid
         self.min_possession_frames: int = 3
@@ -95,6 +95,37 @@ class LongPassDetector:
                 continue
             positions[pid] = get_foot_position(bbox)
         return positions
+
+    def _get_min_distance_to_player(
+        self,
+        ball_pos: Tuple[int, int],
+        tracks: Dict,
+        frame_num: int,
+        player_id: int,
+    ) -> float:
+        """
+        Hitung jarak MINIMAL bola ke pemain.
+        Cek jarak ke KAKI (bottom-center) DAN BADAN (center) bbox,
+        ambil yang terkecil.
+
+        Ini penting karena pemain bisa menerima bola dengan:
+        - Kaki → bola dekat bottom-center bbox
+        - Dada/badan → bola dekat center bbox
+        """
+        pdata = tracks['players'][frame_num].get(player_id)
+        if pdata is None:
+            return float('inf')
+        bbox = pdata.get('bbox')
+        if bbox is None:
+            return float('inf')
+
+        foot_pos = get_foot_position(bbox)
+        center_pos = get_center_of_bbox(bbox)
+
+        dist_foot = measure_distance(ball_pos, foot_pos)
+        dist_center = measure_distance(ball_pos, center_pos)
+
+        return min(dist_foot, dist_center)
 
     def _get_player_bbox_height(
         self,
@@ -301,14 +332,13 @@ class LongPassDetector:
 
             player_foot_positions = self._get_player_foot_positions(tracks, frame_num)
 
-            # Jarak bola ke kaki masing-masing pemain
-            dist_to_a = float('inf')
-            dist_to_b = float('inf')
-
-            if player_a in player_foot_positions:
-                dist_to_a = measure_distance(ball_pos, player_foot_positions[player_a])
-            if player_b in player_foot_positions:
-                dist_to_b = measure_distance(ball_pos, player_foot_positions[player_b])
+            # Jarak bola ke masing-masing pemain (min dari kaki dan badan)
+            dist_to_a = self._get_min_distance_to_player(
+                ball_pos, tracks, frame_num, player_a
+            )
+            dist_to_b = self._get_min_distance_to_player(
+                ball_pos, tracks, frame_num, player_b
+            )
 
             # ======== STATE MACHINE ========
 

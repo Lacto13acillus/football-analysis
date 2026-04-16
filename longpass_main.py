@@ -47,7 +47,7 @@ CONFIG = {
 
     # PARAMETER LONGPASS
     "ball_possession_distance" : 150.0,
-    "kick_away_distance"       : 200.0,
+    "kick_away_distance"       : 150.0,
     "receive_distance"         : 200.0,
     "min_possession_frames"    : 3,
     "min_receive_frames"       : 2,
