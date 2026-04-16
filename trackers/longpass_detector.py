@@ -230,8 +230,82 @@ class LongPassDetector:
         return most_common[0][0], most_common[1][0]
 
     # ============================================================
-    # DETEKSI LONG PASS — CORE LOGIC
+    # DETEKSI LONG PASS — CORE LOGIC (ID-AGNOSTIC)
     # ============================================================
+
+    def _get_nearest_player_distance(
+        self,
+        ball_pos: Tuple[int, int],
+        tracks: Dict,
+        frame_num: int,
+    ) -> Tuple[int, float]:
+        """
+        Cari pemain MANAPUN yang paling dekat ke bola di frame ini.
+        Cek jarak ke kaki DAN badan, ambil yang paling kecil.
+
+        Returns:
+            (player_id, min_distance)
+        """
+        best_pid = -1
+        best_dist = float('inf')
+
+        for pid, pdata in tracks['players'][frame_num].items():
+            bbox = pdata.get('bbox')
+            if bbox is None:
+                continue
+            foot_pos = get_foot_position(bbox)
+            center_pos = get_center_of_bbox(bbox)
+            dist = min(
+                measure_distance(ball_pos, foot_pos),
+                measure_distance(ball_pos, center_pos),
+            )
+            if dist < best_dist:
+                best_dist = dist
+                best_pid = pid
+
+        return best_pid, best_dist
+
+    def _get_nearest_player_excluding_position(
+        self,
+        ball_pos: Tuple[int, int],
+        tracks: Dict,
+        frame_num: int,
+        exclude_position: Tuple[int, int],
+        min_separation: float = 150.0,
+    ) -> Tuple[int, float]:
+        """
+        Cari pemain terdekat ke bola, tapi BUKAN pemain yang
+        berada di dekat exclude_position (= posisi pengirim saat kick).
+
+        Ini untuk mencari penerima tanpa bergantung pada tracking ID.
+
+        Returns:
+            (player_id, min_distance_to_ball)
+        """
+        best_pid = -1
+        best_dist = float('inf')
+
+        for pid, pdata in tracks['players'][frame_num].items():
+            bbox = pdata.get('bbox')
+            if bbox is None:
+                continue
+
+            player_center = get_center_of_bbox(bbox)
+
+            # Skip pemain yang terlalu dekat dengan posisi sender saat kick
+            if measure_distance(player_center, exclude_position) < min_separation:
+                continue
+
+            foot_pos = get_foot_position(bbox)
+            dist = min(
+                measure_distance(ball_pos, foot_pos),
+                measure_distance(ball_pos, player_center),
+            )
+            if dist < best_dist:
+                best_dist = dist
+                best_pid = pid
+
+        return best_pid, best_dist
 
     def detect_longpasses(
         self,
@@ -241,27 +315,12 @@ class LongPassDetector:
         """
         Deteksi long pass dari tracking data.
 
+        VERSI ID-AGNOSTIC: Tidak bergantung pada fixed player ID.
+        ByteTrack sering reassign ID, jadi kita cari pemain terdekat
+        ke bola di setiap frame, bukan track ID tetap.
+
         Logic (State Machine):
-            IDLE:
-                - Monitor bola. Jika bola dekat kaki salah satu pemain
-                  (possession), tunggu sampai bola pergi.
-
-            KICK_DETECTED:
-                - Bola mulai menjauh dari pemain pengirim.
-                  Masuk state BALL_IN_AIR.
-
-            BALL_IN_AIR:
-                - Tracking jarak bola ke kedua pemain.
-                - Jika bola mendekati kaki pemain LAIN (bukan pengirim)
-                  → cek apakah bola benar-benar diterima.
-
-            RECEIVED (= SUKSES):
-                - Bola dekat kaki penerima selama beberapa frame.
-                - Longpass berhasil!
-
-            MISSED (= GAGAL):
-                - Bola tidak sampai ke kaki penerima:
-                  timeout, keluar frame, atau menjauh.
+            IDLE → WAITING_KICK → BALL_IN_AIR → SUKSES/GAGAL → IDLE
 
         Returns:
             List[Dict] berisi event longpass
@@ -270,15 +329,10 @@ class LongPassDetector:
         if total_frames == 0:
             return []
 
-        # Identifikasi 2 pemain
-        player_a, player_b = self._identify_two_players(tracks)
-
         if debug:
-            print(f"\n[LONGPASS] === LONG PASS DETECTION ===")
+            print(f"\n[LONGPASS] === LONG PASS DETECTION (ID-AGNOSTIC) ===")
             print(f"[LONGPASS] Total frames           : {total_frames}")
             print(f"[LONGPASS] FPS                    : {self.fps}")
-            print(f"[LONGPASS] Player A (ID)          : {player_a}")
-            print(f"[LONGPASS] Player B (ID)          : {player_b}")
             print(f"[LONGPASS] Possession distance    : {self.ball_possession_distance}px")
             print(f"[LONGPASS] Kick away distance     : {self.kick_away_distance}px")
             print(f"[LONGPASS] Receive distance       : {self.receive_distance}px")
@@ -286,43 +340,35 @@ class LongPassDetector:
             print(f"[LONGPASS] Cooldown frames        : {self.cooldown_frames}")
             print(f"[LONGPASS] ================================\n")
 
-        if player_a == -1 or player_b == -1:
-            print("[LONGPASS] ERROR: Tidak bisa mengidentifikasi 2 pemain!")
-            return []
-
         # ============================================================
-        # STATE MACHINE
+        # STATE MACHINE (ID-AGNOSTIC)
         # ============================================================
 
         state = 'idle'
-        sender_id = -1
-        receiver_id = -1
+        sender_id = -1            # ID pemain pengirim (bisa berubah tiap event)
+        sender_position = None    # Posisi pengirim saat kick (untuk identifikasi)
         kick_frame = -1
         flight_frames = 0
         receive_frames = 0
         possession_frames = 0
         current_possessor = -1
         last_event_frame = -999
-        away_frames = self.min_away_frames  # Mulai bisa langsung
+        away_frames = self.min_away_frames
 
         longpass_events: List[Dict] = []
         event_id_counter = 0
-
-        # Track closest distance saat flight
         closest_to_receiver = float('inf')
 
         for frame_num in range(total_frames):
             if frame_num % 200 == 0 and debug:
                 print(f"[LONGPASS] Processing frame {frame_num}/{total_frames}...")
 
-            # --- Ambil data ---
+            # --- Ambil posisi bola ---
             ball_pos = self._get_ball_position(tracks, frame_num)
             if ball_pos is None:
-                # Bola tidak terdeteksi
                 if state == 'ball_in_air':
                     flight_frames += 1
                     if flight_frames > self.max_flight_frames:
-                        # Timeout
                         if debug:
                             print(f"[LONGPASS] Frame {frame_num}: TIMEOUT "
                                   f"— bola tidak terdeteksi selama flight")
@@ -330,58 +376,78 @@ class LongPassDetector:
                         away_frames = 0
                 continue
 
-            player_foot_positions = self._get_player_foot_positions(tracks, frame_num)
-
-            # Jarak bola ke masing-masing pemain (min dari kaki dan badan)
-            dist_to_a = self._get_min_distance_to_player(
-                ball_pos, tracks, frame_num, player_a
-            )
-            dist_to_b = self._get_min_distance_to_player(
-                ball_pos, tracks, frame_num, player_b
+            # --- Cari pemain terdekat ke bola (ID-agnostic) ---
+            nearest_pid, nearest_dist = self._get_nearest_player_distance(
+                ball_pos, tracks, frame_num
             )
 
             # ======== STATE MACHINE ========
 
             if state == 'idle':
-                # Cooldown check
+                # Cooldown
                 if (frame_num - last_event_frame) < self.cooldown_frames:
                     continue
 
-                # Bola harus sudah jauh cukup lama sebelum event baru
+                # Away frames
                 if away_frames < self.min_away_frames:
-                    # Cek apakah bola jauh dari semua pemain
-                    min_dist = min(dist_to_a, dist_to_b)
-                    if min_dist > self.ball_possession_distance:
+                    if nearest_dist > self.ball_possession_distance:
                         away_frames += 1
                     continue
 
-                # Cek possession: bola dekat kaki siapa?
-                if dist_to_a <= self.ball_possession_distance:
-                    possession_frames += 1
-                    current_possessor = player_a
-                elif dist_to_b <= self.ball_possession_distance:
-                    possession_frames += 1
-                    current_possessor = player_b
+                # Cek possession: bola dekat pemain manapun?
+                if nearest_dist <= self.ball_possession_distance and nearest_pid != -1:
+                    if current_possessor == nearest_pid:
+                        possession_frames += 1
+                    else:
+                        # Pemain baru, reset counter
+                        current_possessor = nearest_pid
+                        possession_frames = 1
                 else:
                     possession_frames = 0
                     current_possessor = -1
 
-                # Jika sudah possession cukup lama, tunggu kick
+                # Possession cukup lama → siap menunggu kick
                 if possession_frames >= self.min_possession_frames and current_possessor != -1:
                     sender_id = current_possessor
-                    receiver_id = player_b if sender_id == player_a else player_a
                     state = 'waiting_kick'
 
                     if debug:
                         print(f"[LONGPASS] Frame {frame_num}: Player {sender_id} "
-                              f"memiliki bola (possession {possession_frames}f)")
+                              f"memiliki bola (possession {possession_frames}f, "
+                              f"dist={nearest_dist:.0f}px)")
 
             elif state == 'waiting_kick':
-                # Tunggu bola menjauh dari pengirim
-                dist_sender = dist_to_a if sender_id == player_a else dist_to_b
+                # Cek jarak bola ke sender saat ini
+                dist_sender = self._get_min_distance_to_player(
+                    ball_pos, tracks, frame_num, sender_id
+                )
+                # Jika sender ID hilang, coba cari pemain dekat posisi sender
+                if dist_sender == float('inf'):
+                    # Sender hilang dari tracking, gunakan nearest player
+                    # yang dekat dengan bola terakhir (masih holding)
+                    if nearest_dist <= self.ball_possession_distance:
+                        sender_id = nearest_pid
+                        dist_sender = nearest_dist
+                    else:
+                        # Bola sudah jauh, anggap ditendang
+                        dist_sender = self.kick_away_distance + 1
 
                 if dist_sender > self.kick_away_distance:
                     # Bola sudah ditendang!
+                    # Simpan posisi sender saat kick untuk identifikasi
+                    pdata = tracks['players'][frame_num].get(sender_id)
+                    if pdata and 'bbox' in pdata:
+                        sender_position = get_center_of_bbox(pdata['bbox'])
+                    else:
+                        # Cari di frame sebelumnya
+                        for back_f in range(frame_num - 1, max(0, frame_num - 10) - 1, -1):
+                            pdata = tracks['players'][back_f].get(sender_id)
+                            if pdata and 'bbox' in pdata:
+                                sender_position = get_center_of_bbox(pdata['bbox'])
+                                break
+                        else:
+                            sender_position = ball_pos  # fallback ke posisi bola
+
                     state = 'ball_in_air'
                     kick_frame = frame_num
                     flight_frames = 0
@@ -390,48 +456,65 @@ class LongPassDetector:
 
                     if debug:
                         print(f"[LONGPASS] Frame {frame_num}: KICK DETECTED! "
-                              f"Player {sender_id} → Player {receiver_id} "
-                              f"(dist_sender={dist_sender:.0f}px)")
-                elif dist_sender > self.ball_possession_distance:
-                    # Bola mulai menjauh tapi belum cukup
-                    pass
-                else:
-                    # Masih dekat pengirim — terus tunggu
-                    # Tapi cek apakah pemain berganti
-                    dist_other = dist_to_b if sender_id == player_a else dist_to_a
-                    if dist_other < dist_sender and dist_other <= self.ball_possession_distance:
-                        # Possession pindah tanpa kick yang jelas — reset
-                        state = 'idle'
-                        possession_frames = 0
-                        away_frames = self.min_away_frames
+                              f"Player {sender_id} "
+                              f"(dist_sender={dist_sender:.0f}px, "
+                              f"sender_pos={sender_position})")
+
+                elif dist_sender <= self.ball_possession_distance:
+                    # Masih dekat sender, tapi cek jika pemain lain ambil
+                    if nearest_pid != sender_id and nearest_dist < dist_sender:
+                        if nearest_dist <= self.ball_possession_distance:
+                            state = 'idle'
+                            possession_frames = 0
+                            away_frames = self.min_away_frames
 
             elif state == 'ball_in_air':
                 flight_frames += 1
 
-                # Hitung adaptive receive distance untuk penerima
-                current_recv_dist = self._get_adaptive_receive_distance(
-                    tracks, frame_num, receiver_id
+                # Cari pemain terdekat ke bola YANG BUKAN sender
+                # (gunakan posisi sender saat kick untuk membedakan)
+                recv_pid, dist_receiver = self._get_nearest_player_excluding_position(
+                    ball_pos, tracks, frame_num,
+                    exclude_position=sender_position if sender_position else (0, 0),
+                    min_separation=100.0,
                 )
 
-                # Update closest distance ke penerima
-                dist_receiver = dist_to_b if receiver_id == player_b else dist_to_a
+                # Juga cek jarak ke sender (untuk deteksi bola kembali)
+                dist_sender = self._get_min_distance_to_player(
+                    ball_pos, tracks, frame_num, sender_id
+                )
+                # Jika sender ID hilang, cek nearest player dekat sender_position
+                if dist_sender == float('inf') and sender_position:
+                    for pid, pdata in tracks['players'][frame_num].items():
+                        bbox = pdata.get('bbox')
+                        if bbox is None:
+                            continue
+                        pc = get_center_of_bbox(bbox)
+                        if measure_distance(pc, sender_position) < 100:
+                            dist_sender = self._get_min_distance_to_player(
+                                ball_pos, tracks, frame_num, pid
+                            )
+                            break
+
+                # Update closest
                 if dist_receiver < closest_to_receiver:
                     closest_to_receiver = dist_receiver
 
-                # Debug: print jarak setiap 10 frame saat flight
+                # Debug setiap 10 frame
                 if debug and flight_frames % 10 == 0:
                     print(f"[LONGPASS]   flight f={frame_num}: "
-                          f"dist_recv={dist_receiver:.0f}px "
-                          f"(threshold={current_recv_dist:.0f}px), "
+                          f"recv_pid={recv_pid}, "
+                          f"dist_recv={dist_receiver:.0f}px, "
+                          f"dist_sender={dist_sender:.0f}px, "
                           f"closest={closest_to_receiver:.0f}px")
 
                 # --- CEK BOLA DITERIMA ---
-                if dist_receiver <= current_recv_dist:
+                if dist_receiver <= self.receive_distance and recv_pid != -1:
                     receive_frames += 1
 
                     if debug:
-                        print(f"[LONGPASS]   f={frame_num}: bola DEKAT penerima! "
-                              f"dist={dist_receiver:.0f}px <= {current_recv_dist:.0f}px "
+                        print(f"[LONGPASS]   f={frame_num}: bola DEKAT penerima "
+                              f"P{recv_pid}! dist={dist_receiver:.0f}px "
                               f"(receive_frames={receive_frames}/{self.min_receive_frames})")
 
                     if receive_frames >= self.min_receive_frames:
@@ -440,7 +523,7 @@ class LongPassDetector:
                         event = {
                             'event_id': event_id_counter,
                             'sender_id': sender_id,
-                            'receiver_id': receiver_id,
+                            'receiver_id': recv_pid,
                             'frame_kick': kick_frame,
                             'frame_receive': frame_num,
                             'frame_start': kick_frame,
@@ -459,25 +542,21 @@ class LongPassDetector:
 
                         if debug:
                             print(f"[LONGPASS] Frame {frame_num}: LONGPASS SUKSES ✓ "
-                                  f"(P{sender_id}→P{receiver_id}, "
-                                  f"flight={flight_frames}f/{flight_frames/self.fps:.1f}s, "
-                                  f"recv_dist={dist_receiver:.0f}px, "
-                                  f"threshold={current_recv_dist:.0f}px)")
+                                  f"(P{sender_id}→P{recv_pid}, "
+                                  f"flight={flight_frames}f/"
+                                  f"{flight_frames/self.fps:.1f}s, "
+                                  f"recv_dist={dist_receiver:.0f}px)")
                         continue
                 else:
                     receive_frames = 0
 
                 # --- CEK BOLA KEMBALI KE PENGIRIM ---
-                # Gunakan ball_possession_distance (bukan receive_distance)
-                # agar tidak terlalu agresif menandai GAGAL
-                dist_sender = dist_to_a if sender_id == player_a else dist_to_b
                 if dist_sender <= self.ball_possession_distance and flight_frames > 15:
-                    # Bola benar-benar kembali dekat kaki pengirim — GAGAL
                     event_id_counter += 1
                     event = {
                         'event_id': event_id_counter,
                         'sender_id': sender_id,
-                        'receiver_id': receiver_id,
+                        'receiver_id': recv_pid if recv_pid != -1 else -1,
                         'frame_kick': kick_frame,
                         'frame_receive': frame_num,
                         'frame_start': kick_frame,
@@ -497,19 +576,16 @@ class LongPassDetector:
 
                     if debug:
                         print(f"[LONGPASS] Frame {frame_num}: LONGPASS GAGAL ✗ "
-                              f"(bola kembali ke pengirim P{sender_id}, "
-                              f"dist_sender={dist_sender:.0f}px, "
-                              f"closest_to_recv={closest_to_receiver:.0f}px)")
+                              f"(bola kembali, dist_sender={dist_sender:.0f}px)")
                     continue
 
                 # --- TIMEOUT ---
                 if flight_frames > self.max_flight_frames:
-                    # Timeout — bola di udara terlalu lama
                     event_id_counter += 1
                     event = {
                         'event_id': event_id_counter,
                         'sender_id': sender_id,
-                        'receiver_id': receiver_id,
+                        'receiver_id': recv_pid if recv_pid != -1 else -1,
                         'frame_kick': kick_frame,
                         'frame_receive': frame_num,
                         'frame_start': kick_frame,
@@ -561,45 +637,42 @@ class LongPassDetector:
         sample_every: int = 10,
     ) -> None:
         """
-        Print jarak bola ke kaki semua pemain setiap N frame.
-        Berguna untuk tuning parameter.
+        Print jarak bola ke SEMUA pemain (kaki & badan) setiap N frame.
+        ID-agnostic: menunjukkan semua player ID di setiap frame.
         """
         total_frames = len(tracks['players'])
-        player_a, player_b = self._identify_two_players(tracks)
 
-        print(f"\n[DEBUG] === JARAK BOLA-KAKI (setiap {sample_every} frame) ===")
-        print(f"[DEBUG] Player A: {player_a}, Player B: {player_b}")
-        print(f"{'Frame':<8} {'BallPos':<20} {'DistA':<12} {'DistB':<12} {'Possessor':<12}")
-        print("-" * 70)
+        print(f"\n[DEBUG] === JARAK BOLA-PEMAIN (setiap {sample_every} frame) ===")
+        print(f"{'Frame':<8} {'BallPos':<16} {'NearestPID':<12} {'NearestDist':<14} {'AllPlayers'}")
+        print("-" * 90)
 
         for f in range(0, total_frames, sample_every):
             ball_pos = self._get_ball_position(tracks, f)
             if ball_pos is None:
                 continue
 
-            player_feet = self._get_player_foot_positions(tracks, f)
+            nearest_pid, nearest_dist = self._get_nearest_player_distance(
+                ball_pos, tracks, f
+            )
 
-            dist_a = float('inf')
-            dist_b = float('inf')
+            # List semua pemain dan jaraknya
+            all_players = []
+            for pid, pdata in tracks['players'][f].items():
+                bbox = pdata.get('bbox')
+                if bbox is None:
+                    continue
+                d = self._get_min_distance_to_player(ball_pos, tracks, f, pid)
+                all_players.append(f"P{pid}:{d:.0f}")
 
-            if player_a in player_feet:
-                dist_a = measure_distance(ball_pos, player_feet[player_a])
-            if player_b in player_feet:
-                dist_b = measure_distance(ball_pos, player_feet[player_b])
-
-            possessor = "None"
-            if dist_a <= self.ball_possession_distance:
-                possessor = f"P{player_a}"
-            elif dist_b <= self.ball_possession_distance:
-                possessor = f"P{player_b}"
+            all_str = ", ".join(all_players) if all_players else "None"
 
             print(f"{f:<8} "
-                  f"({ball_pos[0]:.0f},{ball_pos[1]:.0f}){'':<8} "
-                  f"{dist_a:<12.1f} "
-                  f"{dist_b:<12.1f} "
-                  f"{possessor:<12}")
+                  f"({ball_pos[0]:.0f},{ball_pos[1]:.0f}){'':<6} "
+                  f"P{nearest_pid:<10} "
+                  f"{nearest_dist:<14.1f} "
+                  f"{all_str}")
 
-        print("-" * 70)
+        print("-" * 90)
         print()
 
     # ============================================================
