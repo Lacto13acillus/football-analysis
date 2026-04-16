@@ -31,13 +31,16 @@ class Tracker:
     """
     Tracker utama: deteksi objek dengan YOLO + tracking per frame.
 
-    Class mapping (sesuai data.yaml):
+    Class mapping default (sesuai data.yaml heading):
         0 → Heading (bbox kepala pemain)
         1 → ball
         2 → player
+
+    Bisa di-override via parameter class_mapping untuk model lain.
+    Contoh longpass (2 class): {'ball': 0, 'player': 1}
     """
 
-    # Class ID mapping
+    # Class ID mapping (default heading project)
     CLASS_HEADING = 0
     CLASS_BALL    = 1
     CLASS_PLAYER  = 2
@@ -53,16 +56,29 @@ class Tracker:
         model_path: str,
         conf_threshold: float = 0.25,
         iou_threshold: float = 0.5,
+        class_mapping: Optional[Dict[str, int]] = None,
     ):
         """
         Args:
             model_path: Path ke model YOLO (.pt)
             conf_threshold: Confidence threshold untuk deteksi
             iou_threshold: IoU threshold untuk NMS
+            class_mapping: Override class ID mapping.
+                           Dict dari nama objek ke class ID.
+                           Contoh heading (default): {'heading': 0, 'ball': 1, 'player': 2}
+                           Contoh longpass: {'ball': 0, 'player': 1}
         """
         self.model = YOLO(model_path)
         self.conf_threshold = conf_threshold
         self.iou_threshold = iou_threshold
+
+        # Apply class mapping
+        if class_mapping:
+            self.CLASS_BALL = class_mapping.get('ball', self.CLASS_BALL)
+            self.CLASS_PLAYER = class_mapping.get('player', self.CLASS_PLAYER)
+            self.CLASS_HEADING = class_mapping.get('heading', -1)  # -1 = tidak ada
+        self.has_heading_class = (self.CLASS_HEADING >= 0 and
+                                  (class_mapping is None or 'heading' in class_mapping))
 
         # Inisialisasi ByteTrack tracker (supervision) untuk player
         if HAS_SUPERVISION:
@@ -87,6 +103,8 @@ class Tracker:
         print(f"[TRACKER] Confidence threshold: {self.conf_threshold}")
         print(f"[TRACKER] IoU threshold: {self.iou_threshold}")
         print(f"[TRACKER] ByteTrack: {'Aktif' if HAS_SUPERVISION else 'Tidak aktif'}")
+        print(f"[TRACKER] Class mapping: ball={self.CLASS_BALL}, player={self.CLASS_PLAYER}, "
+              f"heading={'N/A' if not self.has_heading_class else self.CLASS_HEADING}")
 
     # ============================================================
     # BACA & SIMPAN VIDEO
@@ -207,8 +225,9 @@ class Tracker:
         tracks: Dict[str, List[Dict]] = {
             'players': [],
             'ball':    [],
-            'heading': [],
         }
+        if self.has_heading_class:
+            tracks['heading'] = []
 
         total_frames = len(detections)
 
@@ -285,35 +304,36 @@ class Tracker:
             tracks['ball'].append(ball_dict)
 
             # ----- HEADING (kepala) TRACKING -----
-            heading_dict = {}
+            if self.has_heading_class:
+                heading_dict = {}
 
-            if heading_bboxes:
-                if HAS_SUPERVISION and self.heading_tracker is not None:
-                    sv_head_det = sv.Detections(
-                        xyxy=np.array(heading_bboxes, dtype=np.float32),
-                        confidence=np.array(heading_confs, dtype=np.float32),
-                    )
-                    sv_head_tracked = self.heading_tracker.update_with_detections(
-                        sv_head_det
-                    )
+                if heading_bboxes:
+                    if HAS_SUPERVISION and self.heading_tracker is not None:
+                        sv_head_det = sv.Detections(
+                            xyxy=np.array(heading_bboxes, dtype=np.float32),
+                            confidence=np.array(heading_confs, dtype=np.float32),
+                        )
+                        sv_head_tracked = self.heading_tracker.update_with_detections(
+                            sv_head_det
+                        )
 
-                    for j in range(len(sv_head_tracked)):
-                        tracker_id = int(sv_head_tracked.tracker_id[j])
-                        bbox = sv_head_tracked.xyxy[j].tolist()
-                        conf = float(sv_head_tracked.confidence[j])
-                        heading_dict[tracker_id] = {
-                            'bbox': bbox,
-                            'confidence': conf,
-                        }
-                else:
-                    # Fallback: tanpa tracking
-                    for j, bbox in enumerate(heading_bboxes):
-                        heading_dict[j + 1] = {
-                            'bbox': bbox,
-                            'confidence': heading_confs[j],
-                        }
+                        for j in range(len(sv_head_tracked)):
+                            tracker_id = int(sv_head_tracked.tracker_id[j])
+                            bbox = sv_head_tracked.xyxy[j].tolist()
+                            conf = float(sv_head_tracked.confidence[j])
+                            heading_dict[tracker_id] = {
+                                'bbox': bbox,
+                                'confidence': conf,
+                            }
+                    else:
+                        # Fallback: tanpa tracking
+                        for j, bbox in enumerate(heading_bboxes):
+                            heading_dict[j + 1] = {
+                                'bbox': bbox,
+                                'confidence': heading_confs[j],
+                            }
 
-            tracks['heading'].append(heading_dict)
+                tracks['heading'].append(heading_dict)
 
         print(f"[TRACKER] Konversi tracks selesai: {total_frames} frames.")
         self._print_track_summary(tracks)
@@ -332,7 +352,7 @@ class Tracker:
             1 for f in tracks['ball'] if len(f) > 0
         )
         frames_with_heading = sum(
-            1 for f in tracks['heading'] if len(f) > 0
+            1 for f in tracks.get('heading', []) if len(f) > 0
         )
 
         # Unique IDs
@@ -340,7 +360,7 @@ class Tracker:
         all_heading_ids = set()
         for f in tracks['players']:
             all_player_ids.update(f.keys())
-        for f in tracks['heading']:
+        for f in tracks.get('heading', []):
             all_heading_ids.update(f.keys())
 
         print(f"\n[TRACKER] === TRACKING SUMMARY ===")
@@ -466,7 +486,9 @@ class Tracker:
                 tracks = pickle.load(f)
 
             # Validasi cache punya semua key yang diperlukan
-            required_keys = ['players', 'ball', 'heading']
+            required_keys = ['players', 'ball']
+            if self.has_heading_class:
+                required_keys.append('heading')
             missing = [k for k in required_keys if k not in tracks]
 
             if missing:
