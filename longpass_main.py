@@ -32,8 +32,8 @@ from utils.bbox_utils import get_center_of_bbox, get_foot_position, measure_dist
 # ============================================================
 
 CONFIG = {
-    "input_video" : "input_videos/longpass.mp4",
-    "output_video": "output_videos/longpass_count.avi",
+    "input_video" : "input_videos/longpass2.mp4",
+    "output_video": "output_videos/longpass_count2.avi",
     "model_path"  : "/home/dika/football-analysis/models/longpass.pt",
     "stub_path"   : "stubs/tracks_cache_longpass.pkl",
     "use_stub"    : False,
