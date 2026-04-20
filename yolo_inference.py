@@ -2,7 +2,7 @@ from ultralytics import YOLO
 
 model = YOLO('/home/dika/football-analysis/models/through_pass.pt')
 
-results = model.predict('./input_videos/longpass.mp4', save=True)
+results = model.predict('./input_videos/through_pass.mp4', save=True)
 print(results[0])
 separator = '==================================='
 print(separator)
