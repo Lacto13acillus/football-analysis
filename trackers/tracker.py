@@ -44,6 +44,7 @@ class Tracker:
     CLASS_HEADING = 0
     CLASS_BALL    = 1
     CLASS_PLAYER  = 2
+    CLASS_CONE    = -1  # -1 = tidak ada (default)
 
     CLASS_NAMES = {
         0: 'Heading',
@@ -77,8 +78,10 @@ class Tracker:
             self.CLASS_BALL = class_mapping.get('ball', self.CLASS_BALL)
             self.CLASS_PLAYER = class_mapping.get('player', self.CLASS_PLAYER)
             self.CLASS_HEADING = class_mapping.get('heading', -1)  # -1 = tidak ada
+            self.CLASS_CONE = class_mapping.get('cone', -1)  # -1 = tidak ada
         self.has_heading_class = (self.CLASS_HEADING >= 0 and
                                   (class_mapping is None or 'heading' in class_mapping))
+        self.has_cone_class = (self.CLASS_CONE >= 0)
 
         # Inisialisasi ByteTrack tracker (supervision) untuk player
         if HAS_SUPERVISION:
@@ -95,16 +98,25 @@ class Tracker:
                 minimum_matching_threshold=0.7,
                 frame_rate=30,
             )
+            # Tracker terpisah untuk cone
+            self.cone_tracker = sv.ByteTrack(
+                track_activation_threshold=0.25,
+                lost_track_buffer=60,
+                minimum_matching_threshold=0.8,
+                frame_rate=30,
+            )
         else:
             self.player_tracker = None
             self.heading_tracker = None
+            self.cone_tracker = None
 
         print(f"[TRACKER] Model loaded: {model_path}")
         print(f"[TRACKER] Confidence threshold: {self.conf_threshold}")
         print(f"[TRACKER] IoU threshold: {self.iou_threshold}")
         print(f"[TRACKER] ByteTrack: {'Aktif' if HAS_SUPERVISION else 'Tidak aktif'}")
         print(f"[TRACKER] Class mapping: ball={self.CLASS_BALL}, player={self.CLASS_PLAYER}, "
-              f"heading={'N/A' if not self.has_heading_class else self.CLASS_HEADING}")
+              f"heading={'N/A' if not self.has_heading_class else self.CLASS_HEADING}, "
+              f"cone={'N/A' if not self.has_cone_class else self.CLASS_CONE}")
 
     # ============================================================
     # BACA & SIMPAN VIDEO
@@ -228,6 +240,8 @@ class Tracker:
         }
         if self.has_heading_class:
             tracks['heading'] = []
+        if self.has_cone_class:
+            tracks['cones'] = []
 
         total_frames = len(detections)
 
@@ -243,6 +257,8 @@ class Tracker:
             player_confs  = []
             ball_bboxes   = []
             ball_confs    = []
+            cone_bboxes   = []
+            cone_confs    = []
             heading_bboxes = []
             heading_confs  = []
 
@@ -257,6 +273,9 @@ class Tracker:
                 elif cls == self.CLASS_BALL:
                     ball_bboxes.append(bbox)
                     ball_confs.append(conf)
+                elif self.has_cone_class and cls == self.CLASS_CONE:
+                    cone_bboxes.append(bbox)
+                    cone_confs.append(conf)
                 elif cls == self.CLASS_HEADING:
                     heading_bboxes.append(bbox)
                     heading_confs.append(conf)
@@ -335,6 +354,38 @@ class Tracker:
 
                 tracks['heading'].append(heading_dict)
 
+            # ----- CONE TRACKING -----
+            if self.has_cone_class:
+                cone_dict = {}
+
+                if cone_bboxes:
+                    if HAS_SUPERVISION and self.cone_tracker is not None:
+                        sv_cone_det = sv.Detections(
+                            xyxy=np.array(cone_bboxes, dtype=np.float32),
+                            confidence=np.array(cone_confs, dtype=np.float32),
+                        )
+                        sv_cone_tracked = self.cone_tracker.update_with_detections(
+                            sv_cone_det
+                        )
+
+                        for j in range(len(sv_cone_tracked)):
+                            tracker_id = int(sv_cone_tracked.tracker_id[j])
+                            bbox = sv_cone_tracked.xyxy[j].tolist()
+                            conf = float(sv_cone_tracked.confidence[j])
+                            cone_dict[tracker_id] = {
+                                'bbox': bbox,
+                                'confidence': conf,
+                            }
+                    else:
+                        # Fallback: tanpa tracking
+                        for j, bbox in enumerate(cone_bboxes):
+                            cone_dict[j + 1] = {
+                                'bbox': bbox,
+                                'confidence': cone_confs[j],
+                            }
+
+                tracks['cones'].append(cone_dict)
+
         print(f"[TRACKER] Konversi tracks selesai: {total_frames} frames.")
         self._print_track_summary(tracks)
 
@@ -354,14 +405,20 @@ class Tracker:
         frames_with_heading = sum(
             1 for f in tracks.get('heading', []) if len(f) > 0
         )
+        frames_with_cones = sum(
+            1 for f in tracks.get('cones', []) if len(f) > 0
+        )
 
         # Unique IDs
         all_player_ids = set()
         all_heading_ids = set()
+        all_cone_ids = set()
         for f in tracks['players']:
             all_player_ids.update(f.keys())
         for f in tracks.get('heading', []):
             all_heading_ids.update(f.keys())
+        for f in tracks.get('cones', []):
+            all_cone_ids.update(f.keys())
 
         print(f"\n[TRACKER] === TRACKING SUMMARY ===")
         print(f"[TRACKER] Total frames         : {total}")
@@ -374,10 +431,15 @@ class Tracker:
         print(f"[TRACKER] Frames dengan heading: "
               f"{frames_with_heading}/{total} "
               f"({frames_with_heading/total*100:.1f}%)")
+        print(f"[TRACKER] Frames dengan cone   : "
+              f"{frames_with_cones}/{total} "
+              f"({frames_with_cones/total*100:.1f}%)")
         print(f"[TRACKER] Unique player IDs    : {len(all_player_ids)} "
               f"({sorted(all_player_ids)[:10]}{'...' if len(all_player_ids) > 10 else ''})")
         print(f"[TRACKER] Unique heading IDs   : {len(all_heading_ids)} "
               f"({sorted(all_heading_ids)[:10]}{'...' if len(all_heading_ids) > 10 else ''})")
+        print(f"[TRACKER] Unique cone IDs      : {len(all_cone_ids)} "
+              f"({sorted(all_cone_ids)[:10]}{'...' if len(all_cone_ids) > 10 else ''})")
         print(f"[TRACKER] ============================\n")
 
     # ============================================================
