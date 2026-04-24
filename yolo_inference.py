@@ -1,6 +1,6 @@
 from ultralytics import YOLO
 
-model = YOLO('/home/dika/football-analysis/models/through_pass.pt')
+model = YOLO('/home/dika/football-analysis/models/one_touch_pass.pt')
 
 results = model.predict('./input_videos/through_pass.mp4', save=True)
 print(results[0])
