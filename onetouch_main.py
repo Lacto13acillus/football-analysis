@@ -51,7 +51,7 @@ CONFIG = {
 
     # PARAMETER ONE-TOUCH PASS
     "ball_possession_distance" : 150.0,
-    "kick_away_distance"       : 100.0,
+    "kick_away_distance"       : 150.0,
     "receive_distance"         : 200.0,
     "min_possession_frames"    : 2,
     "min_receive_frames"       : 2,
@@ -59,6 +59,7 @@ CONFIG = {
     "max_transit_frames"       : 90,
     "cooldown_frames"          : 15,
     "min_away_frames"          : 3,
+    "player_separation_distance": 150.0,
 
     # VISUALISASI
     "show_stats_panel"      : True,
@@ -461,6 +462,7 @@ def main():
     otp_detector.max_transit_frames       = CONFIG["max_transit_frames"]
     otp_detector.cooldown_frames          = CONFIG["cooldown_frames"]
     otp_detector.min_away_frames          = CONFIG["min_away_frames"]
+    otp_detector.player_separation_distance = CONFIG.get("player_separation_distance", 150.0)
 
     # TAHAP 3.5: DEBUG — Print jarak bola-pemain
     if CONFIG.get("debug_distances", False):
