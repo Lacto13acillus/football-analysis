@@ -1,19 +1,21 @@
 # onetouch_detector.py
 # ============================================================
 # One-Touch Pass Counting — State Machine (POSITION-BASED):
-#   IDLE → BALL_AT_PLAYER → BALL_TRAVELING → SUKSES / GAGAL
+#   IDLE → BALL_AT_TARGET → BALL_TRAVELING → SUKSES / GAGAL
 #
 # Logic:
-#   SUKSES = bola dari pemain terdekat diterima oleh pemain lain
+#   Hanya menghitung pass DARI target player (baju hitam)
+#   KE partner player (baju orange).
+#   Pass dari partner → target TIDAK dihitung (hanya ball return).
+#
+#   SUKSES = bola dari target player diterima oleh partner
 #            dengan sentuhan < max_touch_seconds (2 detik)
 #   GAGAL  = bola ditahan terlalu lama (> 2 detik)
-#          = bola tidak sampai ke pemain lain (timeout)
-#          = bola kembali ke pengirim
+#          = bola tidak sampai ke partner (timeout)
 #
-# POSITION-BASED: Tidak bergantung pada tracking ID.
-#   ByteTrack sering reassign ID, jadi kita pakai posisi pemain
-#   terdekat ke bola. Pemain "terdekat" di setiap frame dianggap
-#   possessor, tanpa peduli ID-nya berubah.
+# POSITION-BASED: Menggunakan spatial clustering untuk
+#   mengidentifikasi 2 pemain fisik, lalu auto-detect
+#   target player dari posisi pemain pertama yang pegang bola.
 #
 # Model YOLO: 3 class (ball=0, cone=1, player=2)
 # ============================================================
@@ -33,54 +35,182 @@ class OneTouchDetector:
         # ============================================================
         # PARAMETER POSSESSION (bola dekat kaki = memiliki bola)
         # ============================================================
-        # Jarak maks bola ke kaki pemain untuk dianggap "possession"
         self.ball_possession_distance: float = 150.0
 
         # ============================================================
         # PARAMETER KICK DETECTION
         # ============================================================
-        # Jarak minimal bola dari pemain agar dianggap "sudah dioper"
         self.kick_away_distance: float = 150.0
-
-        # Min frames bola harus dekat pemain sebelum dianggap possession valid
         self.min_possession_frames: int = 2
 
         # ============================================================
         # PARAMETER ONE-TOUCH (DURASI SENTUHAN)
         # ============================================================
-        # Maks durasi sentuhan (detik). Jika lebih → GAGAL (bukan one-touch)
         self.max_touch_seconds: float = 2.0
 
         # ============================================================
         # PARAMETER RECEIVE DETECTION
         # ============================================================
-        # Jarak maks bola ke kaki/badan penerima agar dianggap "diterima"
         self.receive_distance: float = 200.0
-
-        # Min frames bola harus dekat penerima untuk konfirmasi
         self.min_receive_frames: int = 2
 
         # ============================================================
         # PARAMETER TRANSIT / TIMEOUT
         # ============================================================
-        # Maks frame bola di transit sebelum auto-reset (timeout)
-        self.max_transit_frames: int = 90  # ~3 detik @30fps
+        self.max_transit_frames: int = 90
 
         # ============================================================
         # PARAMETER COOLDOWN
         # ============================================================
-        # Cooldown setelah 1 event, hindari double count
-        self.cooldown_frames: int = 15  # Lebih pendek karena one-touch cepat
-
-        # Min frames bola harus jauh dari semua pemain sebelum event baru
+        self.cooldown_frames: int = 15
         self.min_away_frames: int = 3
 
         # ============================================================
-        # PARAMETER POSITION-BASED PLAYER SEPARATION
+        # PARAMETER SPATIAL CLUSTERING
         # ============================================================
-        # Jarak minimal antara 2 pemain agar dianggap "berbeda"
-        # Digunakan untuk membedakan sender vs receiver berdasarkan posisi
-        self.player_separation_distance: float = 150.0
+        # Jarak maks untuk menganggap 2 posisi sebagai pemain yang sama
+        self.cluster_match_distance: float = 250.0
+        # Jumlah frame awal untuk sampling posisi pemain
+        self.cluster_sample_frames: int = 60
+
+        # ============================================================
+        # INTERNAL STATE (diisi saat detect)
+        # ============================================================
+        self._target_center: Optional[Tuple[float, float]] = None
+        self._partner_center: Optional[Tuple[float, float]] = None
+
+    # ============================================================
+    # SPATIAL CLUSTERING: Identifikasi 2 pemain fisik
+    # ============================================================
+
+    def _cluster_player_positions(
+        self,
+        tracks: Dict,
+        sample_frames: int = 60,
+    ) -> List[Tuple[float, float]]:
+        """
+        Cluster posisi semua pemain dari N frame pertama menjadi
+        2 kelompok posisi (= 2 pemain fisik).
+
+        Menggunakan simple clustering: kumpulkan semua posisi,
+        lalu cluster berdasarkan jarak.
+
+        Returns:
+            List of 2 cluster centers [(x1,y1), (x2,y2)]
+        """
+        all_positions: List[Tuple[float, float]] = []
+        total = min(sample_frames, len(tracks['players']))
+
+        for f in range(total):
+            for pid, pdata in tracks['players'][f].items():
+                bbox = pdata.get('bbox')
+                if bbox is None:
+                    continue
+                cx, cy = get_center_of_bbox(bbox)
+                all_positions.append((float(cx), float(cy)))
+
+        if len(all_positions) < 2:
+            print("[ONETOUCH] WARNING: Kurang dari 2 posisi pemain!")
+            return []
+
+        # Simple 2-means clustering
+        # Inisialisasi: ambil 2 posisi terjauh
+        max_dist = 0
+        seed_a, seed_b = all_positions[0], all_positions[1]
+        # Sample beberapa pasang untuk cari yang terjauh
+        step = max(1, len(all_positions) // 20)
+        for i in range(0, len(all_positions), step):
+            for j in range(i + 1, len(all_positions), step):
+                d = measure_distance(all_positions[i], all_positions[j])
+                if d > max_dist:
+                    max_dist = d
+                    seed_a = all_positions[i]
+                    seed_b = all_positions[j]
+
+        # Iterate clustering
+        for _ in range(10):
+            cluster_a: List[Tuple[float, float]] = []
+            cluster_b: List[Tuple[float, float]] = []
+
+            for pos in all_positions:
+                da = measure_distance(pos, seed_a)
+                db = measure_distance(pos, seed_b)
+                if da <= db:
+                    cluster_a.append(pos)
+                else:
+                    cluster_b.append(pos)
+
+            if not cluster_a or not cluster_b:
+                break
+
+            new_a = (
+                float(np.mean([p[0] for p in cluster_a])),
+                float(np.mean([p[1] for p in cluster_a])),
+            )
+            new_b = (
+                float(np.mean([p[0] for p in cluster_b])),
+                float(np.mean([p[1] for p in cluster_b])),
+            )
+
+            if (measure_distance(new_a, seed_a) < 1.0 and
+                    measure_distance(new_b, seed_b) < 1.0):
+                break
+
+            seed_a, seed_b = new_a, new_b
+
+        return [seed_a, seed_b]
+
+    def _identify_target_player(
+        self,
+        tracks: Dict,
+        cluster_centers: List[Tuple[float, float]],
+    ) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+        """
+        Identifikasi target player (yang akan di-counting) berdasarkan
+        siapa yang PERTAMA memiliki bola.
+
+        Target = pemain pertama yang pegang bola (baju hitam).
+        Partner = pemain lainnya (baju orange).
+
+        Returns:
+            (target_center, partner_center)
+        """
+        total = len(tracks['players'])
+
+        for f in range(total):
+            ball_pos = self._get_ball_position(tracks, f)
+            if ball_pos is None:
+                continue
+
+            # Cari pemain terdekat ke bola
+            nearest_pid, nearest_dist, nearest_center = \
+                self._get_nearest_player_distance(ball_pos, tracks, f)
+
+            if nearest_dist <= self.ball_possession_distance and nearest_center:
+                # Pemain ini memiliki bola pertama = target
+                # Tentukan cluster mana yang paling dekat
+                d0 = measure_distance(nearest_center, cluster_centers[0])
+                d1 = measure_distance(nearest_center, cluster_centers[1])
+
+                if d0 <= d1:
+                    target = cluster_centers[0]
+                    partner = cluster_centers[1]
+                else:
+                    target = cluster_centers[1]
+                    partner = cluster_centers[0]
+
+                print(f"[ONETOUCH] Target player (first possession) "
+                      f"at frame {f}: "
+                      f"pos=({target[0]:.0f},{target[1]:.0f})")
+                print(f"[ONETOUCH] Partner player: "
+                      f"pos=({partner[0]:.0f},{partner[1]:.0f})")
+
+                return target, partner
+
+        # Fallback: cluster 0 = target
+        print("[ONETOUCH] WARNING: Tidak bisa detect first possession, "
+              "fallback ke cluster[0] sebagai target")
+        return cluster_centers[0], cluster_centers[1]
 
     # ============================================================
     # HELPER FUNCTIONS
@@ -104,11 +234,8 @@ class OneTouchDetector:
         frame_num: int,
     ) -> Tuple[int, float, Optional[Tuple[int, int]]]:
         """
-        Cari pemain MANAPUN yang paling dekat ke bola di frame ini.
-        Cek jarak ke kaki DAN badan, ambil yang paling kecil.
-
-        Returns:
-            (player_id, min_distance, player_center_position)
+        Cari pemain MANAPUN yang paling dekat ke bola.
+        Returns: (player_id, min_distance, player_center)
         """
         best_pid = -1
         best_dist = float('inf')
@@ -131,25 +258,37 @@ class OneTouchDetector:
 
         return best_pid, best_dist, best_center
 
-    def _get_nearest_player_excluding_area(
+    def _classify_player_cluster(
+        self,
+        player_center: Tuple[int, int],
+    ) -> str:
+        """
+        Tentukan apakah pemain di posisi ini termasuk 'target' atau 'partner'.
+        Berdasarkan jarak ke cluster center.
+
+        Returns: 'target' atau 'partner'
+        """
+        if self._target_center is None or self._partner_center is None:
+            return 'unknown'
+
+        dt = measure_distance(player_center, self._target_center)
+        dp = measure_distance(player_center, self._partner_center)
+
+        return 'target' if dt <= dp else 'partner'
+
+    def _get_ball_dist_to_cluster(
         self,
         ball_pos: Tuple[int, int],
         tracks: Dict,
         frame_num: int,
-        exclude_center: Tuple[int, int],
-        min_separation: float = 150.0,
-    ) -> Tuple[int, float, Optional[Tuple[int, int]]]:
+        cluster_center: Tuple[float, float],
+    ) -> Tuple[float, int, Optional[Tuple[int, int]]]:
         """
-        Cari pemain terdekat ke bola, tapi BUKAN pemain yang
-        berada di dekat exclude_center (= area posisi pengirim).
-
-        POSITION-BASED: membedakan pemain berdasarkan posisi, bukan ID.
-
-        Returns:
-            (player_id, min_distance_to_ball, player_center)
+        Hitung jarak bola ke pemain manapun yang berada di cluster ini.
+        Returns: (min_distance, player_id, player_center)
         """
-        best_pid = -1
         best_dist = float('inf')
+        best_pid = -1
         best_center = None
 
         for pid, pdata in tracks['players'][frame_num].items():
@@ -159,8 +298,22 @@ class OneTouchDetector:
 
             player_center = get_center_of_bbox(bbox)
 
-            # Skip pemain yang terlalu dekat dengan area sender
-            if measure_distance(player_center, exclude_center) < min_separation:
+            # Cek apakah pemain ini termasuk cluster yang dimaksud
+            if self._classify_player_cluster(player_center) == 'target':
+                is_target = True
+            else:
+                is_target = False
+
+            # Match cluster
+            d_to_cluster = measure_distance(player_center, cluster_center)
+            dt = measure_distance(player_center, self._target_center) if self._target_center else float('inf')
+            dp = measure_distance(player_center, self._partner_center) if self._partner_center else float('inf')
+
+            # Pemain dianggap milik cluster ini jika cluster_center adalah
+            # yang lebih dekat
+            if cluster_center == self._target_center and dt > dp:
+                continue
+            elif cluster_center == self._partner_center and dp > dt:
                 continue
 
             foot_pos = get_foot_position(bbox)
@@ -173,79 +326,29 @@ class OneTouchDetector:
                 best_pid = pid
                 best_center = player_center
 
-        return best_pid, best_dist, best_center
-
-    def _get_min_distance_to_nearest_at_position(
-        self,
-        ball_pos: Tuple[int, int],
-        tracks: Dict,
-        frame_num: int,
-        target_center: Tuple[int, int],
-        max_match_distance: float = 200.0,
-    ) -> float:
-        """
-        Hitung jarak bola ke pemain yang berada di sekitar target_center.
-        POSITION-BASED: cari pemain manapun (ID apapun) yang dekat
-        dengan target_center, lalu hitung jarak bola ke pemain itu.
-
-        Returns:
-            jarak bola ke pemain terdekat di area target_center.
-            float('inf') jika tidak ada pemain di area itu.
-        """
-        best_dist = float('inf')
-
-        for pid, pdata in tracks['players'][frame_num].items():
-            bbox = pdata.get('bbox')
-            if bbox is None:
-                continue
-
-            player_center = get_center_of_bbox(bbox)
-
-            # Hanya cek pemain yang dekat dengan target_center
-            if measure_distance(player_center, target_center) > max_match_distance:
-                continue
-
-            foot_pos = get_foot_position(bbox)
-            dist = min(
-                measure_distance(ball_pos, foot_pos),
-                measure_distance(ball_pos, player_center),
-            )
-            if dist < best_dist:
-                best_dist = dist
-
-        return best_dist
+        return best_dist, best_pid, best_center
 
     def _identify_two_players(
         self,
         tracks: Dict,
         sample_frames: int = 60
     ) -> Tuple[int, int]:
-        """
-        Identifikasi 2 pemain utama berdasarkan tracking.
-        Ambil 2 player ID yang paling sering muncul.
-
-        Returns:
-            (player_a_id, player_b_id) — dua ID pemain
-        """
+        """Identifikasi 2 player ID paling sering muncul (untuk rendering)."""
         from collections import Counter
         pid_counter = Counter()
-
         total = min(sample_frames, len(tracks['players']))
         for f in range(total):
             for pid in tracks['players'][f].keys():
                 pid_counter[pid] += 1
-
         most_common = pid_counter.most_common(2)
         if len(most_common) < 2:
-            print("[ONETOUCH] WARNING: Kurang dari 2 pemain terdeteksi!")
             if len(most_common) == 1:
                 return most_common[0][0], -1
             return -1, -1
-
         return most_common[0][0], most_common[1][0]
 
     # ============================================================
-    # DETEKSI ONE-TOUCH PASS — CORE LOGIC (POSITION-BASED)
+    # DETEKSI ONE-TOUCH PASS — CORE LOGIC
     # ============================================================
 
     def detect_onetouch_passes(
@@ -254,19 +357,16 @@ class OneTouchDetector:
         debug: bool = True
     ) -> List[Dict]:
         """
-        Deteksi one-touch pass dari tracking data.
+        Deteksi one-touch pass. Hanya menghitung pass dari
+        TARGET player ke PARTNER player.
 
-        POSITION-BASED: Tidak bergantung pada tracking ID yang fixed.
-        Menggunakan posisi pemain terdekat ke bola untuk menentukan
-        possessor. Pemain dibedakan berdasarkan POSISI, bukan ID.
+        State Machine:
+            IDLE → BALL_AT_TARGET → BALL_TRAVELING → SUKSES/GAGAL
 
-        Logic (State Machine):
-            IDLE → BALL_AT_PLAYER → BALL_TRAVELING → SUKSES/GAGAL → IDLE
-
-        Kunci one-touch:
-            - Jika bola di kaki pemain > max_touch_seconds → GAGAL
-            - Jika bola tidak sampai ke pemain lain → GAGAL
-            - Jika bola sampai ke pemain lain dengan sentuhan cepat → SUKSES
+        IDLE: Menunggu bola sampai di target player.
+              Bola di partner player TIDAK memicu event baru.
+        BALL_AT_TARGET: Bola di kaki target player, hitung touch duration.
+        BALL_TRAVELING: Bola sudah dioper, cek apakah sampai ke partner.
 
         Returns:
             List[Dict] berisi event one-touch pass
@@ -277,37 +377,62 @@ class OneTouchDetector:
 
         max_touch_frames = int(self.max_touch_seconds * self.fps)
 
+        # ============================================================
+        # STEP 1: Clustering — identifikasi 2 pemain fisik
+        # ============================================================
         if debug:
-            print(f"\n[ONETOUCH] === ONE-TOUCH PASS DETECTION (POSITION-BASED) ===")
-            print(f"[ONETOUCH] Total frames           : {total_frames}")
-            print(f"[ONETOUCH] FPS                    : {self.fps}")
-            print(f"[ONETOUCH] Possession distance    : {self.ball_possession_distance}px")
-            print(f"[ONETOUCH] Kick away distance     : {self.kick_away_distance}px")
-            print(f"[ONETOUCH] Receive distance       : {self.receive_distance}px")
-            print(f"[ONETOUCH] Max touch seconds      : {self.max_touch_seconds}s "
-                  f"({max_touch_frames} frames)")
-            print(f"[ONETOUCH] Max transit frames     : {self.max_transit_frames}")
-            print(f"[ONETOUCH] Cooldown frames        : {self.cooldown_frames}")
-            print(f"[ONETOUCH] Player separation      : {self.player_separation_distance}px")
+            print(f"\n[ONETOUCH] === STEP 1: Spatial Clustering ===")
+
+        clusters = self._cluster_player_positions(
+            tracks, sample_frames=self.cluster_sample_frames
+        )
+        if len(clusters) < 2:
+            print("[ONETOUCH] ERROR: Tidak bisa mengidentifikasi 2 pemain!")
+            return []
+
+        if debug:
+            print(f"[ONETOUCH] Cluster A: ({clusters[0][0]:.0f}, {clusters[0][1]:.0f})")
+            print(f"[ONETOUCH] Cluster B: ({clusters[1][0]:.0f}, {clusters[1][1]:.0f})")
+            print(f"[ONETOUCH] Jarak antar cluster: "
+                  f"{measure_distance(clusters[0], clusters[1]):.0f}px")
+
+        # ============================================================
+        # STEP 2: Identifikasi target player (first possession)
+        # ============================================================
+        if debug:
+            print(f"\n[ONETOUCH] === STEP 2: Identify Target Player ===")
+
+        self._target_center, self._partner_center = \
+            self._identify_target_player(tracks, clusters)
+
+        if debug:
+            print(f"\n[ONETOUCH] === ONE-TOUCH PASS DETECTION ===")
+            print(f"[ONETOUCH] Mode              : ONE-DIRECTIONAL "
+                  f"(target → partner)")
+            print(f"[ONETOUCH] Total frames       : {total_frames}")
+            print(f"[ONETOUCH] FPS                : {self.fps}")
+            print(f"[ONETOUCH] Possession dist    : {self.ball_possession_distance}px")
+            print(f"[ONETOUCH] Kick away dist     : {self.kick_away_distance}px")
+            print(f"[ONETOUCH] Receive dist       : {self.receive_distance}px")
+            print(f"[ONETOUCH] Max touch          : {self.max_touch_seconds}s "
+                  f"({max_touch_frames}f)")
+            print(f"[ONETOUCH] Max transit        : {self.max_transit_frames}f")
+            print(f"[ONETOUCH] Cooldown           : {self.cooldown_frames}f")
             print(f"[ONETOUCH] ================================\n")
 
         # ============================================================
-        # STATE MACHINE (POSITION-BASED)
+        # STATE MACHINE
         # ============================================================
 
         state = 'idle'
-        sender_position: Optional[Tuple[int, int]] = None  # Posisi pemain pengirim
-        sender_pid = -1            # ID pemain terakhir (untuk logging saja)
+        sender_pid = -1
         possession_start_frame = -1
-        possession_frames = 0
         touch_frames = 0
         transit_frames = 0
         receive_frames = 0
         kick_frame = -1
         last_event_frame = -999
-        away_frames = self.min_away_frames
-        closest_to_receiver = float('inf')
-        last_nearest_center: Optional[Tuple[int, int]] = None
+        closest_to_partner = float('inf')
 
         onetouch_events: List[Dict] = []
         event_id_counter = 0
@@ -316,17 +441,15 @@ class OneTouchDetector:
             if frame_num % 200 == 0 and debug:
                 print(f"[ONETOUCH] Processing frame {frame_num}/{total_frames}...")
 
-            # --- Ambil posisi bola ---
             ball_pos = self._get_ball_position(tracks, frame_num)
             if ball_pos is None:
                 if state == 'ball_traveling':
                     transit_frames += 1
                     if transit_frames > self.max_transit_frames:
                         if debug:
-                            print(f"[ONETOUCH] Frame {frame_num}: TIMEOUT "
-                                  f"— bola hilang dari deteksi")
+                            print(f"[ONETOUCH] Frame {frame_num}: TIMEOUT — bola hilang")
                         event_id_counter += 1
-                        event = {
+                        onetouch_events.append({
                             'event_id': event_id_counter,
                             'sender_id': sender_pid,
                             'receiver_id': -1,
@@ -338,19 +461,33 @@ class OneTouchDetector:
                             'touch_seconds': round(touch_frames / self.fps, 2),
                             'transit_frames': transit_frames,
                             'flight_seconds': round(transit_frames / self.fps, 2),
-                            'closest_distance': round(closest_to_receiver, 1),
-                            'reason': 'Timeout — bola hilang dari deteksi',
-                        }
-                        onetouch_events.append(event)
+                            'closest_distance': round(closest_to_partner, 1),
+                            'reason': 'Timeout — bola hilang',
+                        })
                         last_event_frame = frame_num
-                        away_frames = 0
                         state = 'idle'
-                        possession_frames = 0
                 continue
 
-            # --- Cari pemain terdekat ke bola (POSITION-BASED) ---
-            nearest_pid, nearest_dist, nearest_center = \
-                self._get_nearest_player_distance(ball_pos, tracks, frame_num)
+            # Jarak bola ke target cluster dan partner cluster
+            dist_target, target_pid, target_pos = self._get_ball_dist_to_cluster(
+                ball_pos, tracks, frame_num, self._target_center
+            )
+            dist_partner, partner_pid, partner_pos = self._get_ball_dist_to_cluster(
+                ball_pos, tracks, frame_num, self._partner_center
+            )
+
+            # Update cluster centers secara dinamis
+            if target_pos and dist_target < self.ball_possession_distance:
+                # Smooth update target center
+                self._target_center = (
+                    self._target_center[0] * 0.9 + target_pos[0] * 0.1,
+                    self._target_center[1] * 0.9 + target_pos[1] * 0.1,
+                )
+            if partner_pos and dist_partner < self.ball_possession_distance:
+                self._partner_center = (
+                    self._partner_center[0] * 0.9 + partner_pos[0] * 0.1,
+                    self._partner_center[1] * 0.9 + partner_pos[1] * 0.1,
+                )
 
             # ======== STATE MACHINE ========
 
@@ -359,83 +496,33 @@ class OneTouchDetector:
                 if (frame_num - last_event_frame) < self.cooldown_frames:
                     continue
 
-                # Away frames — pastikan bola sempat jauh dari semua pemain
-                if away_frames < self.min_away_frames:
-                    if nearest_dist > self.ball_possession_distance:
-                        away_frames += 1
-                    else:
-                        away_frames = 0
-                    continue
-
-                # Cek possession: bola dekat pemain manapun?
-                if nearest_dist <= self.ball_possession_distance and nearest_pid != -1:
-                    # Cek apakah ini pemain yang sama (berdasarkan posisi)
-                    if last_nearest_center is not None and nearest_center is not None:
-                        pos_dist = measure_distance(nearest_center, last_nearest_center)
-                        if pos_dist < self.player_separation_distance:
-                            # Pemain yang sama (posisi mirip)
-                            possession_frames += 1
-                        else:
-                            # Pemain berbeda, reset
-                            possession_frames = 1
-                            sender_position = nearest_center
-                            sender_pid = nearest_pid
-                    else:
-                        possession_frames = 1
-                        sender_position = nearest_center
-                        sender_pid = nearest_pid
-
-                    last_nearest_center = nearest_center
-                else:
-                    possession_frames = 0
-                    last_nearest_center = None
-
-                # Possession cukup lama → masuk state BALL_AT_PLAYER
-                if possession_frames >= self.min_possession_frames:
-                    state = 'ball_at_player'
-                    possession_start_frame = frame_num - possession_frames + 1
-                    touch_frames = possession_frames
-                    sender_position = nearest_center
-                    sender_pid = nearest_pid
-
-                    if debug:
-                        print(f"[ONETOUCH] Frame {frame_num}: "
-                              f"BALL_AT_PLAYER (P{sender_pid}, "
-                              f"dist={nearest_dist:.0f}px, "
-                              f"pos=({sender_position[0]:.0f},{sender_position[1]:.0f}))")
-
-            elif state == 'ball_at_player':
-                # ====================================================
-                # BALL_AT_PLAYER: bola di kaki pemain, hitung touch
-                # ====================================================
-
-                # Cek jarak bola ke pemain di area sender (position-based)
-                dist_at_sender = self._get_min_distance_to_nearest_at_position(
-                    ball_pos, tracks, frame_num,
-                    target_center=sender_position,
-                    max_match_distance=250.0,
-                )
-
-                # Juga update sender_position jika ada pemain di area itu
-                for pid, pdata in tracks['players'][frame_num].items():
-                    bbox = pdata.get('bbox')
-                    if bbox is None:
-                        continue
-                    pc = get_center_of_bbox(bbox)
-                    if measure_distance(pc, sender_position) < 250:
-                        sender_position = pc  # Update posisi sender
-                        sender_pid = pid
-                        break
-
-                if dist_at_sender <= self.ball_possession_distance:
-                    # Bola masih di kaki pemain
+                # Cek: bola di kaki TARGET player?
+                if dist_target <= self.ball_possession_distance and target_pid != -1:
                     touch_frames += 1
 
-                    # --- CEK: apakah sudah terlalu lama? ---
+                    if touch_frames >= self.min_possession_frames:
+                        state = 'ball_at_target'
+                        possession_start_frame = frame_num - touch_frames + 1
+                        sender_pid = target_pid
+
+                        if debug:
+                            print(f"[ONETOUCH] Frame {frame_num}: "
+                                  f"BALL_AT_TARGET (P{sender_pid}, "
+                                  f"dist={dist_target:.0f}px)")
+                else:
+                    touch_frames = 0
+
+            elif state == 'ball_at_target':
+                # Bola di kaki target player, hitung touch duration
+                if dist_target <= self.ball_possession_distance:
+                    touch_frames += 1
+                    sender_pid = target_pid if target_pid != -1 else sender_pid
+
+                    # Touch terlalu lama?
                     if touch_frames > max_touch_frames:
                         event_id_counter += 1
-                        touch_seconds = round(touch_frames / self.fps, 2)
-                        event = {
+                        touch_sec = round(touch_frames / self.fps, 2)
+                        onetouch_events.append({
                             'event_id': event_id_counter,
                             'sender_id': sender_pid,
                             'receiver_id': -1,
@@ -444,126 +531,103 @@ class OneTouchDetector:
                             'frame_end': frame_num,
                             'success': False,
                             'touch_frames': touch_frames,
-                            'touch_seconds': touch_seconds,
+                            'touch_seconds': touch_sec,
                             'transit_frames': 0,
                             'flight_seconds': 0.0,
                             'closest_distance': 0.0,
-                            'reason': f'Bola ditahan {touch_seconds}s '
+                            'reason': f'Bola ditahan {touch_sec}s '
                                       f'(maks {self.max_touch_seconds}s)',
-                        }
-                        onetouch_events.append(event)
+                        })
                         last_event_frame = frame_num
-                        away_frames = 0
                         state = 'idle'
-                        possession_frames = 0
+                        touch_frames = 0
 
                         if debug:
                             print(f"[ONETOUCH] Frame {frame_num}: GAGAL ✗ "
-                                  f"— held {touch_seconds}s by P{sender_pid} "
-                                  f"(maks {self.max_touch_seconds}s)")
+                                  f"— held {touch_sec}s (maks "
+                                  f"{self.max_touch_seconds}s)")
                         continue
 
-                    # Debug touch progress
                     if debug and touch_frames % 15 == 0:
-                        touch_sec = touch_frames / self.fps
                         print(f"[ONETOUCH]   touch f={frame_num}: "
-                              f"P{sender_pid} holding {touch_sec:.1f}s / "
+                              f"P{sender_pid} holding "
+                              f"{touch_frames/self.fps:.1f}s / "
                               f"{self.max_touch_seconds}s")
 
-                elif dist_at_sender > self.kick_away_distance:
-                    # Bola sudah ditendang! → traveling
+                elif dist_target > self.kick_away_distance:
+                    # Bola ditendang!
                     state = 'ball_traveling'
                     kick_frame = frame_num
                     transit_frames = 0
                     receive_frames = 0
-                    closest_to_receiver = float('inf')
+                    closest_to_partner = float('inf')
 
                     if debug:
                         touch_sec = touch_frames / self.fps
                         print(f"[ONETOUCH] Frame {frame_num}: KICK by "
-                              f"P{sender_pid} "
-                              f"(touch={touch_sec:.2f}s, "
-                              f"dist={dist_at_sender:.0f}px)")
+                              f"P{sender_pid} (touch={touch_sec:.2f}s, "
+                              f"dist_target={dist_target:.0f}px)")
 
             elif state == 'ball_traveling':
                 transit_frames += 1
 
-                # Cari pemain terdekat ke bola YANG BUKAN di area sender
-                recv_pid, dist_receiver, recv_center = \
-                    self._get_nearest_player_excluding_area(
-                        ball_pos, tracks, frame_num,
-                        exclude_center=sender_position,
-                        min_separation=self.player_separation_distance,
-                    )
-
-                # Cek jarak bola ke area sender (position-based)
-                dist_sender = self._get_min_distance_to_nearest_at_position(
-                    ball_pos, tracks, frame_num,
-                    target_center=sender_position,
-                    max_match_distance=250.0,
-                )
-
                 # Update closest
-                if dist_receiver < closest_to_receiver:
-                    closest_to_receiver = dist_receiver
+                if dist_partner < closest_to_partner:
+                    closest_to_partner = dist_partner
 
-                # Debug setiap 10 frame
                 if debug and transit_frames % 10 == 0:
                     print(f"[ONETOUCH]   transit f={frame_num}: "
-                          f"recv_pid={recv_pid}, "
-                          f"dist_recv={dist_receiver:.0f}px, "
-                          f"dist_sender={dist_sender:.0f}px")
+                          f"dist_partner={dist_partner:.0f}px, "
+                          f"dist_target={dist_target:.0f}px "
+                          f"(P_partner={partner_pid})")
 
-                # --- CEK BOLA DITERIMA ---
-                if dist_receiver <= self.receive_distance and recv_pid != -1:
+                # --- BOLA DITERIMA PARTNER ---
+                if dist_partner <= self.receive_distance and partner_pid != -1:
                     receive_frames += 1
 
                     if debug:
-                        print(f"[ONETOUCH]   f={frame_num}: bola DEKAT penerima "
-                              f"P{recv_pid}! dist={dist_receiver:.0f}px "
-                              f"(receive_frames={receive_frames}/"
-                              f"{self.min_receive_frames})")
+                        print(f"[ONETOUCH]   f={frame_num}: bola DEKAT partner "
+                              f"P{partner_pid}! dist={dist_partner:.0f}px "
+                              f"(recv={receive_frames}/{self.min_receive_frames})")
 
                     if receive_frames >= self.min_receive_frames:
                         # SUKSES!
                         event_id_counter += 1
-                        touch_seconds = round(touch_frames / self.fps, 2)
-                        event = {
+                        touch_sec = round(touch_frames / self.fps, 2)
+                        onetouch_events.append({
                             'event_id': event_id_counter,
                             'sender_id': sender_pid,
-                            'receiver_id': recv_pid,
+                            'receiver_id': partner_pid,
                             'frame_kick': kick_frame,
                             'frame_start': possession_start_frame,
                             'frame_end': frame_num,
                             'success': True,
                             'touch_frames': touch_frames,
-                            'touch_seconds': touch_seconds,
+                            'touch_seconds': touch_sec,
                             'transit_frames': transit_frames,
                             'flight_seconds': round(transit_frames / self.fps, 2),
-                            'closest_distance': round(closest_to_receiver, 1),
-                            'receive_distance': round(dist_receiver, 1),
-                        }
-                        onetouch_events.append(event)
+                            'closest_distance': round(closest_to_partner, 1),
+                            'receive_distance': round(dist_partner, 1),
+                        })
                         last_event_frame = frame_num
-                        away_frames = 0
                         state = 'idle'
-                        possession_frames = 0
+                        touch_frames = 0
 
                         if debug:
                             print(f"[ONETOUCH] Frame {frame_num}: SUKSES ✓ "
-                                  f"(P{sender_pid}→P{recv_pid}, "
-                                  f"touch={touch_seconds}s, "
+                                  f"(P{sender_pid}→P{partner_pid}, "
+                                  f"touch={touch_sec}s, "
                                   f"transit={transit_frames}f/"
                                   f"{transit_frames/self.fps:.1f}s)")
                         continue
                 else:
                     receive_frames = 0
 
-                # --- CEK BOLA KEMBALI KE PENGIRIM ---
-                if dist_sender <= self.ball_possession_distance and transit_frames > 10:
+                # --- BOLA KEMBALI KE TARGET ---
+                if dist_target <= self.ball_possession_distance and transit_frames > 10:
                     event_id_counter += 1
-                    touch_seconds = round(touch_frames / self.fps, 2)
-                    event = {
+                    touch_sec = round(touch_frames / self.fps, 2)
+                    onetouch_events.append({
                         'event_id': event_id_counter,
                         'sender_id': sender_pid,
                         'receiver_id': -1,
@@ -572,53 +636,47 @@ class OneTouchDetector:
                         'frame_end': frame_num,
                         'success': False,
                         'touch_frames': touch_frames,
-                        'touch_seconds': touch_seconds,
+                        'touch_seconds': touch_sec,
                         'transit_frames': transit_frames,
                         'flight_seconds': round(transit_frames / self.fps, 2),
-                        'closest_distance': round(closest_to_receiver, 1),
-                        'reason': 'Bola kembali ke pengirim',
-                    }
-                    onetouch_events.append(event)
+                        'closest_distance': round(closest_to_partner, 1),
+                        'reason': 'Bola kembali ke target player',
+                    })
                     last_event_frame = frame_num
-                    away_frames = 0
                     state = 'idle'
-                    possession_frames = 0
+                    touch_frames = 0
 
                     if debug:
                         print(f"[ONETOUCH] Frame {frame_num}: GAGAL ✗ "
-                              f"(bola kembali ke sender, "
-                              f"dist={dist_sender:.0f}px)")
+                              f"(bola kembali, dist={dist_target:.0f}px)")
                     continue
 
                 # --- TIMEOUT ---
                 if transit_frames > self.max_transit_frames:
                     event_id_counter += 1
-                    touch_seconds = round(touch_frames / self.fps, 2)
-                    event = {
+                    touch_sec = round(touch_frames / self.fps, 2)
+                    onetouch_events.append({
                         'event_id': event_id_counter,
                         'sender_id': sender_pid,
-                        'receiver_id': recv_pid if recv_pid != -1 else -1,
+                        'receiver_id': -1,
                         'frame_kick': kick_frame,
                         'frame_start': possession_start_frame,
                         'frame_end': frame_num,
                         'success': False,
                         'touch_frames': touch_frames,
-                        'touch_seconds': touch_seconds,
+                        'touch_seconds': touch_sec,
                         'transit_frames': transit_frames,
                         'flight_seconds': round(transit_frames / self.fps, 2),
-                        'closest_distance': round(closest_to_receiver, 1),
-                        'reason': f'Timeout transit {transit_frames}f '
-                                  f'({transit_frames/self.fps:.1f}s)',
-                    }
-                    onetouch_events.append(event)
+                        'closest_distance': round(closest_to_partner, 1),
+                        'reason': f'Timeout transit {transit_frames}f',
+                    })
                     last_event_frame = frame_num
-                    away_frames = 0
                     state = 'idle'
-                    possession_frames = 0
+                    touch_frames = 0
 
                     if debug:
                         print(f"[ONETOUCH] Frame {frame_num}: GAGAL ✗ "
-                              f"(TIMEOUT transit {transit_frames}f)")
+                              f"(TIMEOUT {transit_frames}f)")
                     continue
 
         # ============================================================
@@ -643,7 +701,7 @@ class OneTouchDetector:
         return onetouch_events
 
     # ============================================================
-    # DEBUG: Print jarak bola-kaki per frame
+    # DEBUG
     # ============================================================
 
     def debug_distances(
@@ -651,9 +709,7 @@ class OneTouchDetector:
         tracks: Dict,
         sample_every: int = 10,
     ) -> None:
-        """
-        Print jarak bola ke SEMUA pemain (kaki & badan) setiap N frame.
-        """
+        """Print jarak bola ke SEMUA pemain setiap N frame."""
         total_frames = len(tracks['players'])
 
         print(f"\n[DEBUG] === JARAK BOLA-PEMAIN (setiap {sample_every} frame) ===")
@@ -704,7 +760,6 @@ class OneTouchDetector:
         sukses = [e for e in events if e['success']]
         gagal = [e for e in events if not e['success']]
 
-        # Per-player stats (sender) — untuk kompatibilitas
         player_stats: Dict[int, Dict] = {}
         for e in events:
             sid = e['sender_id']
@@ -716,25 +771,19 @@ class OneTouchDetector:
             else:
                 player_stats[sid]['gagal'] += 1
 
-        # Gagal per alasan
         gagal_held = sum(1 for e in gagal if 'ditahan' in e.get('reason', '').lower())
         gagal_timeout = sum(1 for e in gagal if 'timeout' in e.get('reason', '').lower())
         gagal_return = sum(1 for e in gagal if 'kembali' in e.get('reason', '').lower())
         gagal_other = len(gagal) - gagal_held - gagal_timeout - gagal_return
 
-        # Average touch time (sukses)
         avg_touch_success = (
             round(float(np.mean([e['touch_seconds'] for e in sukses])), 2)
             if sukses else 0.0
         )
-
-        # Average transit time (sukses)
         avg_transit_success = (
             round(float(np.mean([e['flight_seconds'] for e in sukses])), 2)
             if sukses else 0.0
         )
-
-        # Average closest distance
         avg_closest = (
             round(float(np.mean([e['closest_distance'] for e in events])), 1)
             if events else 0.0
