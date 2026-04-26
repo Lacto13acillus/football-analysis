@@ -243,6 +243,10 @@ class OneTouchDetector:
         return_frames = 0  # Berapa frame bola dekat sender (sustained check)
         closest_to_receiver = float('inf')
 
+        # Position tracking for wait_return disambiguation
+        last_target_pos: Optional[Tuple[int, int]] = None  # Posisi target saat kick
+        last_partner_pos: Optional[Tuple[int, int]] = None  # Posisi partner saat receive
+
         # Event tracking
         last_event_frame = -999
 
@@ -479,6 +483,9 @@ class OneTouchDetector:
                             'receive_distance': round(dist_recv, 1),
                         })
                         last_event_frame = frame_num
+                        # Simpan posisi untuk disambiguasi di wait_return
+                        last_target_pos = kick_pos  # Target tadi di sini
+                        last_partner_pos = recv_center  # Partner menerima di sini
                         # Sekarang tunggu partner return
                         state = 'wait_return'
                         touch_frames = 0
@@ -572,19 +579,49 @@ class OneTouchDetector:
                     possession_counter += 1
 
                     if possession_counter >= self.min_possession_frames:
-                        # Pemain ini memiliki bola (partner).
-                        # Set possessor dan kick position, lalu tunggu
-                        # bola meninggalkan partner.
-                        possessor_pos = nearest_center
-                        possessor_pid = nearest_pid
-                        state = 'partner_touch'
-                        touch_frames = possession_counter
+                        # Cek: pemain ini PARTNER atau TARGET?
+                        # Bandingkan posisi ke last_target_pos dan last_partner_pos
+                        is_target_player = False
+                        if last_target_pos and last_partner_pos and nearest_center:
+                            dist_to_target = measure_distance(
+                                nearest_center, last_target_pos)
+                            dist_to_partner = measure_distance(
+                                nearest_center, last_partner_pos)
+                            is_target_player = dist_to_target < dist_to_partner
 
-                        if debug:
-                            print(f"[ONETOUCH] Frame {frame_num}: "
-                                  f"PARTNER has ball "
-                                  f"(P{nearest_pid}, dist={nearest_dist:.0f}px) "
-                                  f"— waiting for return...")
+                            if debug:
+                                print(f"[ONETOUCH]   wait_return disambiguasi: "
+                                      f"P{nearest_pid} dist_to_target="
+                                      f"{dist_to_target:.0f}, "
+                                      f"dist_to_partner={dist_to_partner:.0f} "
+                                      f"→ {'TARGET' if is_target_player else 'PARTNER'}")
+
+                        if is_target_player:
+                            # Ini TARGET yang sudah menerima bola kembali!
+                            # Partner return terjadi saat cooldown.
+                            # Skip langsung ke target_touch.
+                            state = 'target_touch'
+                            possessor_pid = nearest_pid
+                            possessor_pos = nearest_center
+                            possession_start_frame = frame_num - possession_counter + 1
+                            touch_frames = possession_counter
+
+                            if debug:
+                                print(f"[ONETOUCH] Frame {frame_num}: "
+                                      f"TARGET_TOUCH start (skip partner) "
+                                      f"(P{nearest_pid}, dist={nearest_dist:.0f}px)")
+                        else:
+                            # Ini PARTNER yang memiliki bola.
+                            possessor_pos = nearest_center
+                            possessor_pid = nearest_pid
+                            state = 'partner_touch'
+                            touch_frames = possession_counter
+
+                            if debug:
+                                print(f"[ONETOUCH] Frame {frame_num}: "
+                                      f"PARTNER has ball "
+                                      f"(P{nearest_pid}, dist={nearest_dist:.0f}px) "
+                                      f"— waiting for return...")
                 else:
                     possession_counter = 0
 
