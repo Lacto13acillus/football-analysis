@@ -240,6 +240,7 @@ class OneTouchDetector:
         kick_pos: Optional[Tuple[int, int]] = None
         transit_frames = 0
         receive_frames = 0
+        return_frames = 0  # Berapa frame bola dekat sender (sustained check)
         closest_to_receiver = float('inf')
 
         # Event tracking
@@ -401,6 +402,7 @@ class OneTouchDetector:
                     kick_pos = possessor_pos
                     transit_frames = 0
                     receive_frames = 0
+                    return_frames = 0
                     closest_to_receiver = float('inf')
 
                     if debug:
@@ -493,32 +495,39 @@ class OneTouchDetector:
                     receive_frames = 0
 
                 # --- BOLA KEMBALI KE SENDER ---
+                # Require sustained proximity (5 frames) to avoid
+                # false trigger when ball just passes near kick area
                 if dist_back <= self.ball_possession_distance and transit_frames > 10:
-                    event_id_counter += 1
-                    touch_sec = round(touch_frames / self.fps, 2)
-                    onetouch_events.append({
-                        'event_id': event_id_counter,
-                        'sender_id': possessor_pid,
-                        'receiver_id': -1,
-                        'frame_kick': kick_frame,
-                        'frame_start': possession_start_frame,
-                        'frame_end': frame_num,
-                        'success': False,
-                        'touch_frames': touch_frames,
-                        'touch_seconds': touch_sec,
-                        'transit_frames': transit_frames,
-                        'flight_seconds': round(transit_frames / self.fps, 2),
-                        'closest_distance': round(closest_to_receiver, 1),
-                        'reason': 'Bola kembali ke pengirim',
-                    })
-                    last_event_frame = frame_num
-                    state = 'wait_target'
-                    touch_frames = 0
-                    possession_counter = 0
-                    if debug:
-                        print(f"[ONETOUCH] Frame {frame_num}: GAGAL ✗ "
-                              f"(bola kembali, dist={dist_back:.0f}px)")
-                    continue
+                    return_frames += 1
+                    if return_frames >= 5:
+                        event_id_counter += 1
+                        touch_sec = round(touch_frames / self.fps, 2)
+                        onetouch_events.append({
+                            'event_id': event_id_counter,
+                            'sender_id': possessor_pid,
+                            'receiver_id': -1,
+                            'frame_kick': kick_frame,
+                            'frame_start': possession_start_frame,
+                            'frame_end': frame_num,
+                            'success': False,
+                            'touch_frames': touch_frames,
+                            'touch_seconds': touch_sec,
+                            'transit_frames': transit_frames,
+                            'flight_seconds': round(transit_frames / self.fps, 2),
+                            'closest_distance': round(closest_to_receiver, 1),
+                            'reason': 'Bola kembali ke pengirim',
+                        })
+                        last_event_frame = frame_num
+                        state = 'wait_target'
+                        touch_frames = 0
+                        possession_counter = 0
+                        if debug:
+                            print(f"[ONETOUCH] Frame {frame_num}: GAGAL ✗ "
+                                  f"(bola kembali, dist={dist_back:.0f}px, "
+                                  f"return_frames={return_frames})")
+                        continue
+                else:
+                    return_frames = 0
 
                 # --- TIMEOUT ---
                 if transit_frames > self.max_transit_frames:
