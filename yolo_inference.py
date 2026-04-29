@@ -1,8 +1,8 @@
 from ultralytics import YOLO
 
-model = YOLO('/home/dika/football-analysis/models/one_touch_pass.pt')
+model = YOLO('/home/dika/football-analysis/models/ball_control.pt')
 
-results = model.predict('./input_videos/one_touch_pass.mp4', save=True)
+results = model.predict('./input_videos/ball_control.mp4', save=True)
 print(results[0])
 separator = '==================================='
 print(separator)
