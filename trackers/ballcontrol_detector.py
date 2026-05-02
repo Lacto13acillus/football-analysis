@@ -115,14 +115,57 @@ class BallControlDetector:
             j = i
         return inside
 
+    def _deduplicate_cones(self, stabilized, min_dist=50.0, debug=True):
+        """Merge cone yang terlalu dekat (duplikat dari ByteTrack ID berbeda)."""
+        cone_list = [(cid, cpos) for cid, cpos in stabilized.items()]
+        merged = {}
+        used = set()
+
+        for i, (cid_i, pos_i) in enumerate(cone_list):
+            if cid_i in used:
+                continue
+            # Cari semua cone yang dekat dengan cone ini
+            group_ids = [cid_i]
+            group_positions = [pos_i]
+            for j, (cid_j, pos_j) in enumerate(cone_list):
+                if j <= i or cid_j in used:
+                    continue
+                if measure_distance(pos_i, pos_j) < min_dist:
+                    group_ids.append(cid_j)
+                    group_positions.append(pos_j)
+                    used.add(cid_j)
+            used.add(cid_i)
+            # Merge: rata-rata posisi, pakai ID terkecil
+            avg_x = float(np.mean([p[0] for p in group_positions]))
+            avg_y = float(np.mean([p[1] for p in group_positions]))
+            merged[min(group_ids)] = (avg_x, avg_y)
+            if debug and len(group_ids) > 1:
+                print(f"[BALLCTRL] DEDUP: Merged cones {group_ids} → "
+                      f"Cone {min(group_ids)} ({avg_x:.0f}, {avg_y:.0f})")
+
+        return merged
+
     def _stabilize_and_group_cones(self, tracks, player_a_id, player_b_id, debug=True):
-        """Stabilkan 8 cone, kelompokkan 4 per pemain, buat polygon."""
+        """Stabilkan 8 cone, deduplikasi, kelompokkan 4 per pemain, buat polygon."""
         stabilized = stabilize_cone_positions(
             tracks, cone_key='cones', sample_frames=self.cone_stabilize_frames)
 
+        if debug:
+            print(f"[BALLCTRL] Raw stabilized cones ({len(stabilized)}):")
+            for cid, cpos in stabilized.items():
+                print(f"  Cone {cid}: ({cpos[0]:.0f}, {cpos[1]:.0f})")
+
+        # Deduplicate nearby cones
+        stabilized = self._deduplicate_cones(stabilized, min_dist=50.0, debug=debug)
+
+        if debug:
+            print(f"[BALLCTRL] After dedup: {len(stabilized)} unique cones")
+            for cid, cpos in stabilized.items():
+                print(f"  Cone {cid}: ({cpos[0]:.0f}, {cpos[1]:.0f})")
+
         if len(stabilized) < 8:
             if debug:
-                print(f"[BALLCTRL] WARNING: Hanya {len(stabilized)} cone (butuh 8)")
+                print(f"[BALLCTRL] WARNING: Hanya {len(stabilized)} cone unik (butuh 8)")
             if len(stabilized) < 4:
                 return None, None
 
@@ -134,38 +177,26 @@ class BallControlDetector:
         if debug:
             print(f"[BALLCTRL] Player A (ID={player_a_id}) avg pos: ({pos_a[0]:.0f}, {pos_a[1]:.0f})")
             print(f"[BALLCTRL] Player B (ID={player_b_id}) avg pos: ({pos_b[0]:.0f}, {pos_b[1]:.0f})")
-            print(f"[BALLCTRL] Stabilized cones ({len(stabilized)}):")
-            for cid, cpos in stabilized.items():
-                print(f"  Cone {cid}: ({cpos[0]:.0f}, {cpos[1]:.0f})")
 
-        # Assign each cone to nearest player
-        cones_a, cones_b = [], []
+        # Hitung jarak setiap cone ke kedua pemain
+        all_cones = []
         for cid, cpos in stabilized.items():
             da = measure_distance(cpos, pos_a)
             db = measure_distance(cpos, pos_b)
-            if da < db:
-                cones_a.append({'id': cid, 'pos': cpos, 'dist': da})
-            else:
-                cones_b.append({'id': cid, 'pos': cpos, 'dist': db})
+            all_cones.append({'id': cid, 'pos': cpos, 'dist_a': da, 'dist_b': db})
 
-        # Take 4 closest to each player
-        cones_a.sort(key=lambda c: c['dist'])
-        cones_b.sort(key=lambda c: c['dist'])
-        cones_a = cones_a[:4]
-        cones_b = cones_b[:4]
+        # Sort semua cone berdasarkan jarak ke player A
+        all_cones.sort(key=lambda c: c['dist_a'])
+        # Ambil 4 terdekat ke A
+        cones_a = all_cones[:4]
+        # Sisanya sort berdasarkan jarak ke player B, ambil 4 terdekat
+        remaining = all_cones[4:]
+        remaining.sort(key=lambda c: c['dist_b'])
+        cones_b = remaining[:4]
 
         if len(cones_a) < 4 or len(cones_b) < 4:
-            # Fallback: sort all by dist_a, take first 4 for A, rest for B
-            all_cones = []
-            for cid, cpos in stabilized.items():
-                da = measure_distance(cpos, pos_a)
-                all_cones.append({'id': cid, 'pos': cpos, 'dist_a': da})
-            all_cones.sort(key=lambda c: c['dist_a'])
-            cones_a = all_cones[:4]
-            cones_b = all_cones[4:8]
-            if len(cones_a) < 4 or len(cones_b) < 4:
-                print("[BALLCTRL] ERROR: Tidak cukup cone!")
-                return None, None
+            print("[BALLCTRL] ERROR: Tidak cukup cone unik (butuh 4 per pemain)!")
+            return None, None
 
         # Create ordered polygons
         zone_a_pts = self._order_polygon([c['pos'] for c in cones_a])
