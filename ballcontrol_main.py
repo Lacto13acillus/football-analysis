@@ -36,8 +36,8 @@ from utils.bbox_utils import get_center_of_bbox, get_foot_position, measure_dist
 # ============================================================
 
 CONFIG = {
-    "input_video" : "input_videos/aerial_touch.mp4",
-    "output_video": "output_videos/aerial_touch.avi",
+    "input_video" : "input_videos/ball_control.mp4",
+    "output_video": "output_videos/ball_control.avi",
     "model_path"  : "models/ball_control.pt",
     "stub_path"   : "stubs/tracks_cache_ballcontrol.pkl",
     "use_stub"    : False,
