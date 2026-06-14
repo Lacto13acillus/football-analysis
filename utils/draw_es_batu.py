@@ -370,15 +370,13 @@ def annotate_frame(
         eb = es_batu_dict.get(es_id)
         if eb:
             for mid, mdata in motor_dict.items():
-                from utils.draw_es_batu import _intersection_ratio as _ir
-                if _ir(eb['bbox'], mdata['bbox']) > 0.05:
+                if _intersection_ratio(eb['bbox'], mdata['bbox']) > 0.05:
                     motor_highlight.add(mid)
     for es_id in new_truk:
         eb = es_batu_dict.get(es_id)
         if eb:
             for tid, tdata in truk_dict.items():
-                from utils.draw_es_batu import _intersection_ratio as _ir
-                if _ir(eb['bbox'], tdata['bbox']) > 0.05:
+                if _intersection_ratio(eb['bbox'], tdata['bbox']) > 0.05:
                     truk_highlight.add(tid)
 
     # ------ Gambar TRUK ------
